@@ -8,32 +8,6 @@
 <img src="docs/img/settings.png" width="270" alt="设置">
 </p>
 
-## 能做什么
-
-| 功能 | 状态 |
-|---|---|
-| 开机到桌面 | 约 23 秒（4 核 / 4 GB）；创建实例时已在后台跑完首次开机 |
-| 显示 | SDL 窗口；guest 内 SwiftShader 软件渲染 GLES 3.0，经 virtio-gpu 输出；分辨率/密度可配；窗口可缩放 |
-| 工具栏 | 仿官方模拟器，贴在窗口右侧：关闭、最小化、电源、音量 ±、截图、返回、主屏幕、最近任务、更多（位置、窗口大小、屏幕常亮、帮助）。按住按钮 = 长按 |
-| 输入 | 鼠标左键 = 触摸，右键 / 侧键“后退” = 返回，中键 = 主屏幕，侧键“前进” = 最近任务；键盘直通；**Ctrl+Alt+P = 电源键**（灭屏/亮屏） |
-| adb | 自动出现在 `adb devices`（emulator-5554、emulator-5556…），push 100+ MB/s |
-| 网络 | 以太网（QEMU user 模式 NAT），宿主在 guest 里是 10.0.2.2 |
-| 剪贴板 | 与 Windows 双向同步 |
-| 声音 | virtio-snd → Windows DirectSound（默认只有放音，`--mic` 打开录音） |
-| GPS | 固定位置，默认 Google 总部；运行中用工具栏「更多 → 位置」或 `avdctl geo` 修改 |
-| 传感器 | 加速度计、磁力计、方向、光照、气压、湿度（静态读数，竖屏直立） |
-| 时区 | 跟随 Windows |
-| 多实例 | 每个实例独立端口，可同时运行 |
-| SELinux | enforcing（与官方模拟器相同） |
-| 其他系统 | 实验性：可换上 GSI（system 镜像），ColorOS 15、AOSP 15 GSI 都已开机到桌面，见「运行 GSI」 |
-
-**限制**：没有 GPU 加速（重度 3D 应用会很慢）；没有摄像头、蓝牙、Wi-Fi（以太网代替）、电话/短信、指纹；
-单点触摸、不能旋转屏幕；基础镜像只支持 android-35 google_apis arm64-v8a。
-
-关闭窗口（或点工具栏的 ✕）会先让 Android 正常关机（标题显示「正在关机…」，几秒后窗口自动消失）；
-关机过程中再点一次关闭可强制退出。屏幕黑了多半是自动灭屏：点工具栏的电源键或按 Ctrl+Alt+P 亮屏，
-不想让它灭屏就勾上工具栏「更多 → 显示与电源 → 保持唤醒」。
-
 ## 运行环境
 
 - Windows 11 ARM64（在 Snapdragon X Elite X1E78100、Windows 11 build 26220 上验证）
@@ -122,9 +96,10 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
   要逐像素还原就用 `--width 1240 --height 2772 --density 560`（软件渲染会明显变卡）。
   它超时灭屏很快：工具栏电源键或 `adb shell input keyevent WAKEUP` 亮屏，工具栏「更多 → 显示与电源 → 保持唤醒」
   （即 `adb shell svc power stayon true`）保持常亮。
-  缺 OPLUS 专有硬件服务，相关功能不可用；网络、声音未验证。细节见 docs/RESEARCH.md §21。
 - GSI 都是 user 版，SELinux 总是 enforcing；GSI 引用了 vendor 策略里没有的类型时，用 `scripts/gsi_undef_types.py`
   找出来补到 `gfx/vendor-overlay/gsi/gsi_sepolicy.cil`。
+- 没有开机向导的 GSI（如这个 ColorOS 移植包）不会写 `device_provisioned`/`user_setup_complete`，Android 会一直不响应
+  主屏幕键和最近任务；QEMU 在每次开机完成后经 adbd 把它们补成 1（无需手动处理）。
 - 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要重新生成。
 
 ## 工作原理
@@ -143,16 +118,12 @@ bootanimation ──┘   经 AHardwareBuffer 锁 gralloc    └→ virtio-gpu 2
   virtio-gpu）。改动写进 super 里的 vendor 分区（`scripts/vendor_install.py`，在 Alpine 辅助 VM 里用 e2fsprogs 完成）。
 - **qemud 服务**：Android 15 的模拟器服务（传感器、开机属性、剪贴板、GPS、摄像头列表…）走 virtio-vsock，Windows 没有
   vhost-vsock，`ranchu-vsock-device` 在 QEMU 里实现了用户态 virtio-vsock 及这些服务，并把宿主端口转发给 guest 的 adbd；
-  关窗口/`system_powerdown` 时它还会自己当 adb 客户端让 guest 执行 `svc power shutdown`（与电源菜单的"关机"同一流程）。
+  关窗口/`system_powerdown` 时它还会自己当 adb 客户端让 guest 执行 `svc power shutdown`（与电源菜单的"关机"同一流程），
+  每次开机完成后同样执行 avdctl 给的开机命令（`boot-cmd`）。
 - **首次开机**：`create`/`wipe` 在后台跑完首次开机，顺带把「私人 DNS」设为关闭（NAT 后面用不上 DNS-over-TLS，
   默认的"自动"模式在网络就绪前会让解析服务空转）。
 - **输入**：`virtio-touchscreen-pci`（单点触摸屏，另带返回/主屏幕/最近任务三个按键）+ `virtio-keyboard-pci`；
   SDL UI 修了 Windows 上的死锁并支持高 DPI。
-- **工具栏**：`tools/avdctl/toolbar.py`（Tk，独立进程）。窗口归 QEMU 的 SDL 窗口所有（owner），所以总在它上面、随它
-  最小化；带 `WS_EX_NOACTIVATE`，点按钮不抢键盘焦点。经专用 QMP 端口发 `input-send-event`（按下/松开分开发，
-  所以能长按）和 `screendump`；关闭按钮给 SDL 窗口发 `WM_CLOSE`，与点窗口的关闭按钮完全相同。
-  官方模拟器的 Qt 界面（AOSP `platform/external/qemu` 的 `android/android-ui/.../skin/qt`，GPLv2）依赖它自己的
-  模拟器内核（agents/gRPC）和 Qt，没法直接搬过来，这里按它的布局重写了一个轻量版。
 - **声音**：`virtio-sound-pci` + 官方镜像的 goldfish 音频 HAL（tinyalsa）。
 
 完整的调研与实验记录见 [docs/RESEARCH.md](docs/RESEARCH.md)（§19–§20 是当前架构）。
