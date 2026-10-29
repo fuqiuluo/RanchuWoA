@@ -786,7 +786,7 @@
 +    int r = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
 +    if (r < 0 && gf_sock_errno() != EWOULDBLOCK &&
 +        gf_sock_errno() != EINPROGRESS) {
-+        closesocket(fd);
++        close(fd);
 +        gf_adb_reg_schedule(h);
 +        return;
 +    }
@@ -826,7 +826,7 @@
 +        return;   /* 继续读到对端关闭或静默 */
 +    }
 +    qemu_set_fd_handler(h->reg_fd, NULL, NULL, NULL);
-+    closesocket(h->reg_fd);
++    close(h->reg_fd);
 +    h->reg_fd = -1;
 +    if (!h->reg_sent) {
 +        gf_adb_reg_schedule(h);
@@ -856,7 +856,7 @@
 +    a->sock = fd;
 +    if (h->early_pipe && h->early) {
 +        /* guest 已 accept 等连接：换绑 */
-+        closesocket(h->early->sock);
++        close(h->early->sock);
 +        g_free(h->early->wr_pending);
 +        g_free(h->early);
 +        h->early = a;
@@ -885,7 +885,7 @@
 +        listen(fd, 4) < 0) {
 +        error_report("gf-adb: 5555 监听失败: %s", strerror(gf_sock_errno()));
 +        if (fd >= 0) {
-+            closesocket(fd);
++            close(fd);
 +        }
 +        return;
 +    }
@@ -911,7 +911,7 @@
 +        gf_send_to_guest(s, p, tmp, r);
 +    } else if (r == 0 || gf_sock_errno() != EWOULDBLOCK) {
 +        qemu_set_fd_handler(a->sock, NULL, NULL, NULL);
-+        closesocket(a->sock);
++        close(a->sock);
 +        a->sock = -1;
 +        gf_pipe_closed_by_host(s, p);
 +    }
@@ -931,7 +931,7 @@
 +            return;
 +        } else {
 +            qemu_set_fd_handler(a->sock, NULL, NULL, NULL);
-+            closesocket(a->sock);
++            close(a->sock);
 +            a->sock = -1;
 +            gf_pipe_closed_by_host(s, p);
 +            return;
@@ -994,7 +994,7 @@
 +                off = r;
 +            } else if (r < 0 && gf_sock_errno() != EWOULDBLOCK) {
 +                qemu_set_fd_handler(a->sock, NULL, NULL, NULL);
-+                closesocket(a->sock);
++                close(a->sock);
 +                a->sock = -1;
 +                gf_pipe_closed_by_host(s, p);
 +                return;
@@ -1035,7 +1035,7 @@
 +    GfAdbPipe *a = p->priv;
 +    if (a->sock >= 0) {
 +        qemu_set_fd_handler(a->sock, NULL, NULL, NULL);
-+        closesocket(a->sock);
++        close(a->sock);
 +        a->sock = -1;
 +    }
 +    if (h->early == a) {
@@ -1826,7 +1826,7 @@
 +#endif
 --- a/hw/android/ranchu-vsock.c
 +++ b/hw/android/ranchu-vsock.c
-@@ -0,0 +1,1447 @@
+@@ -0,0 +1,1491 @@
 +/*
 + * RanchuWoA: 纯用户态 virtio-vsock 设备（ranchu-vsock-device）。
 + *
@@ -1905,6 +1905,7 @@
 +    const struct RvService *svc;
 +    void *svc_priv;
 +    GByteArray *in;             /* 服务的输入重组缓冲 */
++    QEMUTimer *connect_timer;   /* 宿主发起的连接：guest 迟迟不回 RESPONSE 就放弃 */
 +    QTAILQ_ENTRY(RvConn) next;
 +};
 +
@@ -2080,12 +2081,28 @@
 +    return c;
 +}
 +
++/*
++ * 关宿主 socket。两个坑（以前都踩了：guest 重启后 adb server 收不到断开、不再重连，adb 卡死）：
++ *  - Windows 上 QEMU 的 socket()/accept() 返回包装过的 CRT fd，只能用 close()（qemu_close_wrap）关，
++ *    closesocket() 把它当 SOCKET 句柄、静默失败；
++ *  - 即便 close() 成功，accept 出来的 socket 实测仍停在 CLOSE_WAIT/ESTABLISHED、不发 FIN（底层对象
++ *    还有别的引用），对端永远等不到断开。先 shutdown(SD_BOTH) 在协议层立即发 FIN。
++ */
++static void rv_close_sock(int fd)
++{
++    qemu_set_fd_handler(fd, NULL, NULL, NULL);
++    shutdown(fd, 2);                    /* SHUT_RDWR / SD_BOTH */
++    close(fd);
++}
++
 +static void rv_conn_free(RvConn *c)
 +{
 +    QTAILQ_REMOVE(&c->dev->conns, c, next);
++    if (c->connect_timer) {
++        timer_free(c->connect_timer);       /* 可能正在它自己的回调里：timer_free 允许 */
++    }
 +    if (c->sock >= 0) {
-+        qemu_set_fd_handler(c->sock, NULL, NULL, NULL);
-+        closesocket(c->sock);
++        rv_close_sock(c->sock);
 +    }
 +    if (c->sock_out) {
 +        g_byte_array_free(c->sock_out, true);
@@ -2099,12 +2116,38 @@
 +    g_free(c);
 +}
 +
++/*
++ * 宿主发起连接：发 REQUEST 并计时。guest 正在关机/重启、或 vsock 驱动刚起来时，REQUEST 可能没人回，
++ * 连接会一直挂在 CONNECTING、宿主 socket 也一直开着（对方以为连上了）。超时后 RST 并关掉宿主
++ * socket，让对方（adb server 等）重连。
++ */
++#define RV_CONNECT_TIMEOUT_MS 5000
++
++static void rv_connect_timeout(void *opaque)
++{
++    RvConn *c = opaque;
++
++    if (c->state == RV_CONNECTING) {
++        RV_DBG(c->dev, "guest 没回应连接请求（本端 %u -> guest %u），放弃", c->local_port,
++               c->peer_port);
++        rv_send(c, VIRTIO_VSOCK_OP_RST, 0);
++        rv_conn_free(c);
++    }
++}
++
++static void rv_conn_connect(RvConn *c)
++{
++    c->state = RV_CONNECTING;
++    c->connect_timer = timer_new_ms(QEMU_CLOCK_REALTIME, rv_connect_timeout, c);
++    timer_mod(c->connect_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + RV_CONNECT_TIMEOUT_MS);
++    rv_send(c, VIRTIO_VSOCK_OP_REQUEST, 0);
++}
++
 +/* 宿主侧主动关闭：发 SHUTDOWN，等 guest 回 RST 再释放 */
 +static void rv_conn_shutdown(RvConn *c)
 +{
 +    if (c->sock >= 0) {
-+        qemu_set_fd_handler(c->sock, NULL, NULL, NULL);
-+        closesocket(c->sock);
++        rv_close_sock(c->sock);
 +        c->sock = -1;
 +    }
 +    if (c->state == RV_CONNECTED) {
@@ -2219,7 +2262,7 @@
 +            /* 忽略 */
 +        }
 +    }
-+    closesocket(fd);
++    rv_close_sock(fd);
 +}
 +
 +/*
@@ -2732,12 +2775,11 @@
 +    a->boot = boot;
 +
 +    RvConn *c = rv_conn_new(s, rv_next_port(s), RV_ADBD_PORT);
-+    c->state = RV_CONNECTING;
 +    c->svc = &rv_adbctl_service;
 +    c->svc_priv = a;
 +    c->name_done = true;                /* 不是 guest 发起的服务连接，没有服务名 */
 +    c->in = g_byte_array_new();
-+    rv_send(c, VIRTIO_VSOCK_OP_REQUEST, 0);
++    rv_conn_connect(c);
 +}
 +
 +/*
@@ -2892,24 +2934,26 @@
 +    RvForward *f = opaque;
 +    RanchuVsock *s = f->dev;
 +    VirtIODevice *vdev = VIRTIO_DEVICE(s);
-+    struct sockaddr_in sa;
-+    socklen_t slen = sizeof(sa);
-+    int fd = accept(f->listen_fd, (struct sockaddr *)&sa, &slen);
 +
-+    if (fd < 0) {
-+        return;
++    for (;;) {                          /* 一次取完 backlog（监听 socket 是非阻塞的） */
++        struct sockaddr_in sa;
++        socklen_t slen = sizeof(sa);
++        int fd = accept(f->listen_fd, (struct sockaddr *)&sa, &slen);
++
++        if (fd < 0) {
++            return;
++        }
++        if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
++            rv_close_sock(fd);    /* guest 驱动还没起来 */
++            continue;
++        }
++        qemu_set_blocking(fd, false, NULL);
++        RvConn *c = rv_conn_new(s, rv_next_port(s), f->guest_port);
++        c->sock = fd;
++        RV_DBG(s, "宿主 %u 连入，向 guest:%u 发 REQUEST（本端 %u）", f->host_port, f->guest_port,
++               c->local_port);
++        rv_conn_connect(c);
 +    }
-+    if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
-+        closesocket(fd);    /* guest 驱动还没起来 */
-+        return;
-+    }
-+    qemu_set_blocking(fd, false, NULL);
-+    RvConn *c = rv_conn_new(s, rv_next_port(s), f->guest_port);
-+    c->sock = fd;
-+    c->state = RV_CONNECTING;
-+    RV_DBG(s, "宿主 %u 连入，向 guest:%u 发 REQUEST（本端 %u）", f->host_port, f->guest_port,
-+           c->local_port);
-+    rv_send(c, VIRTIO_VSOCK_OP_REQUEST, 0);
 +}
 +
 +static void rv_forward_setup(RanchuVsock *s, Error **errp)
@@ -2934,7 +2978,7 @@
 +        if (fd < 0 || bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 || listen(fd, 8) < 0) {
 +            error_setg(errp, "ranchu-vsock: 无法监听 127.0.0.1:%u", hp);
 +            if (fd >= 0) {
-+                closesocket(fd);
++                close(fd);
 +            }
 +            return;
 +        }
@@ -3171,7 +3215,7 @@
 +    for (guint i = 0; i < s->forwards->len; i++) {
 +        RvForward *f = g_ptr_array_index(s->forwards, i);
 +        qemu_set_fd_handler(f->listen_fd, NULL, NULL, NULL);
-+        closesocket(f->listen_fd);
++        close(f->listen_fd);
 +    }
 +    g_ptr_array_free(s->forwards, true);
 +    virtio_delete_queue(s->rx_vq);
