@@ -3785,6 +3785,53 @@
  }
  
  type_init(virtio_register_types)
+--- a/hw/intc/arm_gicv3_whpx.c
++++ b/hw/intc/arm_gicv3_whpx.c
+@@ -20,6 +20,7 @@
+ #include "migration/blocker.h"
+ #include "qom/object.h"
+ #include "target/arm/cpregs.h"
++#include "target/arm/whpx_arm.h"
+ 
+ #include "hw/arm/bsa.h"
+ #include <winhvplatform.h>
+@@ -93,6 +94,21 @@
+     memset(c->icc_igrpen, 0, sizeof(c->icc_igrpen));
+ }
+ 
++static void whpx_set_reg(CPUState *cpu, WHV_REGISTER_NAME reg, WHV_REGISTER_VALUE val);
++
++/*
++ * RanchuWoA: 每个 vCPU 的重分发器基址，realize 时设。guest 重启时的分区 reset 会把它清掉，
++ * 那之后由 whpx_set_registers（RESET_STATE）重设（见 target/arm/whpx/whpx-all.c）；这里的
++ * reset_hold 不能设——那时分区还没 reset，跑过的 vCPU 不让改（HV_STATUS_INVALID_VP_STATE）。
++ */
++static void whpx_gicv3_set_redist_bases(GICv3State *s)
++{
++    for (int i = 0; i < s->num_cpu; i++) {
++        WHV_REGISTER_VALUE val = {.Reg64 = WHPX_GICR_BASE(i)};
++        whpx_set_reg(qemu_get_cpu(i), WHvArm64RegisterGicrBaseGpa, val);
++    }
++}
++
+ static void whpx_gicv3_reset_hold(Object *obj, ResetType type)
+ {
+     GICv3State *s = ARM_GICV3_COMMON(obj);
+@@ -185,12 +201,9 @@
+ 
+     gicv3_init_irqs_and_mmio(s, whpx_gicv3_set_irq, NULL);
+ 
++    whpx_gicv3_set_redist_bases(s);
+     for (i = 0; i < s->num_cpu; i++) {
+-        CPUState *cpu_state = qemu_get_cpu(i);
+-        ARMCPU *cpu = ARM_CPU(cpu_state);
+-        WHV_REGISTER_VALUE val = {.Reg64 = 0x080A0000 + (GICV3_REDIST_SIZE * i)};
+-        whpx_set_reg(cpu_state, WHvArm64RegisterGicrBaseGpa, val);
+-        define_arm_cp_regs(cpu, gicv3_cpuif_reginfo);
++        define_arm_cp_regs(ARM_CPU(qemu_get_cpu(i)), gicv3_cpuif_reginfo);
+     }
+ 
+     if (s->maint_irq) {
 --- a/hw/virtio/virtio-input-pci.c
 +++ b/hw/virtio/virtio-input-pci.c
 @@ -30,6 +30,7 @@
@@ -3877,6 +3924,163 @@
  };
  
  struct VirtIOInputHost {
+--- a/target/arm/whpx/whpx-all.c
++++ b/target/arm/whpx/whpx-all.c
+@@ -16,6 +16,7 @@
+ #include "system/whpx.h"
+ #include "system/cpus.h"
+ #include "system/runstate.h"
++#include "system/reset.h"
+ #include "qemu/main-loop.h"
+ #include "hw/core/boards.h"
+ #include "qemu/error-report.h"
+@@ -385,6 +386,21 @@
+     return 0;
+ }
+ 
++/*
++ * RanchuWoA: guest 重启 / system_reset 时的分区级 reset（重置 Hyper-V 里的 vGIC、PSCI 等内部状态）。
++ * 必须在所有 vCPU 都停下时调用 WHvResetPartition：reset handler 只做标记，由 reset 后第一个
++ * 恢复寄存器的 vCPU（这时其余 vCPU 都已暂停）执行，见 whpx_set_registers。
++ */
++static bool whpx_vcpus_ran;
++static bool whpx_partition_reset_pending;
++
++static void whpx_reset_handler(void *opaque)
++{
++    if (whpx_vcpus_ran) {           /* 启动时的第一次 reset 不需要 */
++        whpx_partition_reset_pending = true;
++    }
++}
++
+ static void whpx_psci_cpu_off(ARMCPU *arm_cpu)
+ {
+     int32_t ret = arm_set_cpu_off(arm_cpu_mp_affinity(arm_cpu));
+@@ -402,6 +418,7 @@
+ 
+     g_assert(bql_locked());
+ 
++    whpx_vcpus_ran = true;
+     if (whpx->running_cpus++ == 0) {
+         ret = whpx_first_vcpu_starting(cpu);
+         if (ret != 0) {
+@@ -471,8 +488,12 @@
+             if (arm_cpu->power_state != PSCI_OFF) {
+                 whpx_psci_cpu_off(arm_cpu);
+             }
+-            /* Partition-wide reset, to reset state for reboots to succeed. */
+-            whp_dispatch.WHvResetPartition(whpx->partition);
++            /*
++             * RanchuWoA: 分区级 reset 不能在这里做——其余 vCPU 还在 WHvRunVirtualProcessor 里，
++             * WHvResetPartition 会以 WHV_E_INVALID_VP_STATE 失败（原来不检查返回值），GIC/PSCI 状态
++             * 原样留给第二次开机，内核卡在拉起副核。改到 system reset 里所有 vCPU 都停下之后做，
++             * 见 whpx_reset_handler / whpx_set_registers。
++             */
+             bql_unlock();
+             break;
+         case WHvRunVpExitReasonNone:
+@@ -516,6 +537,25 @@
+     memset(val, 0, sizeof(WHV_REGISTER_VALUE));
+ }
+ 
++/*
++ * MIDR/MPIDR 是 CP_NO_RAW 寄存器，不在常规的寄存器同步里，只在 vCPU 创建时设一次。
++ * RanchuWoA: guest 重启时的 WHvResetPartition 会把每核状态清回默认，reset 时要重新设
++ * （同理 GIC 重分发器基址，见 arm_gicv3_whpx.c）。
++ */
++static void whpx_set_id_regs(CPUState *cpu)
++{
++    ARMCPU *arm_cpu = ARM_CPU(cpu);
++    WHV_REGISTER_VALUE val;
++
++    clean_whv_register_value(&val);
++    val.Reg64 = arm_cpu->midr;
++    whpx_set_reg(cpu, WHvArm64RegisterMidrEl1, val);
++
++    clean_whv_register_value(&val);
++    val.Reg64 = deposit64(arm_cpu->mp_affinity, 31, 1, 1 /* RES1 */);
++    whpx_set_reg(cpu, WHvArm64RegisterMpidrEl1, val);
++}
++
+ void whpx_get_registers(CPUState *cpu, WHPXStateLevel level)
+ {
+     ARMCPU *arm_cpu = ARM_CPU(cpu);
+@@ -573,6 +613,15 @@
+ 
+     assert(cpu_is_stopped(cpu) || qemu_cpu_is_self(cpu));
+ 
++    if (level == WHPX_LEVEL_RESET_STATE && whpx_partition_reset_pending) {
++        /* system reset 期间所有 vCPU 都已暂停，这时分区 reset 才会成功；之后各 vCPU 再写回寄存器 */
++        HRESULT hr = whp_dispatch.WHvResetPartition(whpx_global.partition);
++        if (FAILED(hr)) {
++            error_report("WHPX: WHvResetPartition failed, hr=%08lx", hr);
++        }
++        whpx_partition_reset_pending = false;
++    }
++
+     for (i = 0; i < ARRAY_SIZE(whpx_reg_match); i++) {
+         val.Reg64 = *(uint64_t *)((char *)env + whpx_reg_match[i].offset);
+         whpx_set_reg(cpu, whpx_reg_match[i].reg, val);
+@@ -615,6 +664,11 @@
+     }
+ 
+     if (level == WHPX_LEVEL_RESET_STATE) {
++        /* 分区 reset 会清掉这些只在创建时设过的每核寄存器 */
++        whpx_set_id_regs(cpu);
++        clean_whv_register_value(&val);
++        val.Reg64 = WHPX_GICR_BASE(cpu->cpu_index);
++        whpx_set_reg(cpu, WHvArm64RegisterGicrBaseGpa, val);
+         /*
+          * WHPX keeps the "vCPU is in a low-power wait" state (entered when the
+          * guest executes WFI/WFE) in WHvRegisterInternalActivityState, and that
+@@ -788,7 +842,6 @@
+ 
+     uint32_t sregs_match_len = ARRAY_SIZE(whpx_sreg_match);
+     uint32_t sregs_cnt = 0;
+-    WHV_REGISTER_VALUE val;
+     int i;
+ 
+     hr = whp_dispatch.WHvCreateVirtualProcessor(
+@@ -836,14 +889,7 @@
+     assert(write_cpustate_to_list(arm_cpu, false));
+ 
+     /* Set CP_NO_RAW system registers on init */
+-    val.Reg64 = arm_cpu->midr;
+-    whpx_set_reg(cpu, WHvArm64RegisterMidrEl1,
+-                              val);
+-
+-    clean_whv_register_value(&val);
+-
+-    val.Reg64 = deposit64(arm_cpu->mp_affinity, 31, 1, 1 /* RES1 */);
+-    whpx_set_reg(cpu, WHvArm64RegisterMpidrEl1, val);
++    whpx_set_id_regs(cpu);
+ 
+     clamp_id_aa64mmfr0_parange_to_ipa_size(&arm_cpu->isar);
+     return 0;
+@@ -1023,6 +1069,7 @@
+     }
+ 
+     whpx_memory_init();
++    qemu_register_reset(whpx_reset_handler, NULL);
+ 
+     return 0;
+ 
+--- a/target/arm/whpx_arm.h
++++ b/target/arm/whpx_arm.h
+@@ -10,6 +10,13 @@
+ #define QEMU_WHPX_ARM_H
+ 
+ #include "target/arm/cpu-qom.h"
++#include "hw/intc/arm_gicv3_common.h"
++
++/*
++ * RanchuWoA: virt 板 GICv3 重分发器区（VIRT_GIC_REDIST）里第 n 个 vCPU 的帧。
++ * arm_gicv3_whpx.c 在 realize/reset 时设，分区 reset 后 whpx_set_registers 也要重设。
++ */
++#define WHPX_GICR_BASE(n) (0x080A0000ULL + (uint64_t)GICV3_REDIST_SIZE * (n))
+ 
+ uint32_t whpx_arm_get_ipa_bit_size(void);
+ void whpx_arm_set_cpu_features_from_host(ARMCPU *cpu);
 --- a/ui/sdl2.c
 +++ b/ui/sdl2.c
 @@ -24,6 +24,7 @@
