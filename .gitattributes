@@ -1,0 +1,4 @@
+# 项目在 Windows 上开发，但补丁、shell 脚本要在 Git Bash / MSYS2 里用，统一 LF
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.png binary

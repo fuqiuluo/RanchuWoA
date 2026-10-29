@@ -1,0 +1,27 @@
+# 本地生成 / 下载的大文件与专有材料，不进仓库（见 README「目录说明」）
+/images/
+/downloads/
+/logs/
+/debug/
+/dist/
+/.zcode/
+
+# 只在本地给开发会话（Claude Code）用的文档：开发约定、交接说明
+/CLAUDE.md
+/docs/HANDOFF.md
+
+# 可由上游源码 + patches/ 复原的源码树
+/qemu-ranchu/
+/gfx/swiftshader/
+
+# 构建环境与构建产物
+/gfx/android-ndk-r27c/
+/gfx/ss-build/
+/gfx/egl-out/
+/gfx/device-libs/
+/gfx/gralloc/out/
+/gfx/gralloc/gen/
+/gfx/legacy/nullgfx/out/
+
+__pycache__/
+*.pyc
