@@ -1,0 +1,4 @@
+# RanchuWoA: SwiftShader egl 注入钩子（预留：注入到 system.img 的 /system/etc/init/ 下才生效；
+# ramdisk 根目录的 .rc 会被 second-stage switch_root 丢弃，不要放那里）
+on post-fs-data
+    mount none /data/local/tmp/egl /vendor/lib64/egl bind

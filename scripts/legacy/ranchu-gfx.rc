@@ -1,0 +1,5 @@
+# RanchuWoA: data disk root (holds SwiftShader .so) -> vendor egl dir.
+# File modes and SELinux xattrs persist inside data.img.
+on post-fs-data
+    wait /dev/block/vdc
+    mount ext4 /dev/block/vdc /vendor/lib64/egl rw
