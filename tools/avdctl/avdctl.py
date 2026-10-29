@@ -71,6 +71,11 @@ DEV_QEMU = ROOT / "qemu-ranchu" / "build" / "qemu-system-aarch64.exe"
 DEFAULTS = {"width": 720, "height": 1280, "density": 320, "ram": 4096, "cores": 4,
             "data_size": "8G"}
 
+# 每次开机完成后由 QEMU（ranchu-vsock 的 boot-cmd）经 adbd 执行。正常是开机向导走完时写这两个标志
+# （官方镜像由 googlesdksetup 代劳）；没有开机向导的 GSI（如 ColorOS 移植包）永远是 0，而这时 Android
+# 不响应主屏幕键和最近任务（"Not going home because user setup is in progress"）。命令要幂等、不含逗号。
+BOOT_CMD = "settings put global device_provisioned 1; settings put secure user_setup_complete 1"
+
 
 def log(msg: str) -> None:
     print(f"[avdctl] {msg}", flush=True)
@@ -442,7 +447,8 @@ def build_cmdline(name: str, d: Path, cfg: dict, headless: bool, verbose: bool =
         "androidboot.logcat=*:I",
     ])
     tz = host_timezone()
-    vsock = f"ranchu-vsock-device,id=vsock0,forward={p['adb']}:5555,boot-props=qemu.timezone={tz}"
+    vsock = (f"ranchu-vsock-device,id=vsock0,forward={p['adb']}:5555,boot-props=qemu.timezone={tz},"
+             f"boot-cmd={BOOT_CMD}")
     if cfg.get("gps"):
         vsock += f",gps={cfg['gps']}"
     # 声音：virtio-snd（guest 内核自带 virtio_snd 模块，goldfish 音频 HAL 走 tinyalsa card0/pcm0）。
