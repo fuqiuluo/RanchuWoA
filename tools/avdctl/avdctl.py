@@ -11,8 +11,9 @@
   py tools/avdctl/avdctl.py list                       列出实例及运行状态
   py tools/avdctl/avdctl.py edit <名字> [选项]        改分辨率/密度/内存/核数/声音（--width --height --density
        --ram --cores --audio --mic/--no-mic），下次启动生效
-  py tools/avdctl/avdctl.py start <名字> [--headless] [--wait] [--foreground]
+  py tools/avdctl/avdctl.py start <名字> [--headless] [--wait] [--foreground] [--no-toolbar]
        [--verbose-boot]（内核/init 日志进 logs/console.log） [--selinux permissive|enforcing]（默认 enforcing）
+  py tools/avdctl/avdctl.py toolbar <名字>             重新打开侧边工具栏（start 时会自动打开）
   py tools/avdctl/avdctl.py stop <名字> [--force]     正常关机（同关窗口：system_powerdown → svc power shutdown），
                                                        --force 直接退出 QEMU
   py tools/avdctl/avdctl.py wipe <名字> [--no-firstboot]   清空 userdata（恢复出厂）
@@ -20,8 +21,9 @@
   py tools/avdctl/avdctl.py geo <名字> <纬度> <经度> [海拔]   设置 GPS 位置（运行中立即生效，并记入配置）
   py tools/avdctl/avdctl.py dist                       把补丁版 QEMU 及其 DLL 打包到 dist/qemu（脱离 MSYS2 运行）
 
-窗口：SDL；鼠标左键=触摸，右键/侧键后退=返回，中键=主屏幕，侧键前进=最近任务；Ctrl+Alt+P=电源键；键盘直通；
-剪贴板与 Windows 双向同步；声音经 virtio-snd 输出到 Windows；GPS 默认位于 Google 总部（avdctl geo 修改）。
+窗口：SDL + 右侧工具栏（toolbar.py：电源/音量/截图/返回/主屏幕/最近任务/位置/窗口大小…）；
+鼠标左键=触摸，右键/侧键后退=返回，中键=主屏幕，侧键前进=最近任务；Ctrl+Alt+P=电源键；键盘直通；
+剪贴板与 Windows 双向同步；声音经 virtio-snd 输出到 Windows；GPS 默认位于 Google 总部（avdctl geo 或工具栏修改）。
 adb：启动后自动出现在 `adb devices`（emulator-5554、5556…），也可 adb connect 127.0.0.1:<adb 端口>。
 """
 
@@ -206,9 +208,11 @@ def save_cfg(d: Path, cfg: dict) -> None:
 
 
 def ports_of(cfg: dict) -> dict:
+    """qmp_ui 是侧边工具栏专用的 QMP 端口（工具栏一直连着，QMP 端口同时只服务一个客户端）。"""
     i = cfg["index"]
     base = 25400 + 10 * i
-    return {"adb": 5555 + 2 * i, "console": base, "monitor": base + 1, "qmp": base + 2}
+    return {"adb": 5555 + 2 * i, "console": base, "monitor": base + 1, "qmp": base + 2,
+            "qmp_ui": base + 3}
 
 
 def run_info(d: Path) -> dict | None:
@@ -475,6 +479,7 @@ def build_cmdline(name: str, d: Path, cfg: dict, headless: bool, verbose: bool =
         "-serial", "chardev:con0",
         "-monitor", f"tcp:127.0.0.1:{p['monitor']},server,nowait",
         "-qmp", f"tcp:127.0.0.1:{p['qmp']},server,nowait",
+        "-qmp", f"tcp:127.0.0.1:{p['qmp_ui']},server,nowait",
     ]
 
 
@@ -527,13 +532,19 @@ def do_start(args) -> None:
     qlog = d / "logs" / "qemu.log"
     serial = f"emulator-{p['adb'] - 1}"
     log(f"启动 {args.name}：{cfg['width']}x{cfg['height']}，adb {serial} / 127.0.0.1:{p['adb']}")
+    toolbar = not args.headless and not args.no_toolbar
     if args.foreground:
         _, env = qemu_exe()
-        sys.exit(subprocess.run(build_cmdline(args.name, d, cfg, args.headless, args.verbose_boot),
-                                env=env).returncode)
+        proc = subprocess.Popen(build_cmdline(args.name, d, cfg, args.headless, args.verbose_boot),
+                                env=env)
+        if toolbar:
+            spawn_toolbar(args.name, proc.pid)
+        sys.exit(proc.wait())
     proc = launch(args.name, d, cfg, args.headless, qlog, args.verbose_boot)
     (d / "run.json").write_text(json.dumps({"pid": proc.pid, "adb_serial": serial, **p}, indent=2),
                                 encoding="utf-8")
+    if toolbar:
+        spawn_toolbar(args.name, proc.pid)
     if not args.wait:
         log(f"已启动 pid {proc.pid}；日志 {qlog}")
         return
@@ -541,6 +552,25 @@ def do_start(args) -> None:
         log(f"开机完成，用时 {wait_boot(proc, qlog):.0f}s；adb -s {serial} shell")
     except RuntimeError as e:
         sys.exit(str(e))
+
+
+def spawn_toolbar(name: str, pid: int) -> None:
+    """拉起侧边工具栏（toolbar.py，用 pythonw 免得多一个控制台窗口；QEMU 退出时它自己退出）。"""
+    exe = Path(sys.executable)
+    pyw = exe.with_name("pythonw.exe")
+    subprocess.Popen([str(pyw if pyw.exists() else exe), "-X", "utf8",
+                      str(Path(__file__).with_name("toolbar.py")), name, "--pid", str(pid)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=0x00000008 | 0x00000200)   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+
+
+def do_toolbar(args) -> None:
+    d = avd_dir(args.name)
+    info = run_info(d)
+    if not info:
+        sys.exit(f"{args.name} 没有在运行")
+    spawn_toolbar(args.name, info["pid"])
+    log(f"已打开 {args.name} 的工具栏（已经开着时不会重复打开；出错看 logs/toolbar.log）")
 
 
 def console_cmd(port: int, cmd: str) -> bool:
@@ -746,6 +776,8 @@ def main() -> None:
     p.add_argument("--verbose-boot", action="store_true",
                    help="内核/init 日志全部打到串口控制台（logs/console.log）")
     p.add_argument("--selinux", choices=["permissive", "enforcing"], help="本次启动的 SELinux 模式")
+    p.add_argument("--no-toolbar", action="store_true", help="不打开侧边工具栏")
+    sub.add_parser("toolbar").add_argument("name")
     p = sub.add_parser("wipe")
     p.add_argument("name")
     p.add_argument("--no-firstboot", action="store_true")
@@ -762,7 +794,7 @@ def main() -> None:
     args = ap.parse_args()
     {"prepare": do_prepare, "create": do_create, "list": do_list, "edit": do_edit, "start": do_start,
      "stop": do_stop, "wipe": do_wipe, "delete": do_delete, "geo": do_geo,
-     "dist": do_dist}[args.cmd](args)
+     "toolbar": do_toolbar, "dist": do_dist}[args.cmd](args)
 
 
 if __name__ == "__main__":
