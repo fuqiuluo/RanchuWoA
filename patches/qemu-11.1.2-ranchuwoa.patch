@@ -1826,7 +1826,7 @@
 +#endif
 --- a/hw/android/ranchu-vsock.c
 +++ b/hw/android/ranchu-vsock.c
-@@ -0,0 +1,1364 @@
+@@ -0,0 +1,1447 @@
 +/*
 + * RanchuWoA: 纯用户态 virtio-vsock 设备（ranchu-vsock-device）。
 + *
@@ -1841,7 +1841,8 @@
 + *   - 宿主 TCP 转发：forward=<宿主端口>:<guest 端口>[;...]，本机连上宿主端口后
 + *     由设备向 guest 发起 vsock 连接（adb connect 127.0.0.1:<宿主端口> 直连 guest adbd）；
 + *   - 正常关机：guest 开机完成后（poweroff-ready），system_powerdown（QMP/HMP、SDL 关窗）由设备
-+ *     自己当 adb 客户端连 guest adbd 执行 svc power shutdown，取代板子的电源键（Android 只把它当锁屏）。
++ *     自己当 adb 客户端连 guest adbd 执行 svc power shutdown，取代板子的电源键（Android 只把它当锁屏）；
++ *   - 开机命令：boot-cmd=<shell 命令>，每次开机完成后同样经 adbd 执行（adbd 没起来时重试几次）。
 + * 其余目标端口一律 RST（guest 的 vsock ping 端口 5001 本来就期望失败）。
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later
@@ -1946,6 +1947,9 @@
 +    double gps_lat, gps_lon, gps_alt;   /* qemud:gps 报给 guest 的固定位置（gps 属性） */
 +    bool boot_completed;        /* 收到过 QemuMiscPipe 的 bootcomplete（guest 重启时清零） */
 +    Notifier powerdown;         /* system_powerdown / 关窗 → 经 adbd 请求 guest 正常关机 */
++    char *boot_cmd;             /* 每次开机完成后经 adbd 执行的 shell 命令（boot-cmd 属性） */
++    QEMUTimer *boot_cmd_timer;
++    int boot_cmd_tries;
 +};
 +
 +#define RV_DBG(s, fmt, ...) do { \
@@ -2270,6 +2274,10 @@
 +            c->dev->boot_completed = true;
 +            /* 开机完成时 adbd 可能因 usb 配置变化重启一次，稍等再登记 */
 +            timer_mod(c->dev->adb_reg_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 3000);
++            if (c->dev->boot_cmd && *c->dev->boot_cmd) {
++                c->dev->boot_cmd_tries = 0;
++                timer_mod(c->dev->boot_cmd_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 4000);
++            }
 +        } else if (strcmp(msg, "heartbeat") == 0) {
 +            rv_adb_register(c->dev);    /* adb server 后启动/重启时也能在 30 秒内发现模拟器 */
 +        }
@@ -2594,18 +2602,30 @@
 +}
 +
 +/*
-+ * ---- 宿主发起的 adb 客户端：请求 guest 正常关机 ----
-+ * 模拟器镜像 ro.adb.secure=0，adbd 在 vsock:5555 上无需认证：CNXN 握手后 OPEN 一条关机的 shell 命令。
++ * ---- 宿主发起的 adb 客户端：经 guest adbd 执行 shell 命令（正常关机、开机命令） ----
++ * 模拟器镜像 ro.adb.secure=0，adbd 在 vsock:5555 上无需认证：CNXN 握手后 OPEN 一条 shell 命令。
 + * 协议见 AOSP packages/modules/adb/protocol.txt：24 字节小端头
 + * {命令, arg0, arg1, 负载长度, 负载字节和, 命令 ^ 0xffffffff} + 负载。
 + */
 +#define ADB_CNXN    0x4e584e43
++#define ADB_AUTH    0x48545541
 +#define ADB_OPEN    0x4e45504f
 +#define ADB_OKAY    0x59414b4f
 +#define ADB_WRTE    0x45545257
++#define ADB_CLSE    0x45534c43
 +#define ADB_VERSION 0x01000001
 +#define ADB_MAXDATA (256 * 1024)
 +#define ADB_LOCAL_ID 1
++#define RV_BOOT_CMD_TRIES 5
++
++/* 一次宿主发起的 shell 命令（连接的 svc_priv） */
++typedef struct RvAdbCmd {
++    char *service;              /* "shell:<命令>" */
++    const char *what;           /* 日志用的说明 */
++    bool boot;                  /* 开机命令：adbd 还没起来（连接被 RST）时稍后重试 */
++    bool accepted;              /* adbd 已回 OKAY，命令在跑 */
++    bool give_up;               /* adbd 要求认证，重试也没用 */
++} RvAdbCmd;
 +
 +static void rv_adb_msg(RvConn *c, uint32_t cmd, uint32_t arg0, uint32_t arg1,
 +                       const char *data, uint32_t len)
@@ -2637,6 +2657,8 @@
 +
 +static void rv_adbctl_recv(RvConn *c, const uint8_t *data, size_t len)
 +{
++    RvAdbCmd *a = c->svc_priv;
++
 +    g_byte_array_append(c->in, data, len);
 +    while (c->in->len >= 24) {
 +        uint32_t cmd = ldl_le_p(c->in->data);
@@ -2650,21 +2672,47 @@
 +            return;
 +        }
 +        g_byte_array_remove_range(c->in, 0, 24 + plen);
-+        if (cmd == ADB_CNXN) {
-+            /*
-+             * svc power shutdown 走框架的 ShutdownThread（关机广播、AM/PM 收尾），与电源菜单的"关机"相同；
-+             * 它在关机完成前不返回，失败（如 system_server 异常）时才退回 init 层的 reboot -p
-+             */
-+            static const char svc[] = "shell:svc power shutdown || reboot -p";
-+            info_report("ranchu-vsock: 经 adbd 请求 guest 关机");
-+            rv_adb_msg(c, ADB_OPEN, ADB_LOCAL_ID, 0, svc, sizeof(svc));
-+        } else if (cmd == ADB_WRTE) {
++        switch (cmd) {
++        case ADB_CNXN:
++            info_report("ranchu-vsock: 经 adbd %s", a->what);
++            rv_adb_msg(c, ADB_OPEN, ADB_LOCAL_ID, 0, a->service, strlen(a->service) + 1);
++            break;
++        case ADB_AUTH:
++            warn_report("ranchu-vsock: guest adbd 要求认证（ro.adb.secure=1），没法%s", a->what);
++            a->give_up = true;
++            rv_conn_shutdown(c);        /* 仍是 CONNECTED：只发 SHUTDOWN，等 guest RST 再释放 */
++            return;
++        case ADB_OKAY:
++            a->accepted = true;
++            break;
++        case ADB_WRTE:
 +            rv_adb_msg(c, ADB_OKAY, ADB_LOCAL_ID, arg0, NULL, 0);    /* 命令输出，确认后丢弃 */
++            break;
++        case ADB_CLSE:                  /* 命令跑完了 */
++            rv_adb_msg(c, ADB_CLSE, ADB_LOCAL_ID, arg0, NULL, 0);
++            rv_conn_shutdown(c);
++            return;
 +        }
 +    }
 +}
 +
-+static const RvService rv_adbctl_service = { "（宿主 adb 客户端）", rv_adbctl_open, rv_adbctl_recv, NULL };
++static void rv_adbctl_close(RvConn *c)
++{
++    RvAdbCmd *a = c->svc_priv;
++    RanchuVsock *s = c->dev;
++
++    /* 开机命令没被 adbd 接受（开机完成前后 adbd 会重启一次，这时连接被 RST）：过几秒再试 */
++    if (a->boot && !a->accepted && !a->give_up && s->boot_completed &&
++        s->boot_cmd_tries < RV_BOOT_CMD_TRIES) {
++        timer_mod(s->boot_cmd_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 3000);
++    }
++    g_free(a->service);
++    g_free(a);
++}
++
++static const RvService rv_adbctl_service = {
++    "（宿主 adb 客户端）", rv_adbctl_open, rv_adbctl_recv, rv_adbctl_close
++};
 +
 +static uint32_t rv_next_port(RanchuVsock *s)
 +{
@@ -2673,6 +2721,37 @@
 +        s->next_local_port = 49152;
 +    }
 +    return port;
++}
++
++/* 宿主发起一条 vsock 连接到 guest adbd，握手后执行 shell 命令 */
++static void rv_adb_shell(RanchuVsock *s, const char *cmd, const char *what, bool boot)
++{
++    RvAdbCmd *a = g_new0(RvAdbCmd, 1);
++    a->service = g_strconcat("shell:", cmd, NULL);
++    a->what = what;
++    a->boot = boot;
++
++    RvConn *c = rv_conn_new(s, rv_next_port(s), RV_ADBD_PORT);
++    c->state = RV_CONNECTING;
++    c->svc = &rv_adbctl_service;
++    c->svc_priv = a;
++    c->name_done = true;                /* 不是 guest 发起的服务连接，没有服务名 */
++    c->in = g_byte_array_new();
++    rv_send(c, VIRTIO_VSOCK_OP_REQUEST, 0);
++}
++
++/*
++ * 开机命令（boot-cmd 属性）：avdctl 用它补上没有开机向导的 GSI 不会写的 device_provisioned /
++ * user_setup_complete（为 0 时 Android 不响应主屏幕键和最近任务）。每次开机都执行，命令本身要幂等。
++ */
++static void rv_boot_cmd_timer_cb(void *opaque)
++{
++    RanchuVsock *s = opaque;
++
++    if (s->boot_completed && s->boot_cmd && *s->boot_cmd) {
++        s->boot_cmd_tries++;
++        rv_adb_shell(s, s->boot_cmd, "执行开机命令", true);
++    }
 +}
 +
 +/* guest 开机完成后才有 adbd 可连；之前的关机请求交给板子的电源键 */
@@ -2688,12 +2767,11 @@
 +    if (!rv_poweroff_ready(s)) {
 +        return;
 +    }
-+    RvConn *c = rv_conn_new(s, rv_next_port(s), RV_ADBD_PORT);
-+    c->state = RV_CONNECTING;
-+    c->svc = &rv_adbctl_service;
-+    c->name_done = true;                /* 不是 guest 发起的服务连接，没有服务名 */
-+    c->in = g_byte_array_new();
-+    rv_send(c, VIRTIO_VSOCK_OP_REQUEST, 0);
++    /*
++     * svc power shutdown 走框架的 ShutdownThread（关机广播、AM/PM 收尾），与电源菜单的"关机"相同；
++     * 它在关机完成前不返回，失败（如 system_server 异常）时才退回 init 层的 reboot -p
++     */
++    rv_adb_shell(s, "svc power shutdown || reboot -p", "请求 guest 关机", false);
 +}
 +
 +static const RvService rv_services[] = {
@@ -3049,8 +3127,9 @@
 +{
 +    RanchuVsock *s = RANCHU_VSOCK(vdev);
 +
++    s->boot_completed = false;          /* 先清：丢弃连接时开机命令不会再排重试 */
++    timer_del(s->boot_cmd_timer);
 +    rv_drop_all(s);
-+    s->boot_completed = false;
 +}
 +
 +static void rv_realize(DeviceState *dev, Error **errp)
@@ -3073,6 +3152,7 @@
 +    s->evt_vq = virtio_add_queue(vdev, 16, rv_handle_evt);
 +
 +    s->adb_reg_timer = timer_new_ms(QEMU_CLOCK_REALTIME, rv_adb_reg_timer_cb, s);
++    s->boot_cmd_timer = timer_new_ms(QEMU_CLOCK_REALTIME, rv_boot_cmd_timer_cb, s);
 +    s->powerdown.notify = rv_powerdown_req;
 +    qemu_register_powerdown_notifier(&s->powerdown);
 +    rv_clip_init(s);
@@ -3084,7 +3164,9 @@
 +    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
 +    RanchuVsock *s = RANCHU_VSOCK(dev);
 +
++    s->boot_completed = false;
 +    rv_drop_all(s);
++    timer_free(s->boot_cmd_timer);
 +    notifier_remove(&s->powerdown);
 +    for (guint i = 0; i < s->forwards->len; i++) {
 +        RvForward *f = g_ptr_array_index(s->forwards, i);
@@ -3102,6 +3184,7 @@
 +    DEFINE_PROP_UINT64("guest-cid", RanchuVsock, guest_cid, 3),
 +    DEFINE_PROP_STRING("forward", RanchuVsock, forward),
 +    DEFINE_PROP_STRING("boot-props", RanchuVsock, boot_props),
++    DEFINE_PROP_STRING("boot-cmd", RanchuVsock, boot_cmd),
 +    DEFINE_PROP_BOOL("debug", RanchuVsock, debug, false),
 +};
 +
