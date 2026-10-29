@@ -1,0 +1,10 @@
+# RanchuWoA nullgfx: host 无关图形栈
+on post-fs-data
+    mount none /data/local/tmp/egl /vendor/lib64/egl bind
+    setprop ro.vendor.hwcomposer.display_finder_mode noop
+
+service vendor.nullgfxd /data/local/tmp/nullgfx/allocatord
+    class core
+    user root
+    group root
+    seclabel u:r:su:s0

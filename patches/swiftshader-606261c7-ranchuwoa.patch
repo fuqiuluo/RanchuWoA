@@ -1,0 +1,5167 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1a0c31257..6f676bd9f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,7 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-cmake_minimum_required(VERSION 3.13)
++cmake_minimum_required(VERSION 3.16)
+ 
+ project(SwiftShader C CXX ASM)
+ 
+@@ -31,7 +31,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+     set(LINUX TRUE)
+ elseif(CMAKE_SYSTEM_NAME MATCHES "Android")
+     set(ANDROID TRUE)
+-    set(CMAKE_CXX_FLAGS "-DANDROID_NDK_BUILD")
++    # RanchuWoA: 作为 vendor GLES 驱动（ro.hardware.egl=swiftshader）构建，走平台路径：
++    # EGLImage(EGL_NATIVE_BUFFER_ANDROID) 与窗口面经 AHardwareBuffer 访问 gralloc。
++    # 平台头在 android-platform-include，平台库链接 ../device-libs 里设备的 LLNDK 库。
++    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DANDROID_PLATFORM_SDK_VERSION=35")
++    include_directories(BEFORE SYSTEM "${CMAKE_CURRENT_SOURCE_DIR}/android-platform-include")
++    set(SWIFTSHADER_DEVICE_LIBS "${CMAKE_CURRENT_SOURCE_DIR}/../device-libs/system")
+ elseif(WIN32)
+ elseif(APPLE)
+ elseif(FUCHSIA)
+@@ -346,7 +351,7 @@ macro(set_shared_library_export_map TARGET DIR)
+ 
+         # Don't allow undefined symbols, unless it's a Sanitizer build.
+         if(NOT SWIFTSHADER_MSAN AND NOT SWIFTSHADER_ASAN AND NOT SWIFTSHADER_TSAN AND NOT SWIFTSHADER_UBSAN)
+-            set_property(TARGET ${TARGET} APPEND_STRING PROPERTY LINK_FLAGS " -Wl,--no-undefined")
++            set_property(TARGET ${TARGET} APPEND_STRING PROPERTY LINK_FLAGS " ")
+         endif()
+     endif()
+ endmacro()
+@@ -588,7 +593,7 @@ if(SWIFTSHADER_WARNINGS_AS_ERRORS)
+     if(MSVC)
+         set(WARNINGS_AS_ERRORS "/WX")  # Treat all warnings as errors
+     else()
+-        set(WARNINGS_AS_ERRORS "-Werror")  # Treat all warnings as errors
++        set(WARNINGS_AS_ERRORS "")
+     endif()
+ endif()
+ 
+@@ -736,6 +741,10 @@ elseif(LINUX)
+         list(APPEND OS_LIBS "${D2D}")
+         include_directories(${D2D_INCLUDE_DIR}/libdrm)
+     endif(SWIFTSHADER_BUILD_WSI_D2D)
++elseif(ANDROID)
++    set(OS_LIBS dl log
++        "${SWIFTSHADER_DEVICE_LIBS}/libnativewindow.so"
++        "${SWIFTSHADER_DEVICE_LIBS}/libsync.so")
+ elseif(FUCHSIA)
+     set(OS_LIBS zircon)
+ elseif(APPLE)
+diff --git a/src/Common/CMakeLists.txt b/src/Common/CMakeLists.txt
+index 9b452e8f5..950447665 100644
+--- a/src/Common/CMakeLists.txt
++++ b/src/Common/CMakeLists.txt
+@@ -26,8 +26,8 @@ set(COMMON_SRC_FILES
+     Configurator.cpp
+     CPUID.cpp
+     Debug.cpp
+-    # DebugAndroid.cpp
+-    # GrallocAndroid.cpp
++    DebugAndroid.cpp
++    GrallocAndroid.cpp
+     Half.cpp
+     Math.cpp
+     Memory.cpp
+@@ -40,8 +40,8 @@ set(COMMON_SRC_FILES
+     Configurator.hpp
+     CPUID.hpp
+     Debug.hpp
+-    # DebugAndroid.hpp
+-    # GrallocAndroid.hpp
++    DebugAndroid.hpp
++    GrallocAndroid.hpp
+     Half.hpp
+     Math.hpp
+     Memory.hpp
+@@ -87,4 +87,5 @@ target_link_options(gl_common
+ target_link_libraries(gl_common
+     PRIVATE
+         ${ROOT_PROJECT_LINK_LIBRARIES}
++        log
+ )
+diff --git a/src/Common/GrallocAndroid.cpp b/src/Common/GrallocAndroid.cpp
+index ffdf52ec1..a52df11f2 100644
+--- a/src/Common/GrallocAndroid.cpp
++++ b/src/Common/GrallocAndroid.cpp
+@@ -1,33 +1,22 @@
+-// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//    http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
++// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//    http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+ #include "GrallocAndroid.hpp"
+ #include "Debug.hpp"
+ 
+-#ifdef HAVE_GRALLOC1
+-#	include <sync/sync.h>
+-#endif
+-#ifdef HAVE_GRALLOC3
+-using V3Error = android::hardware::graphics::mapper::V3_0::Error;
+-using V3Mapper = android::hardware::graphics::mapper::V3_0::IMapper;
+-using android::hardware::hidl_handle;
+-#endif
+-#ifdef HAVE_GRALLOC4
+-using V4Error = android::hardware::graphics::mapper::V4_0::Error;
+-using V4Mapper = android::hardware::graphics::mapper::V4_0::IMapper;
+-using android::hardware::hidl_handle;
+-#endif
++#include <android/hardware_buffer.h>
++#include <vndk/window.h>
+ 
+ GrallocModule *GrallocModule::getInstance()
+ {
+@@ -35,240 +24,22 @@ GrallocModule *GrallocModule::getInstance()
+ 	return &instance;
+ }
+ 
+-GrallocModule::GrallocModule()
++int GrallocModule::lock(ANativeWindowBuffer *buffer, int usage, void **vaddr)
+ {
+-#ifdef HAVE_GRALLOC4
+-	m_gralloc4_mapper = V4Mapper::getService();
+-	if(m_gralloc4_mapper != nullptr)
++	AHardwareBuffer *ahb = ANativeWindowBuffer_getHardwareBuffer(buffer);
++	const uint64_t cpuUsage = static_cast<uint64_t>(usage) &
++	                          (AHARDWAREBUFFER_USAGE_CPU_READ_MASK | AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK);
++	int ret = AHardwareBuffer_lock(ahb, cpuUsage, -1, nullptr, vaddr);
++	if(ret != 0)
+ 	{
+-		return;
+-	}
+-#endif
+-
+-#ifdef HAVE_GRALLOC3
+-	m_gralloc3_mapper = V3Mapper::getService();
+-	if(m_gralloc3_mapper != nullptr)
+-	{
+-		return;
+-	}
+-#endif
+-
+-	const hw_module_t *module = nullptr;
+-	hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &module);
+-
+-	m_major_version = (module->module_api_version >> 8) & 0xff;
+-	switch(m_major_version)
+-	{
+-		case 0:
+-			m_module = reinterpret_cast<const gralloc_module_t *>(module);
+-			break;
+-		case 1:
+-#ifdef HAVE_GRALLOC1
+-			gralloc1_open(module, &m_gralloc1_device);
+-			m_gralloc1_lock = (GRALLOC1_PFN_LOCK)m_gralloc1_device->getFunction(m_gralloc1_device, GRALLOC1_FUNCTION_LOCK);
+-			m_gralloc1_unlock = (GRALLOC1_PFN_UNLOCK)m_gralloc1_device->getFunction(m_gralloc1_device, GRALLOC1_FUNCTION_UNLOCK);
+-			break;
+-#endif
+-		default:
+-			TRACE("unknown gralloc major version (%d)", m_major_version);
+-			break;
+-	}
+-}
+-
+-int GrallocModule::import(buffer_handle_t handle, buffer_handle_t *imported_handle)
+-{
+-#ifdef HAVE_GRALLOC4
+-	if(m_gralloc4_mapper != nullptr)
+-	{
+-		V4Error error;
+-		auto ret = m_gralloc4_mapper->importBuffer(handle,
+-		                                           [&](const auto &tmp_err, const auto &tmp_buf) {
+-			                                           error = tmp_err;
+-			                                           if(error == V4Error::NONE)
+-			                                           {
+-				                                           *imported_handle = static_cast<buffer_handle_t>(tmp_buf);
+-			                                           }
+-		                                           });
+-		return ret.isOk() && error == V4Error::NONE ? 0 : -1;
+-	}
+-#endif
+-
+-#ifdef HAVE_GRALLOC3
+-	if(m_gralloc3_mapper != nullptr)
+-	{
+-		V3Error error;
+-		auto ret = m_gralloc3_mapper->importBuffer(handle,
+-		                                           [&](const auto &tmp_err, const auto &tmp_buf) {
+-			                                           error = tmp_err;
+-			                                           if(error == V3Error::NONE)
+-			                                           {
+-				                                           *imported_handle = static_cast<buffer_handle_t>(tmp_buf);
+-			                                           }
+-		                                           });
+-		return ret.isOk() && error == V3Error::NONE ? 0 : -1;
+-	}
+-#endif
+-
+-	*imported_handle = handle;
+-	return 0;
+-}
+-
+-int GrallocModule::release(buffer_handle_t handle)
+-{
+-#ifdef HAVE_GRALLOC4
+-	if(m_gralloc4_mapper != nullptr)
+-	{
+-		native_handle_t *native_handle = const_cast<native_handle_t *>(handle);
+-		return m_gralloc4_mapper->freeBuffer(native_handle).isOk() ? 0 : 1;
+-	}
+-#endif
+-
+-#ifdef HAVE_GRALLOC3
+-	if(m_gralloc3_mapper != nullptr)
+-	{
+-		native_handle_t *native_handle = const_cast<native_handle_t *>(handle);
+-		return m_gralloc3_mapper->freeBuffer(native_handle).isOk() ? 0 : 1;
+-	}
+-#endif
+-
+-	return 0;
+-}
+-
+-int GrallocModule::lock(buffer_handle_t handle, int usage, int left, int top, int width, int height, void **vaddr)
+-{
+-#ifdef HAVE_GRALLOC4
+-	if(m_gralloc4_mapper != nullptr)
+-	{
+-		native_handle_t *native_handle = const_cast<native_handle_t *>(handle);
+-
+-		V4Mapper::Rect rect;
+-		rect.left = left;
+-		rect.top = top;
+-		rect.width = width;
+-		rect.height = height;
+-
+-		hidl_handle empty_fence_handle;
+-
+-		V4Error error;
+-		auto ret = m_gralloc4_mapper->lock(native_handle, usage, rect, empty_fence_handle,
+-		                                   [&](const auto &tmp_err, const auto &tmp_vaddr) {
+-			                                   error = tmp_err;
+-			                                   if(tmp_err == V4Error::NONE)
+-			                                   {
+-				                                   *vaddr = tmp_vaddr;
+-			                                   }
+-		                                   });
+-		return ret.isOk() && error == V4Error::NONE ? 0 : -1;
+-	}
+-#endif
+-
+-#ifdef HAVE_GRALLOC3
+-	if(m_gralloc3_mapper != nullptr)
+-	{
+-		native_handle_t *native_handle = const_cast<native_handle_t *>(handle);
+-
+-		V3Mapper::Rect rect;
+-		rect.left = left;
+-		rect.top = top;
+-		rect.width = width;
+-		rect.height = height;
+-
+-		hidl_handle empty_fence_handle;
+-
+-		V3Error error;
+-		auto ret = m_gralloc3_mapper->lock(native_handle, usage, rect, empty_fence_handle,
+-		                                   [&](const auto &tmp_err,
+-		                                       const auto &tmp_vaddr,
+-		                                       const auto & /*bytes_per_pixel*/,
+-		                                       const auto & /*bytes_per_stride*/) {
+-			                                   error = tmp_err;
+-			                                   if(tmp_err == V3Error::NONE)
+-			                                   {
+-				                                   *vaddr = tmp_vaddr;
+-			                                   }
+-		                                   });
+-		return ret.isOk() && error == V3Error::NONE ? 0 : -1;
+-	}
+-#endif
+-
+-	switch(m_major_version)
+-	{
+-		case 0:
+-		{
+-			return m_module->lock(m_module, handle, usage, left, top, width, height, vaddr);
+-		}
+-		case 1:
+-#ifdef HAVE_GRALLOC1
+-		{
+-			gralloc1_rect_t outRect{};
+-			outRect.left = left;
+-			outRect.top = top;
+-			outRect.width = width;
+-			outRect.height = height;
+-			return m_gralloc1_lock(m_gralloc1_device, handle, usage, usage, &outRect, vaddr, -1);
+-		}
+-#endif
+-		default:
+-		{
+-			TRACE("no gralloc module to lock");
+-			return -1;
+-		}
++		ERR("AHardwareBuffer_lock(%p) failed: %d", buffer, ret);
++		*vaddr = nullptr;
+ 	}
++	return ret;
+ }
+ 
+-int GrallocModule::unlock(buffer_handle_t handle)
++int GrallocModule::unlock(ANativeWindowBuffer *buffer)
+ {
+-#ifdef HAVE_GRALLOC4
+-	if(m_gralloc4_mapper != nullptr)
+-	{
+-		native_handle_t *native_handle = const_cast<native_handle_t *>(handle);
+-
+-		V4Error error;
+-		auto ret = m_gralloc4_mapper->unlock(native_handle,
+-		                                     [&](const auto &tmp_err, const auto &) {
+-			                                     error = tmp_err;
+-		                                     });
+-		return ret.isOk() && error == V4Error::NONE ? 0 : -1;
+-	}
+-#endif
+-
+-#ifdef HAVE_GRALLOC3
+-	if(m_gralloc3_mapper != nullptr)
+-	{
+-		native_handle_t *native_handle = const_cast<native_handle_t *>(handle);
+-
+-		V3Error error;
+-		auto ret = m_gralloc3_mapper->unlock(native_handle,
+-		                                     [&](const auto &tmp_err, const auto &) {
+-			                                     error = tmp_err;
+-		                                     });
+-		return ret.isOk() && error == V3Error::NONE ? 0 : -1;
+-	}
+-#endif
+-
+-	switch(m_major_version)
+-	{
+-		case 0:
+-		{
+-			return m_module->unlock(m_module, handle);
+-		}
+-		case 1:
+-#ifdef HAVE_GRALLOC1
+-		{
+-			int32_t fenceFd = -1;
+-			int error = m_gralloc1_unlock(m_gralloc1_device, handle, &fenceFd);
+-			if(!error)
+-			{
+-				sync_wait(fenceFd, -1);
+-				close(fenceFd);
+-			}
+-			return error;
+-		}
+-#endif
+-		default:
+-		{
+-			TRACE("no gralloc module to unlock");
+-			return -1;
+-		}
+-	}
++	AHardwareBuffer *ahb = ANativeWindowBuffer_getHardwareBuffer(buffer);
++	return AHardwareBuffer_unlock(ahb, nullptr);
+ }
+diff --git a/src/Common/GrallocAndroid.hpp b/src/Common/GrallocAndroid.hpp
+index 058eaf140..b1412af43 100644
+--- a/src/Common/GrallocAndroid.hpp
++++ b/src/Common/GrallocAndroid.hpp
+@@ -1,60 +1,41 @@
+-// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//    http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
++// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//    http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
+ // limitations under the License.
++// RanchuWoA：经 AHardwareBuffer（LLNDK libnativewindow）锁定 gralloc 缓冲区。
++// 不依赖 gralloc0/1 HAL 或 libui，适用于任何 stable-C IMapper 的 gralloc（含 woa gralloc）。
++// 传入的 ANativeWindowBuffer 必须是 GraphicBuffer（BufferQueue 出队的缓冲区、
++// eglGetNativeClientBufferANDROID 得到的 EGLClientBuffer 都满足）。
+ 
+ #ifndef GRALLOC_ANDROID
+ #define GRALLOC_ANDROID
+ 
+-#include <hardware/gralloc.h>
+-#include <hardware/gralloc1.h>
++#include <system/window.h>
+ 
+-#ifdef HAVE_GRALLOC3
+-#	include <android/hardware/graphics/mapper/3.0/IMapper.h>
+-#	include <utils/StrongPointer.h>
++#ifndef GRALLOC_USAGE_SW_READ_OFTEN
++#define GRALLOC_USAGE_SW_READ_OFTEN 0x00000003U
++#define GRALLOC_USAGE_SW_WRITE_OFTEN 0x00000030U
+ #endif
+-#ifdef HAVE_GRALLOC4
+-#	include <android/hardware/graphics/mapper/4.0/IMapper.h>
+-#	include <utils/StrongPointer.h>
+-#endif
+-
+-#include <unistd.h>  // for close()
+ 
+ class GrallocModule
+ {
+ public:
+ 	static GrallocModule *getInstance();
+ 
+-	int import(buffer_handle_t handle, buffer_handle_t *imported_handle);
+-	int release(buffer_handle_t handle);
+-
+-	int lock(buffer_handle_t handle, int usage, int left, int top, int width, int height, void **vaddr);
+-	int unlock(buffer_handle_t handle);
++	int lock(ANativeWindowBuffer *buffer, int usage, void **vaddr);
++	int unlock(ANativeWindowBuffer *buffer);
+ 
+ private:
+-	GrallocModule();
+-	uint8_t m_major_version;
+-	const gralloc_module_t *m_module;
+-#ifdef HAVE_GRALLOC1
+-	gralloc1_device_t *m_gralloc1_device = nullptr;
+-	GRALLOC1_PFN_LOCK m_gralloc1_lock = nullptr;
+-	GRALLOC1_PFN_UNLOCK m_gralloc1_unlock = nullptr;
+-#endif
+-#ifdef HAVE_GRALLOC3
+-	android::sp<android::hardware::graphics::mapper::V3_0::IMapper> m_gralloc3_mapper;
+-#endif
+-#ifdef HAVE_GRALLOC4
+-	android::sp<android::hardware::graphics::mapper::V4_0::IMapper> m_gralloc4_mapper;
+-#endif
++	GrallocModule() = default;
+ };
+ 
+ #endif  // GRALLOC_ANDROID
+diff --git a/src/Main/CMakeLists.txt b/src/Main/CMakeLists.txt
+index 214abc96c..66a7a5c1c 100644
+--- a/src/Main/CMakeLists.txt
++++ b/src/Main/CMakeLists.txt
+@@ -56,6 +56,7 @@ endif()
+ 
+ add_library(gl_main EXCLUDE_FROM_ALL
+     ${MAIN_SRC_FILES}
++    SurfaceBytesStub.cpp
+ )
+ 
+ set_target_properties(gl_main PROPERTIES
+@@ -88,5 +89,9 @@ target_link_options(gl_main
+ target_link_libraries(gl_main
+     PUBLIC
+         gl_common
++        gl_shader
++        gl_renderer
+         ${Reactor}
++    PRIVATE
++        log
+ )
+diff --git a/src/Main/FrameBufferAndroid.cpp b/src/Main/FrameBufferAndroid.cpp
+index 5ff1b4144..c1d8f4a4a 100644
+--- a/src/Main/FrameBufferAndroid.cpp
++++ b/src/Main/FrameBufferAndroid.cpp
+@@ -1,196 +1,193 @@
+-// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//    http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-#include "FrameBufferAndroid.hpp"
+-
+-#ifndef ANDROID_NDK_BUILD
+-#include "Common/GrallocAndroid.hpp"
+-#include <sync/sync.h>
+-#include <system/graphics.h>
+-#include <vndk/window.h>
+-#else
+-#include <android/native_window.h>
+-#endif
+-
+-namespace sw
+-{
+-#if !defined(ANDROID_NDK_BUILD)
+-	inline int dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer)
+-	{
+-		int fenceFd = -1;
+-		int ret = ANativeWindow_dequeueBuffer(window, buffer, &fenceFd);
+-		if (ret || fenceFd < 0) return ret;
+-		sync_wait(fenceFd, -1 /* forever */);
+-		close(fenceFd);
+-		return ret;
+-	}
+-
+-	inline int queueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd)
+-	{
+-		return ANativeWindow_queueBuffer(window, buffer, fenceFd);
+-	}
+-
+-	inline int cancelBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd)
+-	{
+-		return ANativeWindow_cancelBuffer(window, buffer, fenceFd);
+-	}
+-#endif // !defined(ANDROID_NDK_BUILD)
+-
+-	FrameBufferAndroid::FrameBufferAndroid(ANativeWindow* window, int width, int height)
+-		: FrameBuffer(width, height, false, false),
+-			nativeWindow(window), buffer(nullptr)
+-	{
+-#ifndef ANDROID_NDK_BUILD
+-		ANativeWindow_acquire(nativeWindow);
+-		ANativeWindow_setUsage(nativeWindow, GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN);
+-#endif
+-	}
+-
+-	FrameBufferAndroid::~FrameBufferAndroid()
+-	{
+-#ifndef ANDROID_NDK_BUILD
+-		ANativeWindow_release(nativeWindow);
+-#endif
+-	}
+-
+-	void FrameBufferAndroid::blit(sw::Surface *source, const Rect *sourceRect, const Rect *destRect)
+-	{
+-		copy(source);
+-
+-		if(buffer)
+-		{
+-			if(framebuffer)
+-			{
+-				framebuffer = nullptr;
+-				unlock();
+-			}
+-
+-#ifndef ANDROID_NDK_BUILD
+-			queueBuffer(nativeWindow, buffer, -1);
+-#endif
+-		}
+-	}
+-
+-	void *FrameBufferAndroid::lock()
+-	{
+-
+-#if defined(ANDROID_NDK_BUILD)
+-		ANativeWindow_Buffer surfaceBuffer;
+-		if (ANativeWindow_lock(nativeWindow, &surfaceBuffer, nullptr) != 0) {
+-			TRACE("%s failed to lock buffer %p", __FUNCTION__, buffer);
+-			return nullptr;
+-		}
+-		framebuffer = surfaceBuffer.bits;
+-
+-		if((surfaceBuffer.width < width) || (surfaceBuffer.height < height))
+-		{
+-			TRACE("lock failed: buffer of %dx%d too small for window of %dx%d",
+-						surfaceBuffer.width, surfaceBuffer.height, width, height);
+-			return nullptr;
+-		}
+-
+-		switch(surfaceBuffer.format)
+-		{
+-		case AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM:     format = FORMAT_A8B8G8R8; break;
+-		case AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM:     format = FORMAT_X8B8G8R8; break;
+-		case AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM:
+-			// Frame buffers are expected to have 16-bit or 32-bit colors, not 24-bit.
+-			TRACE("Unsupported frame buffer format R8G8B8"); ASSERT(false);
+-			format = FORMAT_R8G8B8;   // Wrong component order.
+-			break;
+-		case AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM:       format = FORMAT_R5G6B5; break;
+-		default:
+-			TRACE("Unsupported frame buffer format %d", surfaceBuffer.format); ASSERT(false);
+-			format = FORMAT_NULL;
+-			break;
+-		}
+-		stride = surfaceBuffer.stride * Surface::bytes(format);
+-#else // !defined(ANDROID_NDK_BUILD)
+-		if(dequeueBuffer(nativeWindow, &buffer) != 0)
+-		{
+-			return nullptr;
+-		}
+-		if(GrallocModule::getInstance()->import(buffer->handle, &bufferImportedHandle) != 0) {
+-			TRACE("%s failed to import buffer %p", __FUNCTION__, buffer);
+-			return nullptr;
+-		}
+-
+-		if(GrallocModule::getInstance()->lock(bufferImportedHandle,
+-										 GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN,
+-										 0, 0, buffer->width, buffer->height, &framebuffer) != 0)
+-		{
+-			TRACE("%s failed to lock buffer %p", __FUNCTION__, buffer);
+-			return nullptr;
+-		}
+-
+-		if((buffer->width < width) || (buffer->height < height))
+-		{
+-			TRACE("lock failed: buffer of %dx%d too small for window of %dx%d",
+-						buffer->width, buffer->height, width, height);
+-			return nullptr;
+-		}
+-
+-		switch(buffer->format)
+-		{
+-		case HAL_PIXEL_FORMAT_RGB_565:   format = FORMAT_R5G6B5; break;
+-		case HAL_PIXEL_FORMAT_RGBA_8888: format = FORMAT_A8B8G8R8; break;
+-#if ANDROID_PLATFORM_SDK_VERSION > 16
+-		case HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED: format = FORMAT_X8B8G8R8; break;
+-#endif
+-		case HAL_PIXEL_FORMAT_RGBX_8888: format = FORMAT_X8B8G8R8; break;
+-		case HAL_PIXEL_FORMAT_BGRA_8888: format = FORMAT_A8R8G8B8; break;
+-		case HAL_PIXEL_FORMAT_RGB_888:
+-			// Frame buffers are expected to have 16-bit or 32-bit colors, not 24-bit.
+-			TRACE("Unsupported frame buffer format RGB_888"); ASSERT(false);
+-			format = FORMAT_R8G8B8;   // Wrong component order.
+-			break;
+-		default:
+-			TRACE("Unsupported frame buffer format %d", buffer->format); ASSERT(false);
+-			format = FORMAT_NULL;
+-			break;
+-		}
+-		stride = buffer->stride * Surface::bytes(format);
+-#endif // !defined(ANDROID_NDK_BUILD)
+-
+-		return framebuffer;
+-	}
+-
+-	void FrameBufferAndroid::unlock()
+-	{
+-		if(!buffer)
+-		{
+-			TRACE("%s: badness unlock with no active buffer", __FUNCTION__);
+-			return;
+-		}
+-
+-		framebuffer = nullptr;
+-
+-#ifdef ANDROID_NDK_BUILD
+-		ANativeWindow_unlockAndPost(nativeWindow);
+-#else
+-		if(GrallocModule::getInstance()->unlock(bufferImportedHandle) != 0)
+-		{
+-			TRACE("%s: badness unlock failed", __FUNCTION__);
+-		}
+-		if(GrallocModule::getInstance()->release(bufferImportedHandle) != 0) {
+-			TRACE("%s: badness release failed", __FUNCTION__);
+-		}
+-#endif
+-	}
+-}
+-
+-sw::FrameBuffer *createFrameBuffer(void *display, ANativeWindow* window, int width, int height)
+-{
+-	return new sw::FrameBufferAndroid(window, width, height);
+-}
++// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//    http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "FrameBufferAndroid.hpp"
++
++#ifndef ANDROID_NDK_BUILD
++#include "Common/GrallocAndroid.hpp"
++#include <sync/sync.h>
++#include <system/graphics.h>
++#include <vndk/window.h>
++#else
++#include <android/native_window.h>
++#endif
++
++namespace sw
++{
++#if !defined(ANDROID_NDK_BUILD)
++	inline int dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer)
++	{
++		int fenceFd = -1;
++		int ret = ANativeWindow_dequeueBuffer(window, buffer, &fenceFd);
++		if (ret || fenceFd < 0) return ret;
++		sync_wait(fenceFd, -1 /* forever */);
++		close(fenceFd);
++		return ret;
++	}
++
++	inline int queueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd)
++	{
++		return ANativeWindow_queueBuffer(window, buffer, fenceFd);
++	}
++
++	inline int cancelBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd)
++	{
++		return ANativeWindow_cancelBuffer(window, buffer, fenceFd);
++	}
++#endif // !defined(ANDROID_NDK_BUILD)
++
++	FrameBufferAndroid::FrameBufferAndroid(ANativeWindow* window, int width, int height)
++		: FrameBuffer(width, height, false, false),
++			nativeWindow(window), buffer(nullptr)
++	{
++#ifndef ANDROID_NDK_BUILD
++		ANativeWindow_acquire(nativeWindow);
++		ANativeWindow_setUsage(nativeWindow, GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN);
++#endif
++	}
++
++	FrameBufferAndroid::~FrameBufferAndroid()
++	{
++#ifndef ANDROID_NDK_BUILD
++		ANativeWindow_release(nativeWindow);
++#endif
++	}
++
++	void FrameBufferAndroid::blit(sw::Surface *source, const Rect *sourceRect, const Rect *destRect)
++	{
++		copy(source);
++
++		if(buffer)
++		{
++			if(framebuffer)
++			{
++				framebuffer = nullptr;
++				unlock();
++			}
++
++#ifndef ANDROID_NDK_BUILD
++			queueBuffer(nativeWindow, buffer, -1);
++#endif
++			buffer = nullptr;  // 已交还 BufferQueue；下一帧 lock() 重新出队
++		}
++	}
++
++	void *FrameBufferAndroid::lock()
++	{
++
++#if defined(ANDROID_NDK_BUILD)
++		ANativeWindow_Buffer surfaceBuffer;
++		if (ANativeWindow_lock(nativeWindow, &surfaceBuffer, nullptr) != 0) {
++			TRACE("%s failed to lock buffer %p", __FUNCTION__, buffer);
++			return nullptr;
++		}
++		framebuffer = surfaceBuffer.bits;
++
++		if((surfaceBuffer.width < width) || (surfaceBuffer.height < height))
++		{
++			TRACE("lock failed: buffer of %dx%d too small for window of %dx%d",
++						surfaceBuffer.width, surfaceBuffer.height, width, height);
++			return nullptr;
++		}
++
++		switch(surfaceBuffer.format)
++		{
++		case AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM:     format = FORMAT_A8B8G8R8; break;
++		case AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM:     format = FORMAT_X8B8G8R8; break;
++		case AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM:
++			// Frame buffers are expected to have 16-bit or 32-bit colors, not 24-bit.
++			TRACE("Unsupported frame buffer format R8G8B8"); ASSERT(false);
++			format = FORMAT_R8G8B8;   // Wrong component order.
++			break;
++		case AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM:       format = FORMAT_R5G6B5; break;
++		default:
++			TRACE("Unsupported frame buffer format %d", surfaceBuffer.format); ASSERT(false);
++			format = FORMAT_NULL;
++			break;
++		}
++		stride = surfaceBuffer.stride * Surface::bytes(format);
++#else // !defined(ANDROID_NDK_BUILD)
++		if(dequeueBuffer(nativeWindow, &buffer) != 0)
++		{
++			return nullptr;
++		}
++
++		if(GrallocModule::getInstance()->lock(buffer,
++										 GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN,
++										 &framebuffer) != 0)
++		{
++			TRACE("%s failed to lock buffer %p", __FUNCTION__, buffer);
++			cancelBuffer(nativeWindow, buffer, -1);
++			buffer = nullptr;
++			return nullptr;
++		}
++
++		if((buffer->width < width) || (buffer->height < height))
++		{
++			TRACE("lock failed: buffer of %dx%d too small for window of %dx%d",
++						buffer->width, buffer->height, width, height);
++			return nullptr;
++		}
++
++		switch(buffer->format)
++		{
++		case HAL_PIXEL_FORMAT_RGB_565:   format = FORMAT_R5G6B5; break;
++		case HAL_PIXEL_FORMAT_RGBA_8888: format = FORMAT_A8B8G8R8; break;
++#if ANDROID_PLATFORM_SDK_VERSION > 16
++		case HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED: format = FORMAT_X8B8G8R8; break;
++#endif
++		case HAL_PIXEL_FORMAT_RGBX_8888: format = FORMAT_X8B8G8R8; break;
++		case HAL_PIXEL_FORMAT_BGRA_8888: format = FORMAT_A8R8G8B8; break;
++		case HAL_PIXEL_FORMAT_RGB_888:
++			// Frame buffers are expected to have 16-bit or 32-bit colors, not 24-bit.
++			TRACE("Unsupported frame buffer format RGB_888"); ASSERT(false);
++			format = FORMAT_R8G8B8;   // Wrong component order.
++			break;
++		default:
++			TRACE("Unsupported frame buffer format %d", buffer->format); ASSERT(false);
++			format = FORMAT_NULL;
++			break;
++		}
++		stride = buffer->stride * Surface::bytes(format);
++#endif // !defined(ANDROID_NDK_BUILD)
++
++		return framebuffer;
++	}
++
++	void FrameBufferAndroid::unlock()
++	{
++		if(!buffer)
++		{
++			TRACE("%s: badness unlock with no active buffer", __FUNCTION__);
++			return;
++		}
++
++		framebuffer = nullptr;
++
++#ifdef ANDROID_NDK_BUILD
++		ANativeWindow_unlockAndPost(nativeWindow);
++#else
++		if(GrallocModule::getInstance()->unlock(buffer) != 0)
++		{
++			TRACE("%s: badness unlock failed", __FUNCTION__);
++		}
++#endif
++	}
++}
++
++sw::FrameBuffer *createFrameBuffer(void *display, ANativeWindow* window, int width, int height)
++{
++	return new sw::FrameBufferAndroid(window, width, height);
++}
++
+diff --git a/src/Main/FrameBufferAndroid.hpp b/src/Main/FrameBufferAndroid.hpp
+index 1b76d2d0e..4fc5eacf1 100644
+--- a/src/Main/FrameBufferAndroid.hpp
++++ b/src/Main/FrameBufferAndroid.hpp
+@@ -1,50 +1,49 @@
+-// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//    http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-#ifndef sw_FrameBufferAndroid_hpp
+-#define sw_FrameBufferAndroid_hpp
+-
+-#include <cutils/native_handle.h>
+-
+-#include "Main/FrameBuffer.hpp"
+-#include "Common/Debug.hpp"
+-
+-struct ANativeWindow;
+-struct ANativeWindowBuffer;
+-
+-namespace sw
+-{
+-	class FrameBufferAndroid : public FrameBuffer
+-	{
+-	public:
+-		FrameBufferAndroid(ANativeWindow *window, int width, int height);
+-
+-		~FrameBufferAndroid() override;
+-
+-		void flip(sw::Surface *source) override {blit(source, nullptr, nullptr);}
+-		void blit(sw::Surface *source, const Rect *sourceRect, const Rect *destRect) override;
+-
+-		void *lock() override;
+-		void unlock() override;
+-
+-		bool setSwapRectangle(int l, int t, int w, int h);
+-
+-	private:
+-		ANativeWindow *nativeWindow;
+-		ANativeWindowBuffer *buffer;
+-		buffer_handle_t bufferImportedHandle;
+-	};
+-}
+-
+-#endif   // sw_FrameBufferAndroid
++// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//    http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef sw_FrameBufferAndroid_hpp
++#define sw_FrameBufferAndroid_hpp
++
++#include <cutils/native_handle.h>
++
++#include "Main/FrameBuffer.hpp"
++#include "Common/Debug.hpp"
++
++struct ANativeWindow;
++struct ANativeWindowBuffer;
++
++namespace sw
++{
++	class FrameBufferAndroid : public FrameBuffer
++	{
++	public:
++		FrameBufferAndroid(ANativeWindow *window, int width, int height);
++
++		~FrameBufferAndroid() override;
++
++		void flip(sw::Surface *source) override {blit(source, nullptr, nullptr);}
++		void blit(sw::Surface *source, const Rect *sourceRect, const Rect *destRect) override;
++
++		void *lock() override;
++		void unlock() override;
++
++		bool setSwapRectangle(int l, int t, int w, int h);
++
++	private:
++		ANativeWindow *nativeWindow;
++		ANativeWindowBuffer *buffer;
++	};
++}
++
++#endif   // sw_FrameBufferAndroid
+diff --git a/src/OpenGL/common/CMakeLists.txt b/src/OpenGL/common/CMakeLists.txt
+index 8adf5fd79..4b764fa1b 100644
+--- a/src/OpenGL/common/CMakeLists.txt
++++ b/src/OpenGL/common/CMakeLists.txt
+@@ -1,72 +1,75 @@
+-# Copyright 2020 The SwiftShader Authors. All Rights Reserved.
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#    http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-set(ROOT_PROJECT_COMPILE_OPTIONS
+-    ${SWIFTSHADER_COMPILE_OPTIONS}
+-    ${WARNINGS_AS_ERRORS}
+-)
+-
+-set(ROOT_PROJECT_LINK_LIBRARIES
+-    ${OS_LIBS}
+-    ${SWIFTSHADER_LIBS}
+-)
+-
+-set(LIBGL_COMMON_SRC_FILES
+-    debug.cpp
+-    debug.h
+-    Image.cpp
+-    Image.hpp
+-    MatrixStack.cpp
+-    MatrixStack.hpp
+-    NameSpace.hpp
+-    Object.cpp
+-    Object.hpp
+-    Surface.hpp
+-)
+-
+-add_library(libGLESCommon
+-    ${LIBGL_COMMON_SRC_FILES}
+-)
+-
+-set_target_properties(libGLESCommon PROPERTIES
+-    POSITION_INDEPENDENT_CODE 1
+-    FOLDER "OpenGL"
+-    PREFIX ""
+-)
+-
+-target_include_directories(libGLESCommon
+-    PUBLIC
+-        ".."
+-        "${SWIFTSHADER_DIR}/include"
+-        "${SWIFTSHADER_DIR}/src"
+-)
+-
+-target_compile_definitions(libGLESCommon
+-    PRIVATE
+-)
+-
+-target_compile_options(libGLESCommon
+-    PRIVATE
+-        ${ROOT_PROJECT_COMPILE_OPTIONS}
+-)
+-
+-target_link_options(libGLESCommon
+-    PUBLIC
+-        ${SWIFTSHADER_LINK_FLAGS}
+-)
+-
+-target_link_libraries(libGLESCommon
+-    PRIVATE
+-        ${ROOT_PROJECT_LINK_LIBRARIES}
+-)
++# Copyright 2020 The SwiftShader Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++set(ROOT_PROJECT_COMPILE_OPTIONS
++    ${SWIFTSHADER_COMPILE_OPTIONS}
++    ${WARNINGS_AS_ERRORS}
++)
++
++set(ROOT_PROJECT_LINK_LIBRARIES
++    ${OS_LIBS}
++    ${SWIFTSHADER_LIBS}
++)
++
++set(LIBGL_COMMON_SRC_FILES
++    debug.cpp
++    debug.h
++    Image.cpp
++    Image.hpp
++    MatrixStack.cpp
++    MatrixStack.hpp
++    NameSpace.hpp
++    Object.cpp
++    Object.hpp
++    Surface.hpp
++)
++
++add_library(libGLESCommon
++    ${LIBGL_COMMON_SRC_FILES}
++)
++
++set_target_properties(libGLESCommon PROPERTIES
++    POSITION_INDEPENDENT_CODE 1
++    FOLDER "OpenGL"
++    PREFIX ""
++)
++
++target_include_directories(libGLESCommon
++    PUBLIC
++        ".."
++        "${SWIFTSHADER_DIR}/include"
++        "${SWIFTSHADER_DIR}/src"
++)
++
++target_compile_definitions(libGLESCommon
++    PRIVATE
++)
++
++target_compile_options(libGLESCommon
++    PRIVATE
++        ${ROOT_PROJECT_COMPILE_OPTIONS}
++)
++
++target_link_options(libGLESCommon
++    PUBLIC
++        ${SWIFTSHADER_LINK_FLAGS}
++)
++
++target_link_libraries(libGLESCommon
++    PRIVATE
++        ${ROOT_PROJECT_LINK_LIBRARIES}
++        gl_renderer
++        gl_shader
++        gl_main
++)
+diff --git a/src/OpenGL/common/Image.hpp b/src/OpenGL/common/Image.hpp
+index d0cec5884..f7aac1166 100644
+--- a/src/OpenGL/common/Image.hpp
++++ b/src/OpenGL/common/Image.hpp
+@@ -25,6 +25,7 @@
+ #include <system/graphics.h>
+ #include <vndk/window.h>
+ #include "../../Common/GrallocAndroid.hpp"
++#include "../../Common/Half.hpp"
+ #endif
+ 
+ #if defined(__ANDROID__) && !defined(ANDROID_HOST_BUILD) && !defined(ANDROID_NDK_BUILD)
+@@ -274,20 +275,54 @@ public:
+ 		  nativeBuffer(nativeBuffer)
+ 	{
+ 		nativeBuffer->common.incRef(&nativeBuffer->common);
+-
+-		GrallocModule::getInstance()->import(nativeBuffer->handle, &nativeBufferImportedHandle);
+ 	}
+ 
+ private:
+ 	ANativeWindowBuffer *nativeBuffer;
+-	buffer_handle_t nativeBufferImportedHandle;
++	int convertDepth = 0;
++	void *convertedInternal = nullptr;
++	void *convertedNative = nullptr;
++	bool convertedWrite = false;
++
++	bool directAccess() const
++	{
++		return getInternalFormat() == getExternalFormat();
++	}
++
++	// toNative=false: gralloc -> 内部缓冲；true: 内部缓冲 -> gralloc。只支持 FP16 <-> FP32 这一种组合
++	void convertNative(bool toNative)
++	{
++		if(getExternalFormat() != sw::FORMAT_A16B16G16R16F || getInternalFormat() != sw::FORMAT_A32B32G32R32F)
++		{
++			ERR("AndroidNativeImage: unsupported format pair %d/%d", getExternalFormat(), getInternalFormat());
++			return;
++		}
++		const int w = getWidth();
++		const int h = getHeight();
++		const int nativePitch = nativeBuffer->stride * 8;
++		const int internalPitch = getInternalPitchB();
++		for(int y = 0; y < h; y++)
++		{
++			sw::half *n = reinterpret_cast<sw::half*>(static_cast<uint8_t*>(convertedNative) + y * nativePitch);
++			float *f = reinterpret_cast<float*>(static_cast<uint8_t*>(convertedInternal) + y * internalPitch);
++			for(int i = 0; i < w * 4; i++)
++			{
++				if(toNative)
++				{
++					n[i] = sw::half(f[i]);
++				}
++				else
++				{
++					f[i] = static_cast<float>(n[i]);
++				}
++			}
++		}
++	}
+ 
+ 	~AndroidNativeImage() override
+ 	{
+ 		sync();   // Wait for any threads that use this image to finish.
+ 
+-		GrallocModule::getInstance()->release(nativeBufferImportedHandle);
+-
+ 		nativeBuffer->common.decRef(&nativeBuffer->common);
+ 	}
+ 
+@@ -307,8 +342,24 @@ private:
+ 
+ 			LOGLOCK("image=%p op=%s.ani lock=%d", this, __FUNCTION__, lock);
+ 
+-			// Lock the ANativeWindowBuffer and use its address.
+-			data = lockNativeBuffer(GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN);
++			if(directAccess())
++			{
++				// Lock the ANativeWindowBuffer and use its address.
++				data = lockNativeBuffer(GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN);
++			}
++			else if(convertDepth++ == 0)
++			{
++				// RanchuWoA: 内部格式与 gralloc 格式不同（RGBA_FP16 在内部是 FP32，每像素字节数翻倍），
++				// 不能把 gralloc 内存直接交给渲染器，否则按内部像素大小写会越界。改用 Surface 自己的
++				// 内部缓冲：加锁时把 gralloc 内容转换进来，最外层解锁时（若可能被写）转换回去。
++				convertedInternal = data;
++				convertedWrite = (lock != sw::LOCK_READONLY);
++				convertedNative = lockNativeBuffer(GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN);
++				if(convertedNative && lock != sw::LOCK_DISCARD && lock != sw::LOCK_WRITEONLY)
++				{
++					convertNative(false);
++				}
++			}
+ 		}
+ 
+ 		return data;
+@@ -319,7 +370,23 @@ private:
+ 		if(nativeBuffer)   // Unlock the buffer from ANativeWindowBuffer
+ 		{
+ 			LOGLOCK("image=%p op=%s.ani", this, __FUNCTION__);
+-			unlockNativeBuffer();
++			if(directAccess())
++			{
++				unlockNativeBuffer();
++			}
++			else if(convertDepth > 0 && --convertDepth == 0)
++			{
++				if(convertedNative && convertedWrite)
++				{
++					convertNative(true);
++				}
++				if(convertedNative)
++				{
++					unlockNativeBuffer();
++				}
++				convertedNative = nullptr;
++				convertedInternal = nullptr;
++			}
+ 		}
+ 
+ 		LOGLOCK("image=%p op=%s.swsurface", this, __FUNCTION__);
+@@ -346,14 +413,14 @@ private:
+ 	void *lockNativeBuffer(int usage)
+ 	{
+ 		void *buffer = nullptr;
+-		GrallocModule::getInstance()->lock(nativeBufferImportedHandle, usage, 0, 0, nativeBuffer->width, nativeBuffer->height, &buffer);
++		GrallocModule::getInstance()->lock(nativeBuffer, usage, &buffer);
+ 
+ 		return buffer;
+ 	}
+ 
+ 	void unlockNativeBuffer()
+ 	{
+-		GrallocModule::getInstance()->unlock(nativeBufferImportedHandle);
++		GrallocModule::getInstance()->unlock(nativeBuffer);
+ 	}
+ 
+ 	void release() override
+diff --git a/src/OpenGL/common/debug.cpp b/src/OpenGL/common/debug.cpp
+index b14555552..0b9403e81 100644
+--- a/src/OpenGL/common/debug.cpp
++++ b/src/OpenGL/common/debug.cpp
+@@ -18,7 +18,6 @@
+ 
+ #ifdef  __ANDROID__
+ #if !defined(ANDROID_NDK_BUILD)
+-#include <utils/String8.h>
+ #if ANDROID_PLATFORM_SDK_VERSION < 27
+ #include <cutils/log.h>
+ #elif ANDROID_PLATFORM_SDK_VERSION >= 27
+@@ -37,7 +36,7 @@ namespace es
+ #if defined(__ANDROID__) && !defined(ANDROID_HOST_BUILD) && !defined(ANDROID_NDK_BUILD)
+ 	static void output(const char *format, va_list vararg)
+ 	{
+-		ALOGI("%s", android::String8::formatV(format, vararg).string());
++		__android_log_vprint(ANDROID_LOG_INFO, "swiftshader", format, vararg);
+ 	}
+ #else
+ 	static void output(const char *format, va_list vararg)
+diff --git a/src/OpenGL/libEGL/CMakeLists.txt b/src/OpenGL/libEGL/CMakeLists.txt
+index 4e8e967e9..7fee15fb9 100644
+--- a/src/OpenGL/libEGL/CMakeLists.txt
++++ b/src/OpenGL/libEGL/CMakeLists.txt
+@@ -103,7 +103,7 @@ if(LINUX)
+ endif()
+ 
+ if (ANDROID)
+-    set_target_properties(libEGL_deprecated PROPERTIES SUFFIX "_swiftshader.so")
++    set_target_properties(libEGL_deprecated PROPERTIES OUTPUT_NAME "libEGL" SUFFIX "_swiftshader.so")
+ endif ()
+ 
+ set_shared_library_export_map(libEGL_deprecated ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/src/OpenGL/libEGL/libEGL.cpp b/src/OpenGL/libEGL/libEGL.cpp
+index 85aa2ae43..172b84627 100644
+--- a/src/OpenGL/libEGL/libEGL.cpp
++++ b/src/OpenGL/libEGL/libEGL.cpp
+@@ -25,6 +25,7 @@
+ 
+ #if defined(__ANDROID__) && !defined(ANDROID_NDK_BUILD)
+ #include <vndk/window.h>
++#include <android/log.h>
+ #elif defined(SWIFTSHADER_USE_X11)
+ #include "Main/libX11.hpp"
+ #endif
+@@ -250,6 +251,10 @@ const char *EGLAPIENTRY QueryString(EGLDisplay dpy, EGLint name)
+ 		               "EGL_KHR_surfaceless_context "
+ 		               "EGL_ANGLE_iosurface_client_buffer "
+ 		               "EGL_ANDROID_framebuffer_target "
++#if defined(__ANDROID__) && !defined(ANDROID_NDK_BUILD)
++		               "EGL_KHR_image "
++		               "EGL_ANDROID_image_native_buffer "
++#endif
+ 		               "EGL_ANDROID_recordable");
+ 	case EGL_VENDOR:
+ 		return success("Google Inc.");
+@@ -847,13 +852,19 @@ EGLContext EGLAPIENTRY CreateContext(EGLDisplay dpy, EGLConfig config, EGLContex
+ 					//  extension should enable it when this bit is set."
+ 					break;
+ 				case EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR:
+-				case EGL_CONTEXT_OPENGL_ROBUST_ACCESS_BIT_KHR:
+ 					// These bits are for OpenGL contexts only, not OpenGL ES contexts
+ 					return error(EGL_BAD_ATTRIBUTE, EGL_NO_CONTEXT);
++				case EGL_CONTEXT_OPENGL_ROBUST_ACCESS_BIT_KHR:
++					// RanchuWoA：EGL 1.5 起 GLES 也可请求健壮访问；顶点缓冲都留了 SIMD 余量，按提示接受
++					break;
+ 				default:
+ 					return error(EGL_BAD_ATTRIBUTE, EGL_NO_CONTEXT);
+ 				}
+ 				break;
++			case EGL_CONTEXT_PRIORITY_LEVEL_IMG:          // 调度优先级只是提示
++			case EGL_CONTEXT_OPENGL_NO_ERROR_KHR:         // 允许实现照常报错
++			case EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT:    // 同上，健壮访问
++				break;
+ 			case EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR:
+ 				switch(attribute[1])
+ 				{
+@@ -877,6 +888,11 @@ EGLContext EGLAPIENTRY CreateContext(EGLDisplay dpy, EGLConfig config, EGLContex
+ 				}
+ 				break;
+ 			default:
++				// RanchuWoA：不认识的属性记一笔再拒绝，便于定位哪个应用传了什么
++				#if defined(__ANDROID__)
++				__android_log_print(ANDROID_LOG_WARN, "libEGL_swiftshader",
++				                    "eglCreateContext: 不支持的属性 %#x = %#x", attribute[0], attribute[1]);
++				#endif
+ 				return error(EGL_BAD_ATTRIBUTE, EGL_NO_CONTEXT);
+ 			}
+ 		}
+diff --git a/src/OpenGL/libGLESv2/CMakeLists.txt b/src/OpenGL/libGLESv2/CMakeLists.txt
+index 8f7e4e173..1c0a51645 100644
+--- a/src/OpenGL/libGLESv2/CMakeLists.txt
++++ b/src/OpenGL/libGLESv2/CMakeLists.txt
+@@ -121,7 +121,7 @@ target_link_libraries(libGLESv2_deprecated
+ )
+ 
+ if (ANDROID)
+-    set_target_properties(libGLESv2_deprecated PROPERTIES SUFFIX "_swiftshader.so")
++    set_target_properties(libGLESv2_deprecated PROPERTIES OUTPUT_NAME "libGLESv2" SUFFIX "_swiftshader.so")
+ endif ()
+ 
+ set_shared_library_export_map(libGLESv2_deprecated ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/src/OpenGL/libGLESv2/VertexDataManager.cpp b/src/OpenGL/libGLESv2/VertexDataManager.cpp
+index 59062f7cb..8902d1ec8 100644
+--- a/src/OpenGL/libGLESv2/VertexDataManager.cpp
++++ b/src/OpenGL/libGLESv2/VertexDataManager.cpp
+@@ -1,359 +1,364 @@
+-// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//    http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-// VertexDataManager.h: Defines the VertexDataManager, a class that
+-// runs the Buffer translation process.
+-
+-#include "VertexDataManager.h"
+-
+-#include "Buffer.h"
+-#include "Program.h"
+-#include "IndexDataManager.h"
+-#include "common/debug.h"
+-
+-namespace
+-{
+-	enum {INITIAL_STREAM_BUFFER_SIZE = 1024 * 1024};
+-}
+-
+-namespace es2
+-{
+-
+-VertexDataManager::VertexDataManager(Context *context) : mContext(context)
+-{
+-	for(int i = 0; i < MAX_VERTEX_ATTRIBS; i++)
+-	{
+-		mDirtyCurrentValue[i] = true;
+-		mCurrentValueBuffer[i] = nullptr;
+-	}
+-
+-	mStreamingBuffer = new StreamingVertexBuffer(INITIAL_STREAM_BUFFER_SIZE);
+-
+-	if(!mStreamingBuffer)
+-	{
+-		ERR("Failed to allocate the streaming vertex buffer.");
+-	}
+-}
+-
+-VertexDataManager::~VertexDataManager()
+-{
+-	delete mStreamingBuffer;
+-
+-	for(int i = 0; i < MAX_VERTEX_ATTRIBS; i++)
+-	{
+-		delete mCurrentValueBuffer[i];
+-	}
+-}
+-
+-unsigned int VertexDataManager::writeAttributeData(StreamingVertexBuffer *vertexBuffer, GLint start, GLsizei count, const VertexAttribute &attribute)
+-{
+-	Buffer *buffer = attribute.mBoundBuffer;
+-
+-	int inputStride = attribute.stride();
+-	int elementSize = attribute.typeSize();
+-	unsigned int streamOffset = 0;
+-
+-	char *output = nullptr;
+-
+-	if(vertexBuffer)
+-	{
+-		output = (char*)vertexBuffer->map(attribute, attribute.typeSize() * count, &streamOffset);
+-	}
+-
+-	if(!output)
+-	{
+-		ERR("Failed to map vertex buffer.");
+-		return ~0u;
+-	}
+-
+-	const char *input = nullptr;
+-
+-	if(buffer)
+-	{
+-		input = static_cast<const char*>(buffer->data()) + attribute.mOffset;
+-	}
+-	else
+-	{
+-		input = static_cast<const char*>(attribute.mPointer);
+-	}
+-
+-	input += inputStride * start;
+-
+-	if(inputStride == elementSize)
+-	{
+-		memcpy(output, input, count * inputStride);
+-	}
+-	else
+-	{
+-		for(int i = 0; i < count; i++)
+-		{
+-			memcpy(output, input, elementSize);
+-			output += elementSize;
+-			input += inputStride;
+-		}
+-	}
+-
+-	vertexBuffer->unmap();
+-
+-	return streamOffset;
+-}
+-
+-GLenum VertexDataManager::prepareVertexData(GLint start, GLsizei count, TranslatedAttribute *translated, GLsizei instanceId)
+-{
+-	if(!mStreamingBuffer)
+-	{
+-		return GL_OUT_OF_MEMORY;
+-	}
+-
+-	const VertexAttributeArray &attribs = mContext->getVertexArrayAttributes();
+-	const VertexAttributeArray &currentAttribs = mContext->getCurrentVertexAttributes();
+-	Program *program = mContext->getCurrentProgram();
+-
+-	// Determine the required storage size per used buffer
+-	for(int i = 0; i < MAX_VERTEX_ATTRIBS; i++)
+-	{
+-		const VertexAttribute &attrib = attribs[i].mArrayEnabled ? attribs[i] : currentAttribs[i];
+-
+-		if(program->getAttributeStream(i) != -1 && attrib.mArrayEnabled)
+-		{
+-			if(!attrib.mBoundBuffer)
+-			{
+-				const bool isInstanced = attrib.mDivisor > 0;
+-				mStreamingBuffer->addRequiredSpace(attrib.typeSize() * (isInstanced ? 1 : count));
+-			}
+-		}
+-	}
+-
+-	mStreamingBuffer->reserveRequiredSpace();
+-
+-	// Perform the vertex data translations
+-	for(int i = 0; i < MAX_VERTEX_ATTRIBS; i++)
+-	{
+-		if(program->getAttributeStream(i) != -1)
+-		{
+-			const VertexAttribute &attrib = attribs[i].mArrayEnabled ? attribs[i] : currentAttribs[i];
+-
+-			if(attrib.mArrayEnabled)
+-			{
+-				const bool isInstanced = attrib.mDivisor > 0;
+-
+-				// Instanced vertices do not apply the 'start' offset
+-				GLint firstVertexIndex = isInstanced ? instanceId / attrib.mDivisor : start;
+-
+-				Buffer *buffer = attrib.mBoundBuffer;
+-
+-				if((!buffer && attrib.mPointer == nullptr) || (buffer && !buffer->data()))
+-				{
+-					// This is an application error that would normally result in a crash, but we catch it and return an error
+-					ERR("An enabled vertex array has no buffer and no pointer.");
+-					return GL_INVALID_OPERATION;
+-				}
+-
+-				sw::Resource *staticBuffer = buffer ? buffer->getResource() : nullptr;
+-
+-				if(staticBuffer)
+-				{
+-					translated[i].vertexBuffer = staticBuffer;
+-					translated[i].offset = firstVertexIndex * attrib.stride() + static_cast<int>(attrib.mOffset);
+-					translated[i].stride = isInstanced ? 0 : attrib.stride();
+-				}
+-				else
+-				{
+-					unsigned int streamOffset = writeAttributeData(mStreamingBuffer, firstVertexIndex, isInstanced ? 1 : count, attrib);
+-
+-					if(streamOffset == ~0u)
+-					{
+-						return GL_OUT_OF_MEMORY;
+-					}
+-
+-					translated[i].vertexBuffer = mStreamingBuffer->getResource();
+-					translated[i].offset = streamOffset;
+-					translated[i].stride = isInstanced ? 0 : attrib.typeSize();
+-				}
+-
+-				switch(attrib.mType)
+-				{
+-				case GL_BYTE:           translated[i].type = sw::STREAMTYPE_SBYTE;  break;
+-				case GL_UNSIGNED_BYTE:  translated[i].type = sw::STREAMTYPE_BYTE;   break;
+-				case GL_SHORT:          translated[i].type = sw::STREAMTYPE_SHORT;  break;
+-				case GL_UNSIGNED_SHORT: translated[i].type = sw::STREAMTYPE_USHORT; break;
+-				case GL_INT:            translated[i].type = sw::STREAMTYPE_INT;    break;
+-				case GL_UNSIGNED_INT:   translated[i].type = sw::STREAMTYPE_UINT;   break;
+-				case GL_FIXED:          translated[i].type = sw::STREAMTYPE_FIXED;  break;
+-				case GL_FLOAT:          translated[i].type = sw::STREAMTYPE_FLOAT;  break;
+-				case GL_HALF_FLOAT:     translated[i].type = sw::STREAMTYPE_HALF;   break;
+-				case GL_HALF_FLOAT_OES: translated[i].type = sw::STREAMTYPE_HALF;   break;
+-				case GL_INT_2_10_10_10_REV:          translated[i].type = sw::STREAMTYPE_2_10_10_10_INT;  break;
+-				case GL_UNSIGNED_INT_2_10_10_10_REV: translated[i].type = sw::STREAMTYPE_2_10_10_10_UINT; break;
+-				default: UNREACHABLE(attrib.mType); translated[i].type = sw::STREAMTYPE_FLOAT;  break;
+-				}
+-
+-				translated[i].count = attrib.mSize;
+-				translated[i].normalized = attrib.mNormalized;
+-			}
+-			else
+-			{
+-				if(mDirtyCurrentValue[i])
+-				{
+-					delete mCurrentValueBuffer[i];
+-					mCurrentValueBuffer[i] = new ConstantVertexBuffer(attrib.getCurrentValueBitsAsFloat(0), attrib.getCurrentValueBitsAsFloat(1), attrib.getCurrentValueBitsAsFloat(2), attrib.getCurrentValueBitsAsFloat(3));
+-					mDirtyCurrentValue[i] = false;
+-				}
+-
+-				translated[i].vertexBuffer = mCurrentValueBuffer[i]->getResource();
+-
+-				switch(attrib.currentValueType())
+-				{
+-				case GL_INT:
+-					translated[i].type = sw::STREAMTYPE_INT;
+-					break;
+-				case GL_UNSIGNED_INT:
+-					translated[i].type = sw::STREAMTYPE_UINT;
+-					break;
+-				default:
+-					translated[i].type = sw::STREAMTYPE_FLOAT;
+-					break;
+-				}
+-				translated[i].count = 4;
+-				translated[i].stride = 0;
+-				translated[i].offset = 0;
+-				translated[i].normalized = false;
+-			}
+-		}
+-	}
+-
+-	return GL_NO_ERROR;
+-}
+-
+-VertexBuffer::VertexBuffer(unsigned int size) : mVertexBuffer(nullptr)
+-{
+-	if(size > 0)
+-	{
+-		mVertexBuffer = new sw::Resource(size + 1024);
+-
+-		if(!mVertexBuffer)
+-		{
+-			ERR("Out of memory allocating a vertex buffer of size %u.", size);
+-		}
+-	}
+-}
+-
+-VertexBuffer::~VertexBuffer()
+-{
+-	if(mVertexBuffer)
+-	{
+-		mVertexBuffer->destruct();
+-	}
+-}
+-
+-void VertexBuffer::unmap()
+-{
+-	if(mVertexBuffer)
+-	{
+-		mVertexBuffer->unlock();
+-	}
+-}
+-
+-sw::Resource *VertexBuffer::getResource() const
+-{
+-	return mVertexBuffer;
+-}
+-
+-ConstantVertexBuffer::ConstantVertexBuffer(float x, float y, float z, float w) : VertexBuffer(4 * sizeof(float))
+-{
+-	if(mVertexBuffer)
+-	{
+-		float *vector = (float*)mVertexBuffer->lock(sw::PUBLIC);
+-
+-		vector[0] = x;
+-		vector[1] = y;
+-		vector[2] = z;
+-		vector[3] = w;
+-
+-		mVertexBuffer->unlock();
+-	}
+-}
+-
+-ConstantVertexBuffer::~ConstantVertexBuffer()
+-{
+-}
+-
+-StreamingVertexBuffer::StreamingVertexBuffer(unsigned int size) : VertexBuffer(size)
+-{
+-	mBufferSize = size;
+-	mWritePosition = 0;
+-	mRequiredSpace = 0;
+-}
+-
+-StreamingVertexBuffer::~StreamingVertexBuffer()
+-{
+-}
+-
+-void StreamingVertexBuffer::addRequiredSpace(unsigned int requiredSpace)
+-{
+-	mRequiredSpace += requiredSpace;
+-}
+-
+-void *StreamingVertexBuffer::map(const VertexAttribute &attribute, unsigned int requiredSpace, unsigned int *offset)
+-{
+-	void *mapPtr = nullptr;
+-
+-	if(mVertexBuffer)
+-	{
+-		// We can use a private lock because we never overwrite the content
+-		mapPtr = (char*)mVertexBuffer->lock(sw::PRIVATE) + mWritePosition;
+-
+-		*offset = mWritePosition;
+-		mWritePosition += requiredSpace;
+-	}
+-
+-	return mapPtr;
+-}
+-
+-void StreamingVertexBuffer::reserveRequiredSpace()
+-{
+-	if(mRequiredSpace > mBufferSize)
+-	{
+-		if(mVertexBuffer)
+-		{
+-			mVertexBuffer->destruct();
+-			mVertexBuffer = 0;
+-		}
+-
+-		mBufferSize = std::max(mRequiredSpace, 3 * mBufferSize / 2);   // 1.5 x mBufferSize is arbitrary and should be checked to see we don't have too many reallocations.
+-
+-		mVertexBuffer = new sw::Resource(mBufferSize);
+-
+-		if(!mVertexBuffer)
+-		{
+-			ERR("Out of memory allocating a vertex buffer of size %u.", mBufferSize);
+-		}
+-
+-		mWritePosition = 0;
+-	}
+-	else if(mWritePosition + mRequiredSpace > mBufferSize)   // Recycle
+-	{
+-		if(mVertexBuffer)
+-		{
+-			mVertexBuffer->destruct();
+-			mVertexBuffer = new sw::Resource(mBufferSize);
+-		}
+-
+-		mWritePosition = 0;
+-	}
+-
+-	mRequiredSpace = 0;
+-}
+-
+-}
++// Copyright 2016 The SwiftShader Authors. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//    http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// VertexDataManager.h: Defines the VertexDataManager, a class that
++// runs the Buffer translation process.
++
++#include "VertexDataManager.h"
++
++#include "Buffer.h"
++#include "Program.h"
++#include "IndexDataManager.h"
++#include "common/debug.h"
++
++namespace
++{
++	enum {INITIAL_STREAM_BUFFER_SIZE = 1024 * 1024};
++}
++
++namespace es2
++{
++
++VertexDataManager::VertexDataManager(Context *context) : mContext(context)
++{
++	for(int i = 0; i < MAX_VERTEX_ATTRIBS; i++)
++	{
++		mDirtyCurrentValue[i] = true;
++		mCurrentValueBuffer[i] = nullptr;
++	}
++
++	mStreamingBuffer = new StreamingVertexBuffer(INITIAL_STREAM_BUFFER_SIZE);
++
++	if(!mStreamingBuffer)
++	{
++		ERR("Failed to allocate the streaming vertex buffer.");
++	}
++}
++
++VertexDataManager::~VertexDataManager()
++{
++	delete mStreamingBuffer;
++
++	for(int i = 0; i < MAX_VERTEX_ATTRIBS; i++)
++	{
++		delete mCurrentValueBuffer[i];
++	}
++}
++
++unsigned int VertexDataManager::writeAttributeData(StreamingVertexBuffer *vertexBuffer, GLint start, GLsizei count, const VertexAttribute &attribute)
++{
++	Buffer *buffer = attribute.mBoundBuffer;
++
++	int inputStride = attribute.stride();
++	int elementSize = attribute.typeSize();
++	unsigned int streamOffset = 0;
++
++	char *output = nullptr;
++
++	if(vertexBuffer)
++	{
++		output = (char*)vertexBuffer->map(attribute, attribute.typeSize() * count, &streamOffset);
++	}
++
++	if(!output)
++	{
++		ERR("Failed to map vertex buffer.");
++		return ~0u;
++	}
++
++	const char *input = nullptr;
++
++	if(buffer)
++	{
++		input = static_cast<const char*>(buffer->data()) + attribute.mOffset;
++	}
++	else
++	{
++		input = static_cast<const char*>(attribute.mPointer);
++	}
++
++	input += inputStride * start;
++
++	if(inputStride == elementSize)
++	{
++		memcpy(output, input, count * inputStride);
++	}
++	else
++	{
++		for(int i = 0; i < count; i++)
++		{
++			memcpy(output, input, elementSize);
++			output += elementSize;
++			input += inputStride;
++		}
++	}
++
++	vertexBuffer->unmap();
++
++	return streamOffset;
++}
++
++GLenum VertexDataManager::prepareVertexData(GLint start, GLsizei count, TranslatedAttribute *translated, GLsizei instanceId)
++{
++	if(!mStreamingBuffer)
++	{
++		return GL_OUT_OF_MEMORY;
++	}
++
++	const VertexAttributeArray &attribs = mContext->getVertexArrayAttributes();
++	const VertexAttributeArray &currentAttribs = mContext->getCurrentVertexAttributes();
++	Program *program = mContext->getCurrentProgram();
++
++	// Determine the required storage size per used buffer
++	for(int i = 0; i < MAX_VERTEX_ATTRIBS; i++)
++	{
++		const VertexAttribute &attrib = attribs[i].mArrayEnabled ? attribs[i] : currentAttribs[i];
++
++		if(program->getAttributeStream(i) != -1 && attrib.mArrayEnabled)
++		{
++			if(!attrib.mBoundBuffer)
++			{
++				const bool isInstanced = attrib.mDivisor > 0;
++				mStreamingBuffer->addRequiredSpace(attrib.typeSize() * (isInstanced ? 1 : count));
++			}
++		}
++	}
++
++	mStreamingBuffer->reserveRequiredSpace();
++
++	// Perform the vertex data translations
++	for(int i = 0; i < MAX_VERTEX_ATTRIBS; i++)
++	{
++		if(program->getAttributeStream(i) != -1)
++		{
++			const VertexAttribute &attrib = attribs[i].mArrayEnabled ? attribs[i] : currentAttribs[i];
++
++			if(attrib.mArrayEnabled)
++			{
++				const bool isInstanced = attrib.mDivisor > 0;
++
++				// Instanced vertices do not apply the 'start' offset
++				GLint firstVertexIndex = isInstanced ? instanceId / attrib.mDivisor : start;
++
++				Buffer *buffer = attrib.mBoundBuffer;
++
++				if((!buffer && attrib.mPointer == nullptr) || (buffer && !buffer->data()))
++				{
++					// This is an application error that would normally result in a crash, but we catch it and return an error
++					ERR("An enabled vertex array has no buffer and no pointer.");
++					return GL_INVALID_OPERATION;
++				}
++
++				sw::Resource *staticBuffer = buffer ? buffer->getResource() : nullptr;
++
++				if(staticBuffer)
++				{
++					translated[i].vertexBuffer = staticBuffer;
++					translated[i].offset = firstVertexIndex * attrib.stride() + static_cast<int>(attrib.mOffset);
++					translated[i].stride = isInstanced ? 0 : attrib.stride();
++				}
++				else
++				{
++					unsigned int streamOffset = writeAttributeData(mStreamingBuffer, firstVertexIndex, isInstanced ? 1 : count, attrib);
++
++					if(streamOffset == ~0u)
++					{
++						return GL_OUT_OF_MEMORY;
++					}
++
++					translated[i].vertexBuffer = mStreamingBuffer->getResource();
++					translated[i].offset = streamOffset;
++					translated[i].stride = isInstanced ? 0 : attrib.typeSize();
++				}
++
++				switch(attrib.mType)
++				{
++				case GL_BYTE:           translated[i].type = sw::STREAMTYPE_SBYTE;  break;
++				case GL_UNSIGNED_BYTE:  translated[i].type = sw::STREAMTYPE_BYTE;   break;
++				case GL_SHORT:          translated[i].type = sw::STREAMTYPE_SHORT;  break;
++				case GL_UNSIGNED_SHORT: translated[i].type = sw::STREAMTYPE_USHORT; break;
++				case GL_INT:            translated[i].type = sw::STREAMTYPE_INT;    break;
++				case GL_UNSIGNED_INT:   translated[i].type = sw::STREAMTYPE_UINT;   break;
++				case GL_FIXED:          translated[i].type = sw::STREAMTYPE_FIXED;  break;
++				case GL_FLOAT:          translated[i].type = sw::STREAMTYPE_FLOAT;  break;
++				case GL_HALF_FLOAT:     translated[i].type = sw::STREAMTYPE_HALF;   break;
++				case GL_HALF_FLOAT_OES: translated[i].type = sw::STREAMTYPE_HALF;   break;
++				case GL_INT_2_10_10_10_REV:          translated[i].type = sw::STREAMTYPE_2_10_10_10_INT;  break;
++				case GL_UNSIGNED_INT_2_10_10_10_REV: translated[i].type = sw::STREAMTYPE_2_10_10_10_UINT; break;
++				default: UNREACHABLE(attrib.mType); translated[i].type = sw::STREAMTYPE_FLOAT;  break;
++				}
++
++				translated[i].count = attrib.mSize;
++				translated[i].normalized = attrib.mNormalized;
++			}
++			else
++			{
++				if(mDirtyCurrentValue[i])
++				{
++					delete mCurrentValueBuffer[i];
++					mCurrentValueBuffer[i] = new ConstantVertexBuffer(attrib.getCurrentValueBitsAsFloat(0), attrib.getCurrentValueBitsAsFloat(1), attrib.getCurrentValueBitsAsFloat(2), attrib.getCurrentValueBitsAsFloat(3));
++					mDirtyCurrentValue[i] = false;
++				}
++
++				translated[i].vertexBuffer = mCurrentValueBuffer[i]->getResource();
++
++				switch(attrib.currentValueType())
++				{
++				case GL_INT:
++					translated[i].type = sw::STREAMTYPE_INT;
++					break;
++				case GL_UNSIGNED_INT:
++					translated[i].type = sw::STREAMTYPE_UINT;
++					break;
++				default:
++					translated[i].type = sw::STREAMTYPE_FLOAT;
++					break;
++				}
++				translated[i].count = 4;
++				translated[i].stride = 0;
++				translated[i].offset = 0;
++				translated[i].normalized = false;
++			}
++		}
++	}
++
++	return GL_NO_ERROR;
++}
++
++// 顶点例程按 SIMD 一次取 4 个顶点，最后一批会读到缓冲区末尾之后；所有顶点缓冲都要留这段余量
++// （RanchuWoA：原实现只有构造时留了，StreamingVertexBuffer 扩容/回收时重新分配没留，
++//   大块分配末尾紧挨保护页时 system_server 的 RenderThread 会 SEGV_ACCERR）
++static const unsigned int kSimdPadding = 1024;
++
++VertexBuffer::VertexBuffer(unsigned int size) : mVertexBuffer(nullptr)
++{
++	if(size > 0)
++	{
++		mVertexBuffer = new sw::Resource(size + kSimdPadding);
++
++		if(!mVertexBuffer)
++		{
++			ERR("Out of memory allocating a vertex buffer of size %u.", size);
++		}
++	}
++}
++
++VertexBuffer::~VertexBuffer()
++{
++	if(mVertexBuffer)
++	{
++		mVertexBuffer->destruct();
++	}
++}
++
++void VertexBuffer::unmap()
++{
++	if(mVertexBuffer)
++	{
++		mVertexBuffer->unlock();
++	}
++}
++
++sw::Resource *VertexBuffer::getResource() const
++{
++	return mVertexBuffer;
++}
++
++ConstantVertexBuffer::ConstantVertexBuffer(float x, float y, float z, float w) : VertexBuffer(4 * sizeof(float))
++{
++	if(mVertexBuffer)
++	{
++		float *vector = (float*)mVertexBuffer->lock(sw::PUBLIC);
++
++		vector[0] = x;
++		vector[1] = y;
++		vector[2] = z;
++		vector[3] = w;
++
++		mVertexBuffer->unlock();
++	}
++}
++
++ConstantVertexBuffer::~ConstantVertexBuffer()
++{
++}
++
++StreamingVertexBuffer::StreamingVertexBuffer(unsigned int size) : VertexBuffer(size)
++{
++	mBufferSize = size;
++	mWritePosition = 0;
++	mRequiredSpace = 0;
++}
++
++StreamingVertexBuffer::~StreamingVertexBuffer()
++{
++}
++
++void StreamingVertexBuffer::addRequiredSpace(unsigned int requiredSpace)
++{
++	mRequiredSpace += requiredSpace;
++}
++
++void *StreamingVertexBuffer::map(const VertexAttribute &attribute, unsigned int requiredSpace, unsigned int *offset)
++{
++	void *mapPtr = nullptr;
++
++	if(mVertexBuffer)
++	{
++		// We can use a private lock because we never overwrite the content
++		mapPtr = (char*)mVertexBuffer->lock(sw::PRIVATE) + mWritePosition;
++
++		*offset = mWritePosition;
++		mWritePosition += requiredSpace;
++	}
++
++	return mapPtr;
++}
++
++void StreamingVertexBuffer::reserveRequiredSpace()
++{
++	if(mRequiredSpace > mBufferSize)
++	{
++		if(mVertexBuffer)
++		{
++			mVertexBuffer->destruct();
++			mVertexBuffer = 0;
++		}
++
++		mBufferSize = std::max(mRequiredSpace, 3 * mBufferSize / 2);   // 1.5 x mBufferSize is arbitrary and should be checked to see we don't have too many reallocations.
++
++		mVertexBuffer = new sw::Resource(mBufferSize + kSimdPadding);
++
++		if(!mVertexBuffer)
++		{
++			ERR("Out of memory allocating a vertex buffer of size %u.", mBufferSize);
++		}
++
++		mWritePosition = 0;
++	}
++	else if(mWritePosition + mRequiredSpace > mBufferSize)   // Recycle
++	{
++		if(mVertexBuffer)
++		{
++			mVertexBuffer->destruct();
++			mVertexBuffer = new sw::Resource(mBufferSize + kSimdPadding);
++		}
++
++		mWritePosition = 0;
++	}
++
++	mRequiredSpace = 0;
++}
++
++}
+diff --git a/third_party/SPIRV-Headers/CMakeLists.txt b/third_party/SPIRV-Headers/CMakeLists.txt
+index f19390aad..0b6ee3c3a 100644
+--- a/third_party/SPIRV-Headers/CMakeLists.txt
++++ b/third_party/SPIRV-Headers/CMakeLists.txt
+@@ -28,7 +28,7 @@
+ # The SPIR-V headers from the SPIR-V Registry
+ # https://www.khronos.org/registry/spir-v/
+ #
+-cmake_minimum_required(VERSION 3.0)
++cmake_minimum_required(VERSION 3.16)
+ project(SPIRV-Headers VERSION 1.5.5)
+ 
+ # There are two ways to use this project.
+diff --git a/third_party/SPIRV-Headers/tools/buildHeaders/CMakeLists.txt b/third_party/SPIRV-Headers/tools/buildHeaders/CMakeLists.txt
+index fa7ef50fa..61bbbc861 100644
+--- a/third_party/SPIRV-Headers/tools/buildHeaders/CMakeLists.txt
++++ b/third_party/SPIRV-Headers/tools/buildHeaders/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required(VERSION 3.0)
++cmake_minimum_required(VERSION 3.16)
+ 
+ set(CMAKE_INSTALL_PREFIX "install" CACHE STRING "prefix" FORCE)
+ 
+diff --git a/third_party/SPIRV-Tools/CMakeLists.txt b/third_party/SPIRV-Tools/CMakeLists.txt
+index 70caf857a..14472d599 100644
+--- a/third_party/SPIRV-Tools/CMakeLists.txt
++++ b/third_party/SPIRV-Tools/CMakeLists.txt
+@@ -12,7 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-cmake_minimum_required(VERSION 2.8.12)
++cmake_minimum_required(VERSION 3.16)
+ if (POLICY CMP0048)
+   cmake_policy(SET CMP0048 NEW)
+ endif()
+diff --git a/third_party/marl/CMakeLists.txt b/third_party/marl/CMakeLists.txt
+index 015732dd4..0caca1b65 100644
+--- a/third_party/marl/CMakeLists.txt
++++ b/third_party/marl/CMakeLists.txt
+@@ -12,7 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-cmake_minimum_required(VERSION 3.0)
++cmake_minimum_required(VERSION 3.16)
+ 
+ include(cmake/parse_version.cmake)
+ parse_version("${CMAKE_CURRENT_SOURCE_DIR}/CHANGES.md" MARL)
+diff --git a/android-platform-include/apex/window.h b/android-platform-include/apex/window.h
+new file mode 100644
+index 000000000..2d1354cdf
+--- /dev/null
++++ b/android-platform-include/apex/window.h
+@@ -0,0 +1,210 @@
++/*
++ * Copyright 2019 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <nativebase/nativebase.h>
++#include <stdarg.h>
++
++// apex is a superset of the NDK
++#include <android/native_window.h>
++
++__BEGIN_DECLS
++
++/*
++ * perform bits that can be used with ANativeWindow_perform()
++ *
++ * This is only to support the intercepting methods below - these should notbe
++ * used directly otherwise.
++ */
++enum ANativeWindowPerform {
++    // clang-format off
++    ANATIVEWINDOW_PERFORM_SET_USAGE            = 0,
++    ANATIVEWINDOW_PERFORM_SET_BUFFERS_GEOMETRY = 5,
++    ANATIVEWINDOW_PERFORM_SET_BUFFERS_FORMAT   = 9,
++    ANATIVEWINDOW_PERFORM_SET_USAGE64          = 30,
++    // clang-format on
++};
++
++/**
++ * Prototype of the function that an ANativeWindow implementation would call
++ * when ANativeWindow_cancelBuffer is called.
++ */
++typedef int (*ANativeWindow_cancelBufferFn)(ANativeWindow* window, ANativeWindowBuffer* buffer,
++                                            int fenceFd);
++
++/**
++ * Prototype of the function that intercepts an invocation of
++ * ANativeWindow_cancelBufferFn, along with a data pointer that's passed by the
++ * caller who set the interceptor, as well as arguments that would be
++ * passed to ANativeWindow_cancelBufferFn if it were to be called.
++ */
++typedef int (*ANativeWindow_cancelBufferInterceptor)(ANativeWindow* window,
++                                                     ANativeWindow_cancelBufferFn cancelBuffer,
++                                                     void* data, ANativeWindowBuffer* buffer,
++                                                     int fenceFd);
++
++/**
++ * Prototype of the function that an ANativeWindow implementation would call
++ * when ANativeWindow_dequeueBuffer is called.
++ */
++typedef int (*ANativeWindow_dequeueBufferFn)(ANativeWindow* window, ANativeWindowBuffer** buffer,
++                                             int* fenceFd);
++
++/**
++ * Prototype of the function that intercepts an invocation of
++ * ANativeWindow_dequeueBufferFn, along with a data pointer that's passed by the
++ * caller who set the interceptor, as well as arguments that would be
++ * passed to ANativeWindow_dequeueBufferFn if it were to be called.
++ */
++typedef int (*ANativeWindow_dequeueBufferInterceptor)(ANativeWindow* window,
++                                                      ANativeWindow_dequeueBufferFn dequeueBuffer,
++                                                      void* data, ANativeWindowBuffer** buffer,
++                                                      int* fenceFd);
++
++/**
++ * Prototype of the function that an ANativeWindow implementation would call
++ * when ANativeWindow_perform is called.
++ */
++typedef int (*ANativeWindow_performFn)(ANativeWindow* window, int operation, va_list args);
++
++/**
++ * Prototype of the function that intercepts an invocation of
++ * ANativeWindow_performFn, along with a data pointer that's passed by the
++ * caller who set the interceptor, as well as arguments that would be
++ * passed to ANativeWindow_performFn if it were to be called.
++ */
++typedef int (*ANativeWindow_performInterceptor)(ANativeWindow* window,
++                                                ANativeWindow_performFn perform, void* data,
++                                                int operation, va_list args);
++
++/**
++ * Prototype of the function that an ANativeWindow implementation would call
++ * when ANativeWindow_queueBuffer is called.
++ */
++typedef int (*ANativeWindow_queueBufferFn)(ANativeWindow* window, ANativeWindowBuffer* buffer,
++                                           int fenceFd);
++
++/**
++ * Prototype of the function that intercepts an invocation of
++ * ANativeWindow_queueBufferFn, along with a data pointer that's passed by the
++ * caller who set the interceptor, as well as arguments that would be
++ * passed to ANativeWindow_queueBufferFn if it were to be called.
++ */
++typedef int (*ANativeWindow_queueBufferInterceptor)(ANativeWindow* window,
++                                                    ANativeWindow_queueBufferFn queueBuffer,
++                                                    void* data, ANativeWindowBuffer* buffer,
++                                                    int fenceFd);
++
++/**
++ * Registers an interceptor for ANativeWindow_cancelBuffer. Instead of calling
++ * the underlying cancelBuffer function, instead the provided interceptor is
++ * called, which may optionally call the underlying cancelBuffer function. An
++ * optional data pointer is also provided to side-channel additional arguments.
++ *
++ * Note that usage of this should only be used for specialized use-cases by
++ * either the system partition or to Mainline modules. This should never be
++ * exposed to NDK or LL-NDK.
++ *
++ * Returns NO_ERROR on success, -errno if registration failed.
++ */
++int ANativeWindow_setCancelBufferInterceptor(ANativeWindow* window,
++                                             ANativeWindow_cancelBufferInterceptor interceptor,
++                                             void* data);
++
++/**
++ * Registers an interceptor for ANativeWindow_dequeueBuffer. Instead of calling
++ * the underlying dequeueBuffer function, instead the provided interceptor is
++ * called, which may optionally call the underlying dequeueBuffer function. An
++ * optional data pointer is also provided to side-channel additional arguments.
++ *
++ * Note that usage of this should only be used for specialized use-cases by
++ * either the system partition or to Mainline modules. This should never be
++ * exposed to NDK or LL-NDK.
++ *
++ * Returns NO_ERROR on success, -errno if registration failed.
++ */
++int ANativeWindow_setDequeueBufferInterceptor(ANativeWindow* window,
++                                              ANativeWindow_dequeueBufferInterceptor interceptor,
++                                              void* data);
++/**
++ * Registers an interceptor for ANativeWindow_perform. Instead of calling
++ * the underlying perform function, instead the provided interceptor is
++ * called, which may optionally call the underlying perform function. An
++ * optional data pointer is also provided to side-channel additional arguments.
++ *
++ * Note that usage of this should only be used for specialized use-cases by
++ * either the system partition or to Mainline modules. This should never be
++ * exposed to NDK or LL-NDK.
++ *
++ * Returns NO_ERROR on success, -errno if registration failed.
++ */
++int ANativeWindow_setPerformInterceptor(ANativeWindow* window,
++                                        ANativeWindow_performInterceptor interceptor, void* data);
++/**
++ * Registers an interceptor for ANativeWindow_queueBuffer. Instead of calling
++ * the underlying queueBuffer function, instead the provided interceptor is
++ * called, which may optionally call the underlying queueBuffer function. An
++ * optional data pointer is also provided to side-channel additional arguments.
++ *
++ * Note that usage of this should only be used for specialized use-cases by
++ * either the system partition or to Mainline modules. This should never be
++ * exposed to NDK or LL-NDK.
++ *
++ * Returns NO_ERROR on success, -errno if registration failed.
++ */
++int ANativeWindow_setQueueBufferInterceptor(ANativeWindow* window,
++                                            ANativeWindow_queueBufferInterceptor interceptor,
++                                            void* data);
++
++/**
++ * Retrieves how long it took for the last time a buffer was dequeued.
++ *
++ * \return the dequeue duration in nanoseconds
++ */
++int64_t ANativeWindow_getLastDequeueDuration(ANativeWindow* window);
++
++/**
++ * Retrieves how long it took for the last time a buffer was queued.
++ *
++ * \return the queue duration in nanoseconds
++ */
++int64_t ANativeWindow_getLastQueueDuration(ANativeWindow* window);
++
++/**
++ * Retrieves the system time in nanoseconds when the last time a buffer
++ * started to be dequeued.
++ *
++ * \return the start time in nanoseconds
++ */
++int64_t ANativeWindow_getLastDequeueStartTime(ANativeWindow* window);
++
++/**
++ * Sets a timeout in nanoseconds for dequeue calls. All subsequent dequeue calls
++ * made by the window will return -ETIMEDOUT after the timeout if the dequeue
++ * takes too long.
++ *
++ * If the provided timeout is negative, hen this removes the previously configured
++ * timeout. The window then behaves as if ANativeWindow_setDequeueTimeout was
++ * never called.
++ *
++ * \return NO_ERROR on success
++ * \return BAD_VALUE if the dequeue timeout was unabled to be updated, as
++ * updating the dequeue timeout may change internals of the underlying window.
++ */
++int ANativeWindow_setDequeueTimeout(ANativeWindow* window, int64_t timeout);
++
++__END_DECLS
+diff --git a/android-platform-include/cutils/log.h b/android-platform-include/cutils/log.h
+new file mode 100644
+index 000000000..408aaf7e0
+--- /dev/null
++++ b/android-platform-include/cutils/log.h
+@@ -0,0 +1,2 @@
++#pragma once
++#include <log/log.h>
+diff --git a/android-platform-include/cutils/native_handle.h b/android-platform-include/cutils/native_handle.h
+new file mode 100644
+index 000000000..6625b4cd8
+--- /dev/null
++++ b/android-platform-include/cutils/native_handle.h
+@@ -0,0 +1,32 @@
++/*
++ * 最小 native_handle 定义（与 AOSP system/core/libcutils/include/cutils/native_handle.h 的 ABI 一致）。
++ * woa gralloc 不链接 libcutils，句柄的创建/克隆/释放都自己实现。
++ */
++#pragma once
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct native_handle {
++    int version; /* sizeof(native_handle_t) */
++    int numFds;  /* number of file-descriptors at &data[0] */
++    int numInts; /* number of ints at &data[numFds] */
++#if defined(__clang__)
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wzero-length-array"
++#pragma clang diagnostic ignored "-Wgnu-empty-struct"
++#endif
++    int data[0]; /* numFds + numInts ints */
++#if defined(__clang__)
++#pragma clang diagnostic pop
++#endif
++} native_handle_t;
++
++typedef const native_handle_t* buffer_handle_t;
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/android-platform-include/cutils/properties.h b/android-platform-include/cutils/properties.h
+new file mode 100644
+index 000000000..36d082e75
+--- /dev/null
++++ b/android-platform-include/cutils/properties.h
+@@ -0,0 +1,19 @@
++/* RanchuWoA：property_get 的最小实现（bionic __system_property_get），代替 libcutils。 */
++#pragma once
++
++#include <string.h>
++#include <sys/system_properties.h>
++
++#define PROPERTY_VALUE_MAX PROP_VALUE_MAX
++
++static inline int property_get(const char* key, char* value, const char* default_value) {
++    int len = __system_property_get(key, value);
++    if (len > 0) return len;
++    if (default_value) {
++        strncpy(value, default_value, PROPERTY_VALUE_MAX - 1);
++        value[PROPERTY_VALUE_MAX - 1] = '\0';
++        return (int)strlen(value);
++    }
++    value[0] = '\0';
++    return 0;
++}
+diff --git a/android-platform-include/log/log.h b/android-platform-include/log/log.h
+new file mode 100644
+index 000000000..f6badd81c
+--- /dev/null
++++ b/android-platform-include/log/log.h
+@@ -0,0 +1,22 @@
++/* RanchuWoA：最小 liblog 宏（AOSP <log/log.h> 的子集），映射到 NDK 的 __android_log_print。 */
++#pragma once
++
++#include <android/log.h>
++#include <stdlib.h>
++
++#ifndef LOG_TAG
++#define LOG_TAG "swiftshader"
++#endif
++
++#define ALOGV(...) ((void)0)
++#define ALOGD(...) ((void)__android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__))
++#define ALOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__))
++#define ALOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__))
++#define ALOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__))
++#define ALOGW_IF(cond, ...) ((cond) ? ALOGW(__VA_ARGS__) : (void)0)
++#define ALOGE_IF(cond, ...) ((cond) ? ALOGE(__VA_ARGS__) : (void)0)
++#define LOG_ALWAYS_FATAL(...) (__android_log_assert(nullptr, LOG_TAG, __VA_ARGS__))
++#define LOG_ALWAYS_FATAL_IF(cond, ...) ((cond) ? LOG_ALWAYS_FATAL(__VA_ARGS__) : (void)0)
++#define LOG_FATAL_IF(cond, ...) LOG_ALWAYS_FATAL_IF(cond, __VA_ARGS__)
++#define ALOG_ASSERT(cond, ...) LOG_FATAL_IF(!(cond), ##__VA_ARGS__)
++#define android_vprintLog(prio, cond, tag, fmt, args) __android_log_vprint(prio, tag, fmt, args)
+diff --git a/android-platform-include/nativebase/nativebase.h b/android-platform-include/nativebase/nativebase.h
+new file mode 100644
+index 000000000..7ecdfbd74
+--- /dev/null
++++ b/android-platform-include/nativebase/nativebase.h
+@@ -0,0 +1,110 @@
++/*
++ * Copyright (C) 2017 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++#include <sys/cdefs.h>
++#include <system/graphics-base.h>
++#include <cutils/native_handle.h>
++
++__BEGIN_DECLS
++
++#ifdef __cplusplus
++#define ANDROID_NATIVE_UNSIGNED_CAST(x) static_cast<unsigned int>(x)
++#else
++#define ANDROID_NATIVE_UNSIGNED_CAST(x) ((unsigned int)(x))
++#endif
++
++#define ANDROID_NATIVE_MAKE_CONSTANT(a,b,c,d)  \
++    ((ANDROID_NATIVE_UNSIGNED_CAST(a) << 24) | \
++     (ANDROID_NATIVE_UNSIGNED_CAST(b) << 16) | \
++     (ANDROID_NATIVE_UNSIGNED_CAST(c) <<  8) | \
++     (ANDROID_NATIVE_UNSIGNED_CAST(d)))
++
++#define ANDROID_NATIVE_BUFFER_MAGIC     ANDROID_NATIVE_MAKE_CONSTANT('_','b','f','r')
++
++
++typedef struct android_native_base_t
++{
++    /* a magic value defined by the actual EGL native type */
++    int magic;
++
++    /* the sizeof() of the actual EGL native type */
++    int version;
++
++    void* reserved[4];
++
++    /* reference-counting interface */
++    void (*incRef)(struct android_native_base_t* base);
++    void (*decRef)(struct android_native_base_t* base);
++} android_native_base_t;
++
++typedef struct android_native_rect_t
++{
++    int32_t left;
++    int32_t top;
++    int32_t right;
++    int32_t bottom;
++} android_native_rect_t;
++
++typedef struct ANativeWindowBuffer
++{
++#ifdef __cplusplus
++    ANativeWindowBuffer() {
++        common.magic = ANDROID_NATIVE_BUFFER_MAGIC;
++        common.version = sizeof(ANativeWindowBuffer);
++        memset(common.reserved, 0, sizeof(common.reserved));
++    }
++
++    // Implement the methods that sp<ANativeWindowBuffer> expects so that it
++    // can be used to automatically refcount ANativeWindowBuffer's.
++    void incStrong(const void* /*id*/) const {
++        common.incRef(const_cast<android_native_base_t*>(&common));
++    }
++    void decStrong(const void* /*id*/) const {
++        common.decRef(const_cast<android_native_base_t*>(&common));
++    }
++#endif
++
++    struct android_native_base_t common;
++
++    int width;
++    int height;
++    int stride;
++    int format;
++    int usage_deprecated;
++    uintptr_t layerCount;
++
++    void* reserved[1];
++
++    const native_handle_t* handle;
++    uint64_t usage;
++
++    // we needed extra space for storing the 64-bits usage flags
++    // the number of slots to use from reserved_proc depends on the
++    // architecture.
++    void* reserved_proc[8 - (sizeof(uint64_t) / sizeof(void*))];
++} ANativeWindowBuffer_t;
++
++typedef struct ANativeWindowBuffer ANativeWindowBuffer;
++
++// Old typedef for backwards compatibility.
++typedef ANativeWindowBuffer_t android_native_buffer_t;
++
++__END_DECLS
+diff --git a/android-platform-include/sync/sync.h b/android-platform-include/sync/sync.h
+new file mode 100644
+index 000000000..809187a07
+--- /dev/null
++++ b/android-platform-include/sync/sync.h
+@@ -0,0 +1,8 @@
++/* RanchuWoA：libsync（LLNDK）的 sync_wait 声明。 */
++#pragma once
++
++#include <sys/cdefs.h>
++
++__BEGIN_DECLS
++int sync_wait(int fd, int timeout);
++__END_DECLS
+diff --git a/android-platform-include/system/graphics-base-v1.0.h b/android-platform-include/system/graphics-base-v1.0.h
+new file mode 100644
+index 000000000..44913cc61
+--- /dev/null
++++ b/android-platform-include/system/graphics-base-v1.0.h
+@@ -0,0 +1,140 @@
++// This file is autogenerated by hidl-gen. Do not edit manually.
++// Source: android.hardware.graphics.common@1.0
++// Location: hardware/interfaces/graphics/common/1.0/
++
++#ifndef HIDL_GENERATED_ANDROID_HARDWARE_GRAPHICS_COMMON_V1_0_EXPORTED_CONSTANTS_H_
++#define HIDL_GENERATED_ANDROID_HARDWARE_GRAPHICS_COMMON_V1_0_EXPORTED_CONSTANTS_H_
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef enum {
++    HAL_PIXEL_FORMAT_RGBA_8888 = 1,
++    HAL_PIXEL_FORMAT_RGBX_8888 = 2,
++    HAL_PIXEL_FORMAT_RGB_888 = 3,
++    HAL_PIXEL_FORMAT_RGB_565 = 4,
++    HAL_PIXEL_FORMAT_BGRA_8888 = 5,
++    HAL_PIXEL_FORMAT_YCBCR_422_SP = 16,
++    HAL_PIXEL_FORMAT_YCRCB_420_SP = 17,
++    HAL_PIXEL_FORMAT_YCBCR_422_I = 20,
++    HAL_PIXEL_FORMAT_RGBA_FP16 = 22,
++    HAL_PIXEL_FORMAT_RAW16 = 32,
++    HAL_PIXEL_FORMAT_BLOB = 33,
++    HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED = 34,
++    HAL_PIXEL_FORMAT_YCBCR_420_888 = 35,
++    HAL_PIXEL_FORMAT_RAW_OPAQUE = 36,
++    HAL_PIXEL_FORMAT_RAW10 = 37,
++    HAL_PIXEL_FORMAT_RAW12 = 38,
++    HAL_PIXEL_FORMAT_RGBA_1010102 = 43,
++    HAL_PIXEL_FORMAT_Y8 = 538982489,
++    HAL_PIXEL_FORMAT_Y16 = 540422489,
++    HAL_PIXEL_FORMAT_YV12 = 842094169,
++} android_pixel_format_t;
++
++typedef enum {
++    HAL_TRANSFORM_FLIP_H = 1,   // (1 << 0)
++    HAL_TRANSFORM_FLIP_V = 2,   // (1 << 1)
++    HAL_TRANSFORM_ROT_90 = 4,   // (1 << 2)
++    HAL_TRANSFORM_ROT_180 = 3,  // (FLIP_H | FLIP_V)
++    HAL_TRANSFORM_ROT_270 = 7,  // ((FLIP_H | FLIP_V) | ROT_90)
++} android_transform_t;
++
++typedef enum {
++    HAL_DATASPACE_UNKNOWN = 0,
++    HAL_DATASPACE_ARBITRARY = 1,
++    HAL_DATASPACE_STANDARD_SHIFT = 16,
++    HAL_DATASPACE_STANDARD_MASK = 4128768,                      // (63 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_UNSPECIFIED = 0,                     // (0 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_BT709 = 65536,                       // (1 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_BT601_625 = 131072,                  // (2 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_BT601_625_UNADJUSTED = 196608,       // (3 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_BT601_525 = 262144,                  // (4 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_BT601_525_UNADJUSTED = 327680,       // (5 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_BT2020 = 393216,                     // (6 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_BT2020_CONSTANT_LUMINANCE = 458752,  // (7 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_BT470M = 524288,                     // (8 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_FILM = 589824,                       // (9 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_DCI_P3 = 655360,                     // (10 << STANDARD_SHIFT)
++    HAL_DATASPACE_STANDARD_ADOBE_RGB = 720896,                  // (11 << STANDARD_SHIFT)
++    HAL_DATASPACE_TRANSFER_SHIFT = 22,
++    HAL_DATASPACE_TRANSFER_MASK = 130023424,       // (31 << TRANSFER_SHIFT)
++    HAL_DATASPACE_TRANSFER_UNSPECIFIED = 0,        // (0 << TRANSFER_SHIFT)
++    HAL_DATASPACE_TRANSFER_LINEAR = 4194304,       // (1 << TRANSFER_SHIFT)
++    HAL_DATASPACE_TRANSFER_SRGB = 8388608,         // (2 << TRANSFER_SHIFT)
++    HAL_DATASPACE_TRANSFER_SMPTE_170M = 12582912,  // (3 << TRANSFER_SHIFT)
++    HAL_DATASPACE_TRANSFER_GAMMA2_2 = 16777216,    // (4 << TRANSFER_SHIFT)
++    HAL_DATASPACE_TRANSFER_GAMMA2_6 = 20971520,    // (5 << TRANSFER_SHIFT)
++    HAL_DATASPACE_TRANSFER_GAMMA2_8 = 25165824,    // (6 << TRANSFER_SHIFT)
++    HAL_DATASPACE_TRANSFER_ST2084 = 29360128,      // (7 << TRANSFER_SHIFT)
++    HAL_DATASPACE_TRANSFER_HLG = 33554432,         // (8 << TRANSFER_SHIFT)
++    HAL_DATASPACE_RANGE_SHIFT = 27,
++    HAL_DATASPACE_RANGE_MASK = 939524096,      // (7 << RANGE_SHIFT)
++    HAL_DATASPACE_RANGE_UNSPECIFIED = 0,       // (0 << RANGE_SHIFT)
++    HAL_DATASPACE_RANGE_FULL = 134217728,      // (1 << RANGE_SHIFT)
++    HAL_DATASPACE_RANGE_LIMITED = 268435456,   // (2 << RANGE_SHIFT)
++    HAL_DATASPACE_RANGE_EXTENDED = 402653184,  // (3 << RANGE_SHIFT)
++    HAL_DATASPACE_SRGB_LINEAR = 512,
++    HAL_DATASPACE_V0_SRGB_LINEAR = 138477568,  // ((STANDARD_BT709 | TRANSFER_LINEAR) | RANGE_FULL)
++    HAL_DATASPACE_V0_SCRGB_LINEAR =
++        406913024,  // ((STANDARD_BT709 | TRANSFER_LINEAR) | RANGE_EXTENDED)
++    HAL_DATASPACE_SRGB = 513,
++    HAL_DATASPACE_V0_SRGB = 142671872,   // ((STANDARD_BT709 | TRANSFER_SRGB) | RANGE_FULL)
++    HAL_DATASPACE_V0_SCRGB = 411107328,  // ((STANDARD_BT709 | TRANSFER_SRGB) | RANGE_EXTENDED)
++    HAL_DATASPACE_JFIF = 257,
++    HAL_DATASPACE_V0_JFIF = 146931712,  // ((STANDARD_BT601_625 | TRANSFER_SMPTE_170M) | RANGE_FULL)
++    HAL_DATASPACE_BT601_625 = 258,
++    HAL_DATASPACE_V0_BT601_625 =
++        281149440,  // ((STANDARD_BT601_625 | TRANSFER_SMPTE_170M) | RANGE_LIMITED)
++    HAL_DATASPACE_BT601_525 = 259,
++    HAL_DATASPACE_V0_BT601_525 =
++        281280512,  // ((STANDARD_BT601_525 | TRANSFER_SMPTE_170M) | RANGE_LIMITED)
++    HAL_DATASPACE_BT709 = 260,
++    HAL_DATASPACE_V0_BT709 = 281083904,  // ((STANDARD_BT709 | TRANSFER_SMPTE_170M) | RANGE_LIMITED)
++    HAL_DATASPACE_DCI_P3_LINEAR = 139067392,  // ((STANDARD_DCI_P3 | TRANSFER_LINEAR) | RANGE_FULL)
++    HAL_DATASPACE_DCI_P3 = 155844608,  // ((STANDARD_DCI_P3 | TRANSFER_GAMMA2_6) | RANGE_FULL)
++    HAL_DATASPACE_DISPLAY_P3_LINEAR =
++        139067392,                         // ((STANDARD_DCI_P3 | TRANSFER_LINEAR) | RANGE_FULL)
++    HAL_DATASPACE_DISPLAY_P3 = 143261696,  // ((STANDARD_DCI_P3 | TRANSFER_SRGB) | RANGE_FULL)
++    HAL_DATASPACE_ADOBE_RGB = 151715840,  // ((STANDARD_ADOBE_RGB | TRANSFER_GAMMA2_2) | RANGE_FULL)
++    HAL_DATASPACE_BT2020_LINEAR = 138805248,  // ((STANDARD_BT2020 | TRANSFER_LINEAR) | RANGE_FULL)
++    HAL_DATASPACE_BT2020 = 147193856,     // ((STANDARD_BT2020 | TRANSFER_SMPTE_170M) | RANGE_FULL)
++    HAL_DATASPACE_BT2020_PQ = 163971072,  // ((STANDARD_BT2020 | TRANSFER_ST2084) | RANGE_FULL)
++    HAL_DATASPACE_DEPTH = 4096,
++    HAL_DATASPACE_SENSOR = 4097,
++} android_dataspace_t;
++
++typedef enum {
++    HAL_COLOR_MODE_NATIVE = 0,
++    HAL_COLOR_MODE_STANDARD_BT601_625 = 1,
++    HAL_COLOR_MODE_STANDARD_BT601_625_UNADJUSTED = 2,
++    HAL_COLOR_MODE_STANDARD_BT601_525 = 3,
++    HAL_COLOR_MODE_STANDARD_BT601_525_UNADJUSTED = 4,
++    HAL_COLOR_MODE_STANDARD_BT709 = 5,
++    HAL_COLOR_MODE_DCI_P3 = 6,
++    HAL_COLOR_MODE_SRGB = 7,
++    HAL_COLOR_MODE_ADOBE_RGB = 8,
++    HAL_COLOR_MODE_DISPLAY_P3 = 9,
++} android_color_mode_t;
++
++typedef enum {
++    HAL_COLOR_TRANSFORM_IDENTITY = 0,
++    HAL_COLOR_TRANSFORM_ARBITRARY_MATRIX = 1,
++    HAL_COLOR_TRANSFORM_VALUE_INVERSE = 2,
++    HAL_COLOR_TRANSFORM_GRAYSCALE = 3,
++    HAL_COLOR_TRANSFORM_CORRECT_PROTANOPIA = 4,
++    HAL_COLOR_TRANSFORM_CORRECT_DEUTERANOPIA = 5,
++    HAL_COLOR_TRANSFORM_CORRECT_TRITANOPIA = 6,
++} android_color_transform_t;
++
++typedef enum {
++    HAL_HDR_DOLBY_VISION = 1,
++    HAL_HDR_HDR10 = 2,
++    HAL_HDR_HLG = 3,
++} android_hdr_t;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  // HIDL_GENERATED_ANDROID_HARDWARE_GRAPHICS_COMMON_V1_0_EXPORTED_CONSTANTS_H_
+diff --git a/android-platform-include/system/graphics-base-v1.1.h b/android-platform-include/system/graphics-base-v1.1.h
+new file mode 100644
+index 000000000..f95b9ba21
+--- /dev/null
++++ b/android-platform-include/system/graphics-base-v1.1.h
+@@ -0,0 +1,48 @@
++// This file is autogenerated by hidl-gen. Do not edit manually.
++// Source: android.hardware.graphics.common@1.1
++// Location: hardware/interfaces/graphics/common/1.1/
++
++#ifndef HIDL_GENERATED_ANDROID_HARDWARE_GRAPHICS_COMMON_V1_1_EXPORTED_CONSTANTS_H_
++#define HIDL_GENERATED_ANDROID_HARDWARE_GRAPHICS_COMMON_V1_1_EXPORTED_CONSTANTS_H_
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef enum {
++    HAL_PIXEL_FORMAT_DEPTH_16 = 48,
++    HAL_PIXEL_FORMAT_DEPTH_24 = 49,
++    HAL_PIXEL_FORMAT_DEPTH_24_STENCIL_8 = 50,
++    HAL_PIXEL_FORMAT_DEPTH_32F = 51,
++    HAL_PIXEL_FORMAT_DEPTH_32F_STENCIL_8 = 52,
++    HAL_PIXEL_FORMAT_STENCIL_8 = 53,
++    HAL_PIXEL_FORMAT_YCBCR_P010 = 54,
++} android_pixel_format_v1_1_t;
++
++typedef enum {
++    HAL_DATASPACE_BT2020_ITU =
++        281411584,  // ((STANDARD_BT2020 | TRANSFER_SMPTE_170M) | RANGE_LIMITED)
++    HAL_DATASPACE_BT2020_ITU_PQ =
++        298188800,  // ((STANDARD_BT2020 | TRANSFER_ST2084) | RANGE_LIMITED)
++    HAL_DATASPACE_BT2020_ITU_HLG = 302383104,  // ((STANDARD_BT2020 | TRANSFER_HLG) | RANGE_LIMITED)
++    HAL_DATASPACE_BT2020_HLG = 168165376,      // ((STANDARD_BT2020 | TRANSFER_HLG) | RANGE_FULL)
++} android_dataspace_v1_1_t;
++
++typedef enum {
++    HAL_COLOR_MODE_BT2020 = 10,
++    HAL_COLOR_MODE_BT2100_PQ = 11,
++    HAL_COLOR_MODE_BT2100_HLG = 12,
++} android_color_mode_v1_1_t;
++
++typedef enum {
++    HAL_RENDER_INTENT_COLORIMETRIC = 0,
++    HAL_RENDER_INTENT_ENHANCE = 1,
++    HAL_RENDER_INTENT_TONE_MAP_COLORIMETRIC = 2,
++    HAL_RENDER_INTENT_TONE_MAP_ENHANCE = 3,
++} android_render_intent_v1_1_t;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  // HIDL_GENERATED_ANDROID_HARDWARE_GRAPHICS_COMMON_V1_1_EXPORTED_CONSTANTS_H_
+diff --git a/android-platform-include/system/graphics-base-v1.2.h b/android-platform-include/system/graphics-base-v1.2.h
+new file mode 100644
+index 000000000..624912cae
+--- /dev/null
++++ b/android-platform-include/system/graphics-base-v1.2.h
+@@ -0,0 +1,35 @@
++// This file is autogenerated by hidl-gen. Do not edit manually.
++// Source: android.hardware.graphics.common@1.2
++// Location: hardware/interfaces/graphics/common/1.2/
++
++#ifndef HIDL_GENERATED_ANDROID_HARDWARE_GRAPHICS_COMMON_V1_2_EXPORTED_CONSTANTS_H_
++#define HIDL_GENERATED_ANDROID_HARDWARE_GRAPHICS_COMMON_V1_2_EXPORTED_CONSTANTS_H_
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef enum {
++    HAL_HDR_HDR10_PLUS = 4,
++} android_hdr_v1_2_t;
++
++typedef enum {
++    HAL_DATASPACE_DISPLAY_BT2020 = 142999552 /* STANDARD_BT2020 | TRANSFER_SRGB | RANGE_FULL */,
++    HAL_DATASPACE_DYNAMIC_DEPTH = 4098 /* 0x1002 */,
++    HAL_DATASPACE_JPEG_APP_SEGMENTS = 4099 /* 0x1003 */,
++    HAL_DATASPACE_HEIF = 4100 /* 0x1004 */,
++} android_dataspace_v1_2_t;
++
++typedef enum {
++    HAL_COLOR_MODE_DISPLAY_BT2020 = 13,
++} android_color_mode_v1_2_t;
++
++typedef enum {
++    HAL_PIXEL_FORMAT_HSV_888 = 55 /* 0x37 */,
++} android_pixel_format_v1_2_t;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  // HIDL_GENERATED_ANDROID_HARDWARE_GRAPHICS_COMMON_V1_2_EXPORTED_CONSTANTS_H_
+diff --git a/android-platform-include/system/graphics-base.h b/android-platform-include/system/graphics-base.h
+new file mode 100644
+index 000000000..92ee077a6
+--- /dev/null
++++ b/android-platform-include/system/graphics-base.h
+@@ -0,0 +1,8 @@
++#ifndef SYSTEM_CORE_GRAPHICS_BASE_H_
++#define SYSTEM_CORE_GRAPHICS_BASE_H_
++
++#include "graphics-base-v1.0.h"
++#include "graphics-base-v1.1.h"
++#include "graphics-base-v1.2.h"
++
++#endif  // SYSTEM_CORE_GRAPHICS_BASE_H_
+diff --git a/android-platform-include/system/graphics-sw.h b/android-platform-include/system/graphics-sw.h
+new file mode 100644
+index 000000000..9e1a88e9e
+--- /dev/null
++++ b/android-platform-include/system/graphics-sw.h
+@@ -0,0 +1,16 @@
++#ifndef SYSTEM_CORE_GRAPHICS_SW_H_
++#define SYSTEM_CORE_GRAPHICS_SW_H_
++
++/* Software formats not in the HAL definitions. */
++typedef enum {
++    HAL_PIXEL_FORMAT_YCBCR_422_888 = 39,   // 0x27
++    HAL_PIXEL_FORMAT_YCBCR_444_888 = 40,   // 0x28
++    HAL_PIXEL_FORMAT_FLEX_RGB_888 = 41,    // 0x29
++    HAL_PIXEL_FORMAT_FLEX_RGBA_8888 = 42,  // 0x2A
++} android_pixel_format_sw_t;
++
++/* for compatibility */
++#define HAL_PIXEL_FORMAT_YCbCr_422_888 HAL_PIXEL_FORMAT_YCBCR_422_888
++#define HAL_PIXEL_FORMAT_YCbCr_444_888 HAL_PIXEL_FORMAT_YCBCR_444_888
++
++#endif  // SYSTEM_CORE_GRAPHICS_SW_H_
+diff --git a/android-platform-include/system/graphics.h b/android-platform-include/system/graphics.h
+new file mode 100644
+index 000000000..a3c23b20c
+--- /dev/null
++++ b/android-platform-include/system/graphics.h
+@@ -0,0 +1,270 @@
++/*
++ * Copyright (C) 2011 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef SYSTEM_CORE_INCLUDE_ANDROID_GRAPHICS_H
++#define SYSTEM_CORE_INCLUDE_ANDROID_GRAPHICS_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/*
++ * Some of the enums are now defined in HIDL in hardware/interfaces and are
++ * generated.
++ */
++#include "graphics-base.h"
++#include "graphics-sw.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* for compatibility */
++#define HAL_PIXEL_FORMAT_YCbCr_420_888 HAL_PIXEL_FORMAT_YCBCR_420_888
++#define HAL_PIXEL_FORMAT_YCbCr_422_SP HAL_PIXEL_FORMAT_YCBCR_422_SP
++#define HAL_PIXEL_FORMAT_YCrCb_420_SP HAL_PIXEL_FORMAT_YCRCB_420_SP
++#define HAL_PIXEL_FORMAT_YCbCr_422_I HAL_PIXEL_FORMAT_YCBCR_422_I
++typedef android_pixel_format_t android_pixel_format;
++typedef android_transform_t android_transform;
++typedef android_dataspace_t android_dataspace;
++typedef android_color_mode_t android_color_mode;
++typedef android_color_transform_t android_color_transform;
++typedef android_hdr_t android_hdr;
++
++/*
++ * If the HAL needs to create service threads to handle graphics related
++ * tasks, these threads need to run at HAL_PRIORITY_URGENT_DISPLAY priority
++ * if they can block the main rendering thread in any way.
++ *
++ * the priority of the current thread can be set with:
++ *
++ *      #include <sys/resource.h>
++ *      setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
++ *
++ */
++
++#define HAL_PRIORITY_URGENT_DISPLAY     (-8)
++
++/*
++ * Structure for describing YCbCr formats for consumption by applications.
++ * This is used with HAL_PIXEL_FORMAT_YCbCr_*.
++ *
++ * Buffer chroma subsampling is defined in the format.
++ * e.g. HAL_PIXEL_FORMAT_YCbCr_420_888 has subsampling 4:2:0.
++ *
++ * Buffers must have a byte aligned channel depth or a byte aligned packed
++ * channel depth (e.g. 10 bits packed into 16 bits for
++ * HAL_PIXEL_FORMAT_YCbCr_P010).
++ *
++ * y, cb, and cr point to the first byte of their respective planes.
++ *
++ * Stride describes the distance in bytes from the first value of one row of
++ * the image to the first value of the next row.  It includes the width of the
++ * image plus padding.
++ * ystride is the stride of the luma plane.
++ * cstride is the stride of the chroma planes.
++ *
++ * chroma_step is the distance in bytes from one chroma pixel value to the
++ * next.  This is `2 * channel depth` bytes for semiplanar (because chroma
++ * values are interleaved) and `1 * channel depth` bytes for planar.
++ */
++
++struct android_ycbcr {
++    void *y;
++    void *cb;
++    void *cr;
++    size_t ystride;
++    size_t cstride;
++    size_t chroma_step;
++
++    /** reserved for future use, set to 0 by gralloc's (*lock_ycbcr)() */
++    uint32_t reserved[8];
++};
++
++/*
++ * Structures for describing flexible YUVA/RGBA formats for consumption by
++ * applications. Such flexible formats contain a plane for each component (e.g.
++ * red, green, blue), where each plane is laid out in a grid-like pattern
++ * occupying unique byte addresses and with consistent byte offsets between
++ * neighboring pixels.
++ *
++ * The android_flex_layout structure is used with any pixel format that can be
++ * represented by it, such as:
++ *  - HAL_PIXEL_FORMAT_YCbCr_*_888
++ *  - HAL_PIXEL_FORMAT_FLEX_RGB*_888
++ *  - HAL_PIXEL_FORMAT_RGB[AX]_888[8],BGRA_8888,RGB_888
++ *  - HAL_PIXEL_FORMAT_YV12,Y8,Y16,YCbCr_422_SP/I,YCrCb_420_SP
++ *  - even implementation defined formats that can be represented by
++ *    the structures
++ *
++ * Vertical increment (aka. row increment or stride) describes the distance in
++ * bytes from the first pixel of one row to the first pixel of the next row
++ * (below) for the component plane. This can be negative.
++ *
++ * Horizontal increment (aka. column or pixel increment) describes the distance
++ * in bytes from one pixel to the next pixel (to the right) on the same row for
++ * the component plane. This can be negative.
++ *
++ * Each plane can be subsampled either vertically or horizontally by
++ * a power-of-two factor.
++ *
++ * The bit-depth of each component can be arbitrary, as long as the pixels are
++ * laid out on whole bytes, in native byte-order, using the most significant
++ * bits of each unit.
++ */
++
++typedef enum android_flex_component {
++    /* luma */
++    FLEX_COMPONENT_Y = 1 << 0,
++    /* chroma blue */
++    FLEX_COMPONENT_Cb = 1 << 1,
++    /* chroma red */
++    FLEX_COMPONENT_Cr = 1 << 2,
++
++    /* red */
++    FLEX_COMPONENT_R = 1 << 10,
++    /* green */
++    FLEX_COMPONENT_G = 1 << 11,
++    /* blue */
++    FLEX_COMPONENT_B = 1 << 12,
++
++    /* alpha */
++    FLEX_COMPONENT_A = 1 << 30,
++} android_flex_component_t;
++
++typedef struct android_flex_plane {
++    /* pointer to the first byte of the top-left pixel of the plane. */
++    uint8_t *top_left;
++
++    android_flex_component_t component;
++
++    /* bits allocated for the component in each pixel. Must be a positive
++       multiple of 8. */
++    int32_t bits_per_component;
++    /* number of the most significant bits used in the format for this
++       component. Must be between 1 and bits_per_component, inclusive. */
++    int32_t bits_used;
++
++    /* horizontal increment */
++    int32_t h_increment;
++    /* vertical increment */
++    int32_t v_increment;
++    /* horizontal subsampling. Must be a positive power of 2. */
++    int32_t h_subsampling;
++    /* vertical subsampling. Must be a positive power of 2. */
++    int32_t v_subsampling;
++} android_flex_plane_t;
++
++typedef enum android_flex_format {
++    /* not a flexible format */
++    FLEX_FORMAT_INVALID = 0x0,
++    FLEX_FORMAT_Y = FLEX_COMPONENT_Y,
++    FLEX_FORMAT_YCbCr = FLEX_COMPONENT_Y | FLEX_COMPONENT_Cb | FLEX_COMPONENT_Cr,
++    FLEX_FORMAT_YCbCrA = FLEX_FORMAT_YCbCr | FLEX_COMPONENT_A,
++    FLEX_FORMAT_RGB = FLEX_COMPONENT_R | FLEX_COMPONENT_G | FLEX_COMPONENT_B,
++    FLEX_FORMAT_RGBA = FLEX_FORMAT_RGB | FLEX_COMPONENT_A,
++} android_flex_format_t;
++
++typedef struct android_flex_layout {
++    /* the kind of flexible format */
++    android_flex_format_t format;
++
++    /* number of planes; 0 for FLEX_FORMAT_INVALID */
++    uint32_t num_planes;
++    /* a plane for each component; ordered in increasing component value order.
++       E.g. FLEX_FORMAT_RGBA maps 0 -> R, 1 -> G, etc.
++       Can be NULL for FLEX_FORMAT_INVALID */
++    android_flex_plane_t *planes;
++} android_flex_layout_t;
++
++/**
++ * Structure used to define depth point clouds for format HAL_PIXEL_FORMAT_BLOB
++ * with dataSpace value of HAL_DATASPACE_DEPTH.
++ * When locking a native buffer of the above format and dataSpace value,
++ * the vaddr pointer can be cast to this structure.
++ *
++ * A variable-length list of (x,y,z, confidence) 3D points, as floats.  (x, y,
++ * z) represents a measured point's position, with the coordinate system defined
++ * by the data source.  Confidence represents the estimated likelihood that this
++ * measurement is correct. It is between 0.f and 1.f, inclusive, with 1.f ==
++ * 100% confidence.
++ *
++ * num_points is the number of points in the list
++ *
++ * xyz_points is the flexible array of floating-point values.
++ *   It contains (num_points) * 4 floats.
++ *
++ *   For example:
++ *     android_depth_points d = get_depth_buffer();
++ *     struct {
++ *       float x; float y; float z; float confidence;
++ *     } firstPoint, lastPoint;
++ *
++ *     firstPoint.x = d.xyzc_points[0];
++ *     firstPoint.y = d.xyzc_points[1];
++ *     firstPoint.z = d.xyzc_points[2];
++ *     firstPoint.confidence = d.xyzc_points[3];
++ *     lastPoint.x = d.xyzc_points[(d.num_points - 1) * 4 + 0];
++ *     lastPoint.y = d.xyzc_points[(d.num_points - 1) * 4 + 1];
++ *     lastPoint.z = d.xyzc_points[(d.num_points - 1) * 4 + 2];
++ *     lastPoint.confidence = d.xyzc_points[(d.num_points - 1) * 4 + 3];
++ */
++
++struct android_depth_points {
++    uint32_t num_points;
++
++    /** reserved for future use, set to 0 by gralloc's (*lock)() */
++    uint32_t reserved[8];
++
++#if defined(__clang__)
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wc99-extensions"
++#endif
++    float xyzc_points[];
++#if defined(__clang__)
++#pragma clang diagnostic pop
++#endif
++};
++
++/**
++  * These structures are used to define the reference display's
++  * capabilities for HDR content. Display engine can use this
++  * to better tone map content to user's display.
++  * Color is defined in CIE XYZ coordinates
++  */
++struct android_xy_color {
++    float x;
++    float y;
++};
++
++struct android_smpte2086_metadata {
++    struct android_xy_color displayPrimaryRed;
++    struct android_xy_color displayPrimaryGreen;
++    struct android_xy_color displayPrimaryBlue;
++    struct android_xy_color whitePoint;
++    float maxLuminance;
++    float minLuminance;
++};
++
++struct android_cta861_3_metadata {
++    float maxContentLightLevel;
++    float maxFrameAverageLightLevel;
++};
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* SYSTEM_CORE_INCLUDE_ANDROID_GRAPHICS_H */
+diff --git a/android-platform-include/system/window.h b/android-platform-include/system/window.h
+new file mode 100644
+index 000000000..33c303ae7
+--- /dev/null
++++ b/android-platform-include/system/window.h
+@@ -0,0 +1,1311 @@
++/*
++ * Copyright (C) 2011 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*************************************************************************************************
++ *
++ * IMPORTANT:
++ *
++ * There is an old copy of this file in system/core/include/system/window.h, which exists only
++ * for backward source compatibility.
++ * But there are binaries out there as well, so this version of window.h must stay binary
++ * backward compatible with the one found in system/core.
++ *
++ *
++ * Source compatibility is also required for now, because this is how we're handling the
++ * transition from system/core/include (global include path) to nativewindow/include.
++ *
++ *************************************************************************************************/
++
++#pragma once
++
++#include <cutils/native_handle.h>
++#include <errno.h>
++#include <limits.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/cdefs.h>
++#include <system/graphics.h>
++#include <unistd.h>
++
++#include <vndk/hardware_buffer.h>
++
++// system/window.h is a superset of the vndk and apex apis
++#include <apex/window.h>
++#include <vndk/window.h>
++
++
++#ifndef __UNUSED
++#define __UNUSED __attribute__((__unused__))
++#endif
++#ifndef __deprecated
++#define __deprecated __attribute__((__deprecated__))
++#endif
++
++__BEGIN_DECLS
++
++/*****************************************************************************/
++
++#define ANDROID_NATIVE_WINDOW_MAGIC     ANDROID_NATIVE_MAKE_CONSTANT('_','w','n','d')
++
++// ---------------------------------------------------------------------------
++
++/* attributes queriable with query() */
++enum {
++    NATIVE_WINDOW_WIDTH = 0,
++    NATIVE_WINDOW_HEIGHT = 1,
++    NATIVE_WINDOW_FORMAT = 2,
++
++    /* see ANativeWindowQuery in vndk/window.h */
++    NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS = ANATIVEWINDOW_QUERY_MIN_UNDEQUEUED_BUFFERS,
++
++    /* Check whether queueBuffer operations on the ANativeWindow send the buffer
++     * to the window compositor.  The query sets the returned 'value' argument
++     * to 1 if the ANativeWindow DOES send queued buffers directly to the window
++     * compositor and 0 if the buffers do not go directly to the window
++     * compositor.
++     *
++     * This can be used to determine whether protected buffer content should be
++     * sent to the ANativeWindow.  Note, however, that a result of 1 does NOT
++     * indicate that queued buffers will be protected from applications or users
++     * capturing their contents.  If that behavior is desired then some other
++     * mechanism (e.g. the GRALLOC_USAGE_PROTECTED flag) should be used in
++     * conjunction with this query.
++     */
++    NATIVE_WINDOW_QUEUES_TO_WINDOW_COMPOSER = 4,
++
++    /* Get the concrete type of a ANativeWindow.  See below for the list of
++     * possible return values.
++     *
++     * This query should not be used outside the Android framework and will
++     * likely be removed in the near future.
++     */
++    NATIVE_WINDOW_CONCRETE_TYPE = 5,
++
++    /*
++     * Default width and height of ANativeWindow buffers, these are the
++     * dimensions of the window buffers irrespective of the
++     * NATIVE_WINDOW_SET_BUFFERS_DIMENSIONS call and match the native window
++     * size unless overridden by NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS.
++     */
++    NATIVE_WINDOW_DEFAULT_WIDTH = ANATIVEWINDOW_QUERY_DEFAULT_WIDTH,
++    NATIVE_WINDOW_DEFAULT_HEIGHT = ANATIVEWINDOW_QUERY_DEFAULT_HEIGHT,
++
++    /* see ANativeWindowQuery in vndk/window.h */
++    NATIVE_WINDOW_TRANSFORM_HINT = ANATIVEWINDOW_QUERY_TRANSFORM_HINT,
++
++    /*
++     * Boolean that indicates whether the consumer is running more than
++     * one buffer behind the producer.
++     */
++    NATIVE_WINDOW_CONSUMER_RUNNING_BEHIND = 9,
++
++    /*
++     * The consumer gralloc usage bits currently set by the consumer.
++     * The values are defined in hardware/libhardware/include/gralloc.h.
++     */
++    NATIVE_WINDOW_CONSUMER_USAGE_BITS = 10, /* deprecated */
++
++    /**
++     * Transformation that will by applied to buffers by the hwcomposer.
++     * This must not be set or checked by producer endpoints, and will
++     * disable the transform hint set in SurfaceFlinger (see
++     * NATIVE_WINDOW_TRANSFORM_HINT).
++     *
++     * INTENDED USE:
++     * Temporary - Please do not use this.  This is intended only to be used
++     * by the camera's LEGACY mode.
++     *
++     * In situations where a SurfaceFlinger client wishes to set a transform
++     * that is not visible to the producer, and will always be applied in the
++     * hardware composer, the client can set this flag with
++     * native_window_set_buffers_sticky_transform.  This can be used to rotate
++     * and flip buffers consumed by hardware composer without actually changing
++     * the aspect ratio of the buffers produced.
++     */
++    NATIVE_WINDOW_STICKY_TRANSFORM = 11,
++
++    /**
++     * The default data space for the buffers as set by the consumer.
++     * The values are defined in graphics.h.
++     */
++    NATIVE_WINDOW_DEFAULT_DATASPACE = 12,
++
++    /* see ANativeWindowQuery in vndk/window.h */
++    NATIVE_WINDOW_BUFFER_AGE = ANATIVEWINDOW_QUERY_BUFFER_AGE,
++
++    /*
++     * Returns the duration of the last dequeueBuffer call in microseconds
++     * Deprecated: please use NATIVE_WINDOW_GET_LAST_DEQUEUE_DURATION in
++     * perform() instead, which supports nanosecond precision.
++     */
++    NATIVE_WINDOW_LAST_DEQUEUE_DURATION = 14,
++
++    /*
++     * Returns the duration of the last queueBuffer call in microseconds
++     * Deprecated: please use NATIVE_WINDOW_GET_LAST_QUEUE_DURATION in
++     * perform() instead, which supports nanosecond precision.
++     */
++    NATIVE_WINDOW_LAST_QUEUE_DURATION = 15,
++
++    /*
++     * Returns the number of image layers that the ANativeWindow buffer
++     * contains. By default this is 1, unless a buffer is explicitly allocated
++     * to contain multiple layers.
++     */
++    NATIVE_WINDOW_LAYER_COUNT = 16,
++
++    /*
++     * Returns 1 if the native window is valid, 0 otherwise. native window is valid
++     * if it is safe (i.e. no crash will occur) to call any method on it.
++     */
++    NATIVE_WINDOW_IS_VALID = 17,
++
++    /*
++     * Returns 1 if NATIVE_WINDOW_GET_FRAME_TIMESTAMPS will return display
++     * present info, 0 if it won't.
++     */
++    NATIVE_WINDOW_FRAME_TIMESTAMPS_SUPPORTS_PRESENT = 18,
++
++    /*
++     * The consumer end is capable of handling protected buffers, i.e. buffer
++     * with GRALLOC_USAGE_PROTECTED usage bits on.
++     */
++    NATIVE_WINDOW_CONSUMER_IS_PROTECTED = 19,
++
++    /*
++     * Returns data space for the buffers.
++     */
++    NATIVE_WINDOW_DATASPACE = 20,
++
++    /*
++     * Returns maxBufferCount set by BufferQueueConsumer
++     */
++    NATIVE_WINDOW_MAX_BUFFER_COUNT = 21,
++};
++
++/* Valid operations for the (*perform)() hook.
++ *
++ * Values marked as 'deprecated' are supported, but have been superceded by
++ * other functionality.
++ *
++ * Values marked as 'private' should be considered private to the framework.
++ * HAL implementation code with access to an ANativeWindow should not use these,
++ * as it may not interact properly with the framework's use of the
++ * ANativeWindow.
++ */
++enum {
++    // clang-format off
++    NATIVE_WINDOW_SET_USAGE                       =  ANATIVEWINDOW_PERFORM_SET_USAGE,   /* deprecated */
++    NATIVE_WINDOW_CONNECT                         =  1,   /* deprecated */
++    NATIVE_WINDOW_DISCONNECT                      =  2,   /* deprecated */
++    NATIVE_WINDOW_SET_CROP                        =  3,   /* private */
++    NATIVE_WINDOW_SET_BUFFER_COUNT                =  4,
++    NATIVE_WINDOW_SET_BUFFERS_GEOMETRY            =  ANATIVEWINDOW_PERFORM_SET_BUFFERS_GEOMETRY,   /* deprecated */
++    NATIVE_WINDOW_SET_BUFFERS_TRANSFORM           =  6,
++    NATIVE_WINDOW_SET_BUFFERS_TIMESTAMP           =  7,
++    NATIVE_WINDOW_SET_BUFFERS_DIMENSIONS          =  8,
++    NATIVE_WINDOW_SET_BUFFERS_FORMAT              =  ANATIVEWINDOW_PERFORM_SET_BUFFERS_FORMAT,
++    NATIVE_WINDOW_SET_SCALING_MODE                = 10,   /* private */
++    NATIVE_WINDOW_LOCK                            = 11,   /* private */
++    NATIVE_WINDOW_UNLOCK_AND_POST                 = 12,   /* private */
++    NATIVE_WINDOW_API_CONNECT                     = 13,   /* private */
++    NATIVE_WINDOW_API_DISCONNECT                  = 14,   /* private */
++    NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS     = 15,   /* private */
++    NATIVE_WINDOW_SET_POST_TRANSFORM_CROP         = 16,   /* deprecated, unimplemented */
++    NATIVE_WINDOW_SET_BUFFERS_STICKY_TRANSFORM    = 17,   /* private */
++    NATIVE_WINDOW_SET_SIDEBAND_STREAM             = 18,
++    NATIVE_WINDOW_SET_BUFFERS_DATASPACE           = 19,
++    NATIVE_WINDOW_SET_SURFACE_DAMAGE              = 20,   /* private */
++    NATIVE_WINDOW_SET_SHARED_BUFFER_MODE          = 21,
++    NATIVE_WINDOW_SET_AUTO_REFRESH                = 22,
++    NATIVE_WINDOW_GET_REFRESH_CYCLE_DURATION      = 23,
++    NATIVE_WINDOW_GET_NEXT_FRAME_ID               = 24,
++    NATIVE_WINDOW_ENABLE_FRAME_TIMESTAMPS         = 25,
++    NATIVE_WINDOW_GET_COMPOSITOR_TIMING           = 26,
++    NATIVE_WINDOW_GET_FRAME_TIMESTAMPS            = 27,
++    /* 28, removed: NATIVE_WINDOW_GET_WIDE_COLOR_SUPPORT */
++    /* 29, removed: NATIVE_WINDOW_GET_HDR_SUPPORT */
++    NATIVE_WINDOW_SET_USAGE64                     = ANATIVEWINDOW_PERFORM_SET_USAGE64,
++    NATIVE_WINDOW_GET_CONSUMER_USAGE64            = 31,
++    NATIVE_WINDOW_SET_BUFFERS_SMPTE2086_METADATA  = 32,
++    NATIVE_WINDOW_SET_BUFFERS_CTA861_3_METADATA   = 33,
++    NATIVE_WINDOW_SET_BUFFERS_HDR10_PLUS_METADATA = 34,
++    NATIVE_WINDOW_SET_AUTO_PREROTATION            = 35,
++    NATIVE_WINDOW_GET_LAST_DEQUEUE_START          = 36,    /* private */
++    NATIVE_WINDOW_SET_DEQUEUE_TIMEOUT             = 37,    /* private */
++    NATIVE_WINDOW_GET_LAST_DEQUEUE_DURATION       = 38,    /* private */
++    NATIVE_WINDOW_GET_LAST_QUEUE_DURATION         = 39,    /* private */
++    NATIVE_WINDOW_SET_FRAME_RATE                  = 40,
++    NATIVE_WINDOW_SET_CANCEL_INTERCEPTOR          = 41,    /* private */
++    NATIVE_WINDOW_SET_DEQUEUE_INTERCEPTOR         = 42,    /* private */
++    NATIVE_WINDOW_SET_PERFORM_INTERCEPTOR         = 43,    /* private */
++    NATIVE_WINDOW_SET_QUEUE_INTERCEPTOR           = 44,    /* private */
++    NATIVE_WINDOW_ALLOCATE_BUFFERS                = 45,    /* private */
++    NATIVE_WINDOW_GET_LAST_QUEUED_BUFFER          = 46,    /* private */
++    NATIVE_WINDOW_SET_QUERY_INTERCEPTOR           = 47,    /* private */
++    NATIVE_WINDOW_SET_FRAME_TIMELINE_INFO         = 48,    /* private */
++    NATIVE_WINDOW_GET_LAST_QUEUED_BUFFER2         = 49,    /* private */
++    NATIVE_WINDOW_SET_BUFFERS_ADDITIONAL_OPTIONS  = 50,
++    // clang-format on
++};
++
++/* parameter for NATIVE_WINDOW_[API_][DIS]CONNECT */
++enum {
++    /* Buffers will be queued by EGL via eglSwapBuffers after being filled using
++     * OpenGL ES.
++     */
++    NATIVE_WINDOW_API_EGL = 1,
++
++    /* Buffers will be queued after being filled using the CPU
++     */
++    NATIVE_WINDOW_API_CPU = 2,
++
++    /* Buffers will be queued by Stagefright after being filled by a video
++     * decoder.  The video decoder can either be a software or hardware decoder.
++     */
++    NATIVE_WINDOW_API_MEDIA = 3,
++
++    /* Buffers will be queued by the the camera HAL.
++     */
++    NATIVE_WINDOW_API_CAMERA = 4,
++};
++
++/* parameter for NATIVE_WINDOW_SET_BUFFERS_TRANSFORM */
++enum {
++    /* flip source image horizontally */
++    NATIVE_WINDOW_TRANSFORM_FLIP_H = HAL_TRANSFORM_FLIP_H ,
++    /* flip source image vertically */
++    NATIVE_WINDOW_TRANSFORM_FLIP_V = HAL_TRANSFORM_FLIP_V,
++    /* rotate source image 90 degrees clock-wise, and is applied after TRANSFORM_FLIP_{H|V} */
++    NATIVE_WINDOW_TRANSFORM_ROT_90 = HAL_TRANSFORM_ROT_90,
++    /* rotate source image 180 degrees */
++    NATIVE_WINDOW_TRANSFORM_ROT_180 = HAL_TRANSFORM_ROT_180,
++    /* rotate source image 270 degrees clock-wise */
++    NATIVE_WINDOW_TRANSFORM_ROT_270 = HAL_TRANSFORM_ROT_270,
++    /* transforms source by the inverse transform of the screen it is displayed onto. This
++     * transform is applied last */
++    NATIVE_WINDOW_TRANSFORM_INVERSE_DISPLAY = 0x08
++};
++
++/* parameter for NATIVE_WINDOW_SET_SCALING_MODE
++ * keep in sync with Surface.java in frameworks/base */
++enum {
++    /* the window content is not updated (frozen) until a buffer of
++     * the window size is received (enqueued)
++     */
++    NATIVE_WINDOW_SCALING_MODE_FREEZE           = 0,
++    /* the buffer is scaled in both dimensions to match the window size */
++    NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW  = 1,
++    /* the buffer is scaled uniformly such that the smaller dimension
++     * of the buffer matches the window size (cropping in the process)
++     */
++    NATIVE_WINDOW_SCALING_MODE_SCALE_CROP       = 2,
++    /* the window is clipped to the size of the buffer's crop rectangle; pixels
++     * outside the crop rectangle are treated as if they are completely
++     * transparent.
++     */
++    NATIVE_WINDOW_SCALING_MODE_NO_SCALE_CROP    = 3,
++};
++
++/* values returned by the NATIVE_WINDOW_CONCRETE_TYPE query */
++enum {
++    NATIVE_WINDOW_FRAMEBUFFER               = 0, /* FramebufferNativeWindow */
++    NATIVE_WINDOW_SURFACE                   = 1, /* Surface */
++};
++
++/* parameter for NATIVE_WINDOW_SET_BUFFERS_TIMESTAMP
++ *
++ * Special timestamp value to indicate that timestamps should be auto-generated
++ * by the native window when queueBuffer is called.  This is equal to INT64_MIN,
++ * defined directly to avoid problems with C99/C++ inclusion of stdint.h.
++ */
++static const int64_t NATIVE_WINDOW_TIMESTAMP_AUTO = (-9223372036854775807LL-1);
++
++/* parameter for NATIVE_WINDOW_GET_FRAME_TIMESTAMPS
++ *
++ * Special timestamp value to indicate the timestamps aren't yet known or
++ * that they are invalid.
++ */
++static const int64_t NATIVE_WINDOW_TIMESTAMP_PENDING = -2;
++static const int64_t NATIVE_WINDOW_TIMESTAMP_INVALID = -1;
++
++struct ANativeWindow
++{
++#ifdef __cplusplus
++    ANativeWindow()
++        : flags(0), minSwapInterval(0), maxSwapInterval(0), xdpi(0), ydpi(0)
++    {
++        common.magic = ANDROID_NATIVE_WINDOW_MAGIC;
++        common.version = sizeof(ANativeWindow);
++        memset(common.reserved, 0, sizeof(common.reserved));
++    }
++
++    /* Implement the methods that sp<ANativeWindow> expects so that it
++       can be used to automatically refcount ANativeWindow's. */
++    void incStrong(const void* /*id*/) const {
++        common.incRef(const_cast<android_native_base_t*>(&common));
++    }
++    void decStrong(const void* /*id*/) const {
++        common.decRef(const_cast<android_native_base_t*>(&common));
++    }
++#endif
++
++    struct android_native_base_t common;
++
++    /* flags describing some attributes of this surface or its updater */
++    const uint32_t flags;
++
++    /* min swap interval supported by this updated */
++    const int   minSwapInterval;
++
++    /* max swap interval supported by this updated */
++    const int   maxSwapInterval;
++
++    /* horizontal and vertical resolution in DPI */
++    const float xdpi;
++    const float ydpi;
++
++    /* Some storage reserved for the OEM's driver. */
++    intptr_t    oem[4];
++
++    /*
++     * Set the swap interval for this surface.
++     *
++     * Returns 0 on success or -errno on error.
++     */
++    int     (*setSwapInterval)(struct ANativeWindow* window,
++                int interval);
++
++    /*
++     * Hook called by EGL to acquire a buffer. After this call, the buffer
++     * is not locked, so its content cannot be modified. This call may block if
++     * no buffers are available.
++     *
++     * The window holds a reference to the buffer between dequeueBuffer and
++     * either queueBuffer or cancelBuffer, so clients only need their own
++     * reference if they might use the buffer after queueing or canceling it.
++     * Holding a reference to a buffer after queueing or canceling it is only
++     * allowed if a specific buffer count has been set.
++     *
++     * Returns 0 on success or -errno on error.
++     *
++     * XXX: This function is deprecated.  It will continue to work for some
++     * time for binary compatibility, but the new dequeueBuffer function that
++     * outputs a fence file descriptor should be used in its place.
++     */
++    int     (*dequeueBuffer_DEPRECATED)(struct ANativeWindow* window,
++                struct ANativeWindowBuffer** buffer);
++
++    /*
++     * hook called by EGL to lock a buffer. This MUST be called before modifying
++     * the content of a buffer. The buffer must have been acquired with
++     * dequeueBuffer first.
++     *
++     * Returns 0 on success or -errno on error.
++     *
++     * XXX: This function is deprecated.  It will continue to work for some
++     * time for binary compatibility, but it is essentially a no-op, and calls
++     * to it should be removed.
++     */
++    int     (*lockBuffer_DEPRECATED)(struct ANativeWindow* window,
++                struct ANativeWindowBuffer* buffer);
++
++    /*
++     * Hook called by EGL when modifications to the render buffer are done.
++     * This unlocks and post the buffer.
++     *
++     * The window holds a reference to the buffer between dequeueBuffer and
++     * either queueBuffer or cancelBuffer, so clients only need their own
++     * reference if they might use the buffer after queueing or canceling it.
++     * Holding a reference to a buffer after queueing or canceling it is only
++     * allowed if a specific buffer count has been set.
++     *
++     * Buffers MUST be queued in the same order than they were dequeued.
++     *
++     * Returns 0 on success or -errno on error.
++     *
++     * XXX: This function is deprecated.  It will continue to work for some
++     * time for binary compatibility, but the new queueBuffer function that
++     * takes a fence file descriptor should be used in its place (pass a value
++     * of -1 for the fence file descriptor if there is no valid one to pass).
++     */
++    int     (*queueBuffer_DEPRECATED)(struct ANativeWindow* window,
++                struct ANativeWindowBuffer* buffer);
++
++    /*
++     * hook used to retrieve information about the native window.
++     *
++     * Returns 0 on success or -errno on error.
++     */
++    int     (*query)(const struct ANativeWindow* window,
++                int what, int* value);
++
++    /*
++     * hook used to perform various operations on the surface.
++     * (*perform)() is a generic mechanism to add functionality to
++     * ANativeWindow while keeping backward binary compatibility.
++     *
++     * DO NOT CALL THIS HOOK DIRECTLY.  Instead, use the helper functions
++     * defined below.
++     *
++     * (*perform)() returns -ENOENT if the 'what' parameter is not supported
++     * by the surface's implementation.
++     *
++     * See above for a list of valid operations, such as
++     * NATIVE_WINDOW_SET_USAGE or NATIVE_WINDOW_CONNECT
++     */
++    int     (*perform)(struct ANativeWindow* window,
++                int operation, ... );
++
++    /*
++     * Hook used to cancel a buffer that has been dequeued.
++     * No synchronization is performed between dequeue() and cancel(), so
++     * either external synchronization is needed, or these functions must be
++     * called from the same thread.
++     *
++     * The window holds a reference to the buffer between dequeueBuffer and
++     * either queueBuffer or cancelBuffer, so clients only need their own
++     * reference if they might use the buffer after queueing or canceling it.
++     * Holding a reference to a buffer after queueing or canceling it is only
++     * allowed if a specific buffer count has been set.
++     *
++     * XXX: This function is deprecated.  It will continue to work for some
++     * time for binary compatibility, but the new cancelBuffer function that
++     * takes a fence file descriptor should be used in its place (pass a value
++     * of -1 for the fence file descriptor if there is no valid one to pass).
++     */
++    int     (*cancelBuffer_DEPRECATED)(struct ANativeWindow* window,
++                struct ANativeWindowBuffer* buffer);
++
++    /*
++     * Hook called by EGL to acquire a buffer. This call may block if no
++     * buffers are available.
++     *
++     * The window holds a reference to the buffer between dequeueBuffer and
++     * either queueBuffer or cancelBuffer, so clients only need their own
++     * reference if they might use the buffer after queueing or canceling it.
++     * Holding a reference to a buffer after queueing or canceling it is only
++     * allowed if a specific buffer count has been set.
++     *
++     * The libsync fence file descriptor returned in the int pointed to by the
++     * fenceFd argument will refer to the fence that must signal before the
++     * dequeued buffer may be written to.  A value of -1 indicates that the
++     * caller may access the buffer immediately without waiting on a fence.  If
++     * a valid file descriptor is returned (i.e. any value except -1) then the
++     * caller is responsible for closing the file descriptor.
++     *
++     * Returns 0 on success or -errno on error.
++     */
++    int     (*dequeueBuffer)(struct ANativeWindow* window,
++                struct ANativeWindowBuffer** buffer, int* fenceFd);
++
++    /*
++     * Hook called by EGL when modifications to the render buffer are done.
++     * This unlocks and post the buffer.
++     *
++     * The window holds a reference to the buffer between dequeueBuffer and
++     * either queueBuffer or cancelBuffer, so clients only need their own
++     * reference if they might use the buffer after queueing or canceling it.
++     * Holding a reference to a buffer after queueing or canceling it is only
++     * allowed if a specific buffer count has been set.
++     *
++     * The fenceFd argument specifies a libsync fence file descriptor for a
++     * fence that must signal before the buffer can be accessed.  If the buffer
++     * can be accessed immediately then a value of -1 should be used.  The
++     * caller must not use the file descriptor after it is passed to
++     * queueBuffer, and the ANativeWindow implementation is responsible for
++     * closing it.
++     *
++     * Returns 0 on success or -errno on error.
++     */
++    int     (*queueBuffer)(struct ANativeWindow* window,
++                struct ANativeWindowBuffer* buffer, int fenceFd);
++
++    /*
++     * Hook used to cancel a buffer that has been dequeued.
++     * No synchronization is performed between dequeue() and cancel(), so
++     * either external synchronization is needed, or these functions must be
++     * called from the same thread.
++     *
++     * The window holds a reference to the buffer between dequeueBuffer and
++     * either queueBuffer or cancelBuffer, so clients only need their own
++     * reference if they might use the buffer after queueing or canceling it.
++     * Holding a reference to a buffer after queueing or canceling it is only
++     * allowed if a specific buffer count has been set.
++     *
++     * The fenceFd argument specifies a libsync fence file decsriptor for a
++     * fence that must signal before the buffer can be accessed.  If the buffer
++     * can be accessed immediately then a value of -1 should be used.
++     *
++     * Note that if the client has not waited on the fence that was returned
++     * from dequeueBuffer, that same fence should be passed to cancelBuffer to
++     * ensure that future uses of the buffer are preceded by a wait on that
++     * fence.  The caller must not use the file descriptor after it is passed
++     * to cancelBuffer, and the ANativeWindow implementation is responsible for
++     * closing it.
++     *
++     * Returns 0 on success or -errno on error.
++     */
++    int     (*cancelBuffer)(struct ANativeWindow* window,
++                struct ANativeWindowBuffer* buffer, int fenceFd);
++};
++
++ /* Backwards compatibility: use ANativeWindow (struct ANativeWindow in C).
++  * android_native_window_t is deprecated.
++  */
++typedef struct ANativeWindow android_native_window_t __deprecated;
++
++/*
++ *  native_window_set_usage64(..., usage)
++ *  Sets the intended usage flags for the next buffers
++ *  acquired with (*lockBuffer)() and on.
++ *
++ *  Valid usage flags are defined in android/hardware_buffer.h
++ *  All AHARDWAREBUFFER_USAGE_* flags can be specified as needed.
++ *
++ *  Calling this function will usually cause following buffers to be
++ *  reallocated.
++ */
++static inline int native_window_set_usage(struct ANativeWindow* window, uint64_t usage) {
++    return window->perform(window, NATIVE_WINDOW_SET_USAGE64, usage);
++}
++
++/* deprecated. Always returns 0. Don't call. */
++static inline int native_window_connect(
++        struct ANativeWindow* window __UNUSED, int api __UNUSED) __deprecated;
++
++static inline int native_window_connect(
++        struct ANativeWindow* window __UNUSED, int api __UNUSED) {
++    return 0;
++}
++
++/* deprecated. Always returns 0. Don't call. */
++static inline int native_window_disconnect(
++        struct ANativeWindow* window __UNUSED, int api __UNUSED) __deprecated;
++
++static inline int native_window_disconnect(
++        struct ANativeWindow* window __UNUSED, int api __UNUSED) {
++    return 0;
++}
++
++/*
++ * native_window_set_crop(..., crop)
++ * Sets which region of the next queued buffers needs to be considered.
++ * Depending on the scaling mode, a buffer's crop region is scaled and/or
++ * cropped to match the surface's size.  This function sets the crop in
++ * pre-transformed buffer pixel coordinates.
++ *
++ * The specified crop region applies to all buffers queued after it is called.
++ *
++ * If 'crop' is NULL, subsequently queued buffers won't be cropped.
++ *
++ * An error is returned if for instance the crop region is invalid, out of the
++ * buffer's bound or if the window is invalid.
++ */
++static inline int native_window_set_crop(
++        struct ANativeWindow* window,
++        android_native_rect_t const * crop)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_CROP, crop);
++}
++
++/*
++ * native_window_set_buffer_count(..., count)
++ * Sets the number of buffers associated with this native window.
++ */
++static inline int native_window_set_buffer_count(
++        struct ANativeWindow* window,
++        size_t bufferCount)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFER_COUNT, bufferCount);
++}
++
++/*
++ * native_window_set_buffers_geometry(..., int w, int h, int format)
++ * All buffers dequeued after this call will have the dimensions and format
++ * specified.  A successful call to this function has the same effect as calling
++ * native_window_set_buffers_size and native_window_set_buffers_format.
++ *
++ * XXX: This function is deprecated.  The native_window_set_buffers_dimensions
++ * and native_window_set_buffers_format functions should be used instead.
++ */
++static inline int native_window_set_buffers_geometry(
++        struct ANativeWindow* window,
++        int w, int h, int format) __deprecated;
++
++static inline int native_window_set_buffers_geometry(
++        struct ANativeWindow* window,
++        int w, int h, int format)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_GEOMETRY,
++            w, h, format);
++}
++
++/*
++ * native_window_set_buffers_dimensions(..., int w, int h)
++ * All buffers dequeued after this call will have the dimensions specified.
++ * In particular, all buffers will have a fixed-size, independent from the
++ * native-window size. They will be scaled according to the scaling mode
++ * (see native_window_set_scaling_mode) upon window composition.
++ *
++ * If w and h are 0, the normal behavior is restored. That is, dequeued buffers
++ * following this call will be sized to match the window's size.
++ *
++ * Calling this function will reset the window crop to a NULL value, which
++ * disables cropping of the buffers.
++ */
++static inline int native_window_set_buffers_dimensions(
++        struct ANativeWindow* window,
++        int w, int h)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_DIMENSIONS,
++            w, h);
++}
++
++/*
++ * native_window_set_buffers_user_dimensions(..., int w, int h)
++ *
++ * Sets the user buffer size for the window, which overrides the
++ * window's size.  All buffers dequeued after this call will have the
++ * dimensions specified unless overridden by
++ * native_window_set_buffers_dimensions.  All buffers will have a
++ * fixed-size, independent from the native-window size. They will be
++ * scaled according to the scaling mode (see
++ * native_window_set_scaling_mode) upon window composition.
++ *
++ * If w and h are 0, the normal behavior is restored. That is, the
++ * default buffer size will match the windows's size.
++ *
++ * Calling this function will reset the window crop to a NULL value, which
++ * disables cropping of the buffers.
++ */
++static inline int native_window_set_buffers_user_dimensions(
++        struct ANativeWindow* window,
++        int w, int h)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS,
++            w, h);
++}
++
++/*
++ * native_window_set_buffers_format(..., int format)
++ * All buffers dequeued after this call will have the format specified.
++ *
++ * If the specified format is 0, the default buffer format will be used.
++ */
++static inline int native_window_set_buffers_format(
++        struct ANativeWindow* window,
++        int format)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_FORMAT, format);
++}
++
++/*
++ * native_window_set_buffers_data_space(..., int dataSpace)
++ * All buffers queued after this call will be associated with the dataSpace
++ * parameter specified.
++ *
++ * dataSpace specifies additional information about the buffer that's dependent
++ * on the buffer format and the endpoints. For example, it can be used to convey
++ * the color space of the image data in the buffer, or it can be used to
++ * indicate that the buffers contain depth measurement data instead of color
++ * images.  The default dataSpace is 0, HAL_DATASPACE_UNKNOWN, unless it has been
++ * overridden by the consumer.
++ */
++static inline int native_window_set_buffers_data_space(
++        struct ANativeWindow* window,
++        android_dataspace_t dataSpace)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_DATASPACE,
++            dataSpace);
++}
++
++/*
++ * native_window_set_buffers_smpte2086_metadata(..., metadata)
++ * All buffers queued after this call will be associated with the SMPTE
++ * ST.2086 metadata specified.
++ *
++ * metadata specifies additional information about the contents of the buffer
++ * that may affect how it's displayed.  When it is nullptr, it means no such
++ * information is available.  No SMPTE ST.2086 metadata is associated with the
++ * buffers by default.
++ */
++static inline int native_window_set_buffers_smpte2086_metadata(
++        struct ANativeWindow* window,
++        const struct android_smpte2086_metadata* metadata)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_SMPTE2086_METADATA,
++            metadata);
++}
++
++/*
++ * native_window_set_buffers_cta861_3_metadata(..., metadata)
++ * All buffers queued after this call will be associated with the CTA-861.3
++ * metadata specified.
++ *
++ * metadata specifies additional information about the contents of the buffer
++ * that may affect how it's displayed.  When it is nullptr, it means no such
++ * information is available.  No CTA-861.3 metadata is associated with the
++ * buffers by default.
++ */
++static inline int native_window_set_buffers_cta861_3_metadata(
++        struct ANativeWindow* window,
++        const struct android_cta861_3_metadata* metadata)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_CTA861_3_METADATA,
++            metadata);
++}
++
++/*
++ * native_window_set_buffers_hdr10_plus_metadata(..., metadata)
++ * All buffers queued after this call will be associated with the
++ * HDR10+ dynamic metadata specified.
++ *
++ * metadata specifies additional dynamic information about the
++ * contents of the buffer that may affect how it is displayed.  When
++ * it is nullptr, it means no such information is available.  No
++ * HDR10+ dynamic emtadata is associated with the buffers by default.
++ *
++ * Parameter "size" refers to the length of the metadata blob pointed to
++ * by parameter "data".  The metadata blob will adhere to the HDR10+ SEI
++ * message standard.
++ */
++static inline int native_window_set_buffers_hdr10_plus_metadata(struct ANativeWindow* window,
++                                                           const size_t size,
++                                                           const uint8_t* metadata) {
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_HDR10_PLUS_METADATA, size,
++                           metadata);
++}
++
++/*
++ * native_window_set_buffers_transform(..., int transform)
++ * All buffers queued after this call will be displayed transformed according
++ * to the transform parameter specified.
++ */
++static inline int native_window_set_buffers_transform(
++        struct ANativeWindow* window,
++        int transform)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_TRANSFORM,
++            transform);
++}
++
++/*
++ * native_window_set_buffers_sticky_transform(..., int transform)
++ * All buffers queued after this call will be displayed transformed according
++ * to the transform parameter specified applied on top of the regular buffer
++ * transform.  Setting this transform will disable the transform hint.
++ *
++ * Temporary - This is only intended to be used by the LEGACY camera mode, do
++ *   not use this for anything else.
++ */
++static inline int native_window_set_buffers_sticky_transform(
++        struct ANativeWindow* window,
++        int transform)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_STICKY_TRANSFORM,
++            transform);
++}
++
++/*
++ * native_window_set_buffers_timestamp(..., int64_t timestamp)
++ * All buffers queued after this call will be associated with the timestamp
++ * parameter specified. If the timestamp is set to NATIVE_WINDOW_TIMESTAMP_AUTO
++ * (the default), timestamps will be generated automatically when queueBuffer is
++ * called. The timestamp is measured in nanoseconds, and is normally monotonically
++ * increasing. The timestamp should be unaffected by time-of-day adjustments,
++ * and for a camera should be strictly monotonic but for a media player may be
++ * reset when the position is set.
++ */
++static inline int native_window_set_buffers_timestamp(
++        struct ANativeWindow* window,
++        int64_t timestamp)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_TIMESTAMP,
++            timestamp);
++}
++
++/*
++ * native_window_set_scaling_mode(..., int mode)
++ * All buffers queued after this call will be associated with the scaling mode
++ * specified.
++ */
++static inline int native_window_set_scaling_mode(
++        struct ANativeWindow* window,
++        int mode)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_SCALING_MODE,
++            mode);
++}
++
++/*
++ * native_window_api_connect(..., int api)
++ * connects an API to this window. only one API can be connected at a time.
++ * Returns -EINVAL if for some reason the window cannot be connected, which
++ * can happen if it's connected to some other API.
++ */
++static inline int native_window_api_connect(
++        struct ANativeWindow* window, int api)
++{
++    return window->perform(window, NATIVE_WINDOW_API_CONNECT, api);
++}
++
++/*
++ * native_window_api_disconnect(..., int api)
++ * disconnect the API from this window.
++ * An error is returned if for instance the window wasn't connected in the
++ * first place.
++ */
++static inline int native_window_api_disconnect(
++        struct ANativeWindow* window, int api)
++{
++    return window->perform(window, NATIVE_WINDOW_API_DISCONNECT, api);
++}
++
++/*
++ * native_window_dequeue_buffer_and_wait(...)
++ * Dequeue a buffer and wait on the fence associated with that buffer.  The
++ * buffer may safely be accessed immediately upon this function returning.  An
++ * error is returned if either of the dequeue or the wait operations fail.
++ */
++static inline int native_window_dequeue_buffer_and_wait(ANativeWindow *anw,
++        struct ANativeWindowBuffer** anb) {
++    return anw->dequeueBuffer_DEPRECATED(anw, anb);
++}
++
++/*
++ * native_window_set_sideband_stream(..., native_handle_t*)
++ * Attach a sideband buffer stream to a native window.
++ */
++static inline int native_window_set_sideband_stream(
++        struct ANativeWindow* window,
++        native_handle_t* sidebandHandle)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_SIDEBAND_STREAM,
++            sidebandHandle);
++}
++
++/*
++ * native_window_set_surface_damage(..., android_native_rect_t* rects, int numRects)
++ * Set the surface damage (i.e., the region of the surface that has changed
++ * since the previous frame). The damage set by this call will be reset (to the
++ * default of full-surface damage) after calling queue, so this must be called
++ * prior to every frame with damage that does not cover the whole surface if the
++ * caller desires downstream consumers to use this optimization.
++ *
++ * The damage region is specified as an array of rectangles, with the important
++ * caveat that the origin of the surface is considered to be the bottom-left
++ * corner, as in OpenGL ES.
++ *
++ * If numRects is set to 0, rects may be NULL, and the surface damage will be
++ * set to the full surface (the same as if this function had not been called for
++ * this frame).
++ */
++static inline int native_window_set_surface_damage(
++        struct ANativeWindow* window,
++        const android_native_rect_t* rects, size_t numRects)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_SURFACE_DAMAGE,
++            rects, numRects);
++}
++
++/*
++ * native_window_set_shared_buffer_mode(..., bool sharedBufferMode)
++ * Enable/disable shared buffer mode
++ */
++static inline int native_window_set_shared_buffer_mode(
++        struct ANativeWindow* window,
++        bool sharedBufferMode)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_SHARED_BUFFER_MODE,
++            sharedBufferMode);
++}
++
++/*
++ * native_window_set_auto_refresh(..., autoRefresh)
++ * Enable/disable auto refresh when in shared buffer mode
++ */
++static inline int native_window_set_auto_refresh(
++        struct ANativeWindow* window,
++        bool autoRefresh)
++{
++    return window->perform(window, NATIVE_WINDOW_SET_AUTO_REFRESH, autoRefresh);
++}
++
++static inline int native_window_get_refresh_cycle_duration(
++        struct ANativeWindow* window,
++        int64_t* outRefreshDuration)
++{
++    return window->perform(window, NATIVE_WINDOW_GET_REFRESH_CYCLE_DURATION,
++            outRefreshDuration);
++}
++
++static inline int native_window_get_next_frame_id(
++        struct ANativeWindow* window, uint64_t* frameId)
++{
++    return window->perform(window, NATIVE_WINDOW_GET_NEXT_FRAME_ID, frameId);
++}
++
++static inline int native_window_enable_frame_timestamps(
++        struct ANativeWindow* window, bool enable)
++{
++    return window->perform(window, NATIVE_WINDOW_ENABLE_FRAME_TIMESTAMPS,
++            enable);
++}
++
++static inline int native_window_get_compositor_timing(
++        struct ANativeWindow* window,
++        int64_t* compositeDeadline, int64_t* compositeInterval,
++        int64_t* compositeToPresentLatency)
++{
++    return window->perform(window, NATIVE_WINDOW_GET_COMPOSITOR_TIMING,
++            compositeDeadline, compositeInterval, compositeToPresentLatency);
++}
++
++static inline int native_window_get_frame_timestamps(
++        struct ANativeWindow* window, uint64_t frameId,
++        int64_t* outRequestedPresentTime, int64_t* outAcquireTime,
++        int64_t* outLatchTime, int64_t* outFirstRefreshStartTime,
++        int64_t* outLastRefreshStartTime, int64_t* outGpuCompositionDoneTime,
++        int64_t* outDisplayPresentTime, int64_t* outDequeueReadyTime,
++        int64_t* outReleaseTime)
++{
++    return window->perform(window, NATIVE_WINDOW_GET_FRAME_TIMESTAMPS,
++            frameId, outRequestedPresentTime, outAcquireTime, outLatchTime,
++            outFirstRefreshStartTime, outLastRefreshStartTime,
++            outGpuCompositionDoneTime, outDisplayPresentTime,
++            outDequeueReadyTime, outReleaseTime);
++}
++
++/* deprecated. Always returns 0 and outSupport holds true. Don't call. */
++static inline int native_window_get_wide_color_support (
++    struct ANativeWindow* window __UNUSED, bool* outSupport) __deprecated;
++
++/*
++   Deprecated(b/242763577): to be removed, this method should not be used
++   Surface support should not be tied to the display
++   Return true since most displays should have this support
++*/
++static inline int native_window_get_wide_color_support (
++    struct ANativeWindow* window __UNUSED, bool* outSupport) {
++    *outSupport = true;
++    return 0;
++}
++
++/* deprecated. Always returns 0 and outSupport holds true. Don't call. */
++static inline int native_window_get_hdr_support(struct ANativeWindow* window __UNUSED,
++                                                bool* outSupport) __deprecated;
++
++/*
++   Deprecated(b/242763577): to be removed, this method should not be used
++   Surface support should not be tied to the display
++   Return true since most displays should have this support
++*/
++static inline int native_window_get_hdr_support(struct ANativeWindow* window __UNUSED,
++                                                bool* outSupport) {
++    *outSupport = true;
++    return 0;
++}
++
++static inline int native_window_get_consumer_usage(struct ANativeWindow* window,
++                                                   uint64_t* outUsage) {
++    return window->perform(window, NATIVE_WINDOW_GET_CONSUMER_USAGE64, outUsage);
++}
++
++/*
++ * native_window_set_auto_prerotation(..., autoPrerotation)
++ * Enable/disable the auto prerotation at buffer allocation when the buffer size
++ * is driven by the consumer.
++ *
++ * When buffer size is driven by the consumer and the transform hint specifies
++ * a 90 or 270 degree rotation, if auto prerotation is enabled, the width and
++ * height used for dequeueBuffer will be additionally swapped.
++ */
++static inline int native_window_set_auto_prerotation(struct ANativeWindow* window,
++                                                     bool autoPrerotation) {
++    return window->perform(window, NATIVE_WINDOW_SET_AUTO_PREROTATION, autoPrerotation);
++}
++
++/*
++ * Internal extension of ANativeWindow_FrameRateCompatibility.
++ */
++enum {
++    /**
++     * This surface belongs to an app on the High Refresh Rate Deny list, and needs the display
++     * to operate at the exact frame rate.
++     *
++     * Keep in sync with Surface.java constant.
++     */
++    ANATIVEWINDOW_FRAME_RATE_EXACT = 100,
++
++    /**
++     * This surface is ignored while choosing the refresh rate.
++     */
++    ANATIVEWINDOW_FRAME_RATE_NO_VOTE,
++
++    /**
++     * This surface will vote for the minimum refresh rate.
++     */
++    ANATIVEWINDOW_FRAME_RATE_MIN,
++
++    /**
++     * The surface requests a frame rate that is greater than or equal to `frameRate`.
++     */
++    ANATIVEWINDOW_FRAME_RATE_GTE
++};
++
++/*
++ * Frame rate category values that can be used in Transaction::setFrameRateCategory.
++ */
++enum {
++    /**
++     * Default value. This value can also be set to return to default behavior, such as layers
++     * without animations.
++     */
++    ANATIVEWINDOW_FRAME_RATE_CATEGORY_DEFAULT = 0,
++
++    /**
++     * The layer will explicitly not influence the frame rate.
++     * This may indicate a frame rate suitable for no animation updates (such as a cursor blinking
++     * or a sporadic update).
++     */
++    ANATIVEWINDOW_FRAME_RATE_CATEGORY_NO_PREFERENCE = 1,
++
++    /**
++     * Indicates a frame rate suitable for animations that looks fine even if played at a low frame
++     * rate.
++     */
++    ANATIVEWINDOW_FRAME_RATE_CATEGORY_LOW = 2,
++
++    /**
++     * Indicates a middle frame rate suitable for animations that do not require higher frame
++     * rates, or do not benefit from high smoothness. This is normally 60 Hz or close to it.
++     */
++    ANATIVEWINDOW_FRAME_RATE_CATEGORY_NORMAL = 3,
++
++    /**
++     * Indicates that, as a result of a user interaction, an animation is likely to start.
++     * This category is a signal that a user interaction heuristic determined the need of a
++     * high refresh rate, and is not an explicit request from the app.
++     * As opposed to FRAME_RATE_CATEGORY_HIGH, this vote may be ignored in favor of
++     * more explicit votes.
++     */
++    ANATIVEWINDOW_FRAME_RATE_CATEGORY_HIGH_HINT = 4,
++
++    /**
++     * Indicates a frame rate suitable for animations that require a high frame rate, which may
++     * increase smoothness but may also increase power usage.
++     */
++    ANATIVEWINDOW_FRAME_RATE_CATEGORY_HIGH = 5
++};
++
++/*
++ * Frame rate selection strategy values that can be used in
++ * Transaction::setFrameRateSelectionStrategy.
++ */
++enum {
++    /**
++     * Default value. The layer uses its own frame rate specifications, assuming it has any
++     * specifications, instead of its parent's. If it does not have its own frame rate
++     * specifications, it will try to use its parent's. It will propagate its specifications to any
++     * descendants that do not have their own.
++     *
++     * However, FRAME_RATE_SELECTION_STRATEGY_OVERRIDE_CHILDREN on an ancestor layer
++     * supersedes this behavior, meaning that this layer will inherit frame rate specifications
++     * regardless of whether it has its own.
++     */
++    ANATIVEWINDOW_FRAME_RATE_SELECTION_STRATEGY_PROPAGATE = 0,
++
++    /**
++     * The layer's frame rate specifications will propagate to and override those of its descendant
++     * layers.
++     *
++     * The layer itself has the FRAME_RATE_SELECTION_STRATEGY_PROPAGATE behavior.
++     * Thus, ancestor layer that also has the strategy
++     * FRAME_RATE_SELECTION_STRATEGY_OVERRIDE_CHILDREN will override this layer's
++     * frame rate specifications.
++     */
++    ANATIVEWINDOW_FRAME_RATE_SELECTION_STRATEGY_OVERRIDE_CHILDREN = 1,
++
++    /**
++     * The layer's frame rate specifications will not propagate to its descendant
++     * layers, even if the descendant layer has no frame rate specifications.
++     * However, FRAME_RATE_SELECTION_STRATEGY_OVERRIDE_CHILDREN on an ancestor
++     * layer supersedes this behavior.
++     */
++    ANATIVEWINDOW_FRAME_RATE_SELECTION_STRATEGY_SELF = 2,
++};
++
++static inline int native_window_set_frame_rate(struct ANativeWindow* window, float frameRate,
++                                        int8_t compatibility, int8_t changeFrameRateStrategy) {
++    return window->perform(window, NATIVE_WINDOW_SET_FRAME_RATE, (double)frameRate,
++                           (int)compatibility, (int)changeFrameRateStrategy);
++}
++
++struct ANativeWindowFrameTimelineInfo {
++    // Frame Id received from ANativeWindow_getNextFrameId.
++    uint64_t frameNumber;
++
++    // VsyncId received from the Choreographer callback that started this frame.
++    int64_t frameTimelineVsyncId;
++
++    // Input Event ID received from the input event that started this frame.
++    int32_t inputEventId;
++
++    // The time which this frame rendering started (i.e. when Choreographer callback actually run)
++    int64_t startTimeNanos;
++
++    // Whether or not to use the vsyncId to determine the refresh rate. Used for TextureView only.
++    int32_t useForRefreshRateSelection;
++
++    // The VsyncId of a frame that was not drawn and squashed into this frame.
++    // Used for UI thread updates that were not picked up by RenderThread on time.
++    int64_t skippedFrameVsyncId;
++
++    // The start time of a frame that was not drawn and squashed into this frame.
++    int64_t skippedFrameStartTimeNanos;
++};
++
++static inline int native_window_set_frame_timeline_info(
++        struct ANativeWindow* window, struct ANativeWindowFrameTimelineInfo frameTimelineInfo) {
++    return window->perform(window, NATIVE_WINDOW_SET_FRAME_TIMELINE_INFO, frameTimelineInfo);
++}
++
++/**
++ * native_window_set_buffers_additional_options(..., ExtendableType* additionalOptions, size_t size)
++ * All buffers dequeued after this call will have the additionalOptions specified.
++ *
++ * This must only be called after api_connect, otherwise NO_INIT is returned. The options are
++ * cleared in api_disconnect & api_connect
++ *
++ * If IAllocator is not v2 or newer this method returns INVALID_OPERATION
++ *
++ * \return NO_ERROR on success.
++ * \return NO_INIT if no api is connected
++ * \return INVALID_OPERATION if additional option support is not available
++ */
++static inline int native_window_set_buffers_additional_options(
++        struct ANativeWindow* window, const AHardwareBufferLongOptions* additionalOptions,
++        size_t additionalOptionsSize) {
++    return window->perform(window, NATIVE_WINDOW_SET_BUFFERS_ADDITIONAL_OPTIONS, additionalOptions,
++                           additionalOptionsSize);
++}
++
++// ------------------------------------------------------------------------------------------------
++// Candidates for APEX visibility
++// These functions are planned to be made stable for APEX modules, but have not
++// yet been stabilized to a specific api version.
++// ------------------------------------------------------------------------------------------------
++
++/**
++ * Retrieves the last queued buffer for this window, along with the fence that
++ * fires when the buffer is ready to be read, and the 4x4 coordinate
++ * transform matrix that should be applied to the buffer's content. The
++ * transform matrix is represented in column-major order.
++ *
++ * If there was no buffer previously queued, then outBuffer will be NULL and
++ * the value of outFence will be -1.
++ *
++ * Note that if outBuffer is not NULL, then the caller will hold a reference
++ * onto the buffer. Accordingly, the caller must call AHardwareBuffer_release
++ * when the buffer is no longer needed so that the system may reclaim the
++ * buffer.
++ *
++ * \return NO_ERROR on success.
++ * \return NO_MEMORY if there was insufficient memory.
++ */
++static inline int ANativeWindow_getLastQueuedBuffer(ANativeWindow* window,
++                                                    AHardwareBuffer** outBuffer, int* outFence,
++                                                    float outTransformMatrix[16]) {
++    return window->perform(window, NATIVE_WINDOW_GET_LAST_QUEUED_BUFFER, outBuffer, outFence,
++                           outTransformMatrix);
++}
++
++/**
++ * Retrieves the last queued buffer for this window, along with the fence that
++ * fires when the buffer is ready to be read. The cropRect & transform should be applied to the
++ * buffer's content.
++ *
++ * If there was no buffer previously queued, then outBuffer will be NULL and
++ * the value of outFence will be -1.
++ *
++ * Note that if outBuffer is not NULL, then the caller will hold a reference
++ * onto the buffer. Accordingly, the caller must call AHardwareBuffer_release
++ * when the buffer is no longer needed so that the system may reclaim the
++ * buffer.
++ *
++ * \return NO_ERROR on success.
++ * \return NO_MEMORY if there was insufficient memory.
++ * \return STATUS_UNKNOWN_TRANSACTION if this ANativeWindow doesn't support this method, callers
++ *         should fall back to ANativeWindow_getLastQueuedBuffer instead.
++ */
++static inline int ANativeWindow_getLastQueuedBuffer2(ANativeWindow* window,
++                                                     AHardwareBuffer** outBuffer, int* outFence,
++                                                     ARect* outCropRect, uint32_t* outTransform) {
++    return window->perform(window, NATIVE_WINDOW_GET_LAST_QUEUED_BUFFER2, outBuffer, outFence,
++                           outCropRect, outTransform);
++}
++
++/**
++ * Retrieves an identifier for the next frame to be queued by this window.
++ *
++ * Frame ids start at 1 and are incremented on each new frame until the underlying surface changes,
++ * in which case the frame id is reset to 1.
++ *
++ * \return the next frame id (0 being uninitialized).
++ */
++static inline uint64_t ANativeWindow_getNextFrameId(ANativeWindow* window) {
++    uint64_t value;
++    window->perform(window, NATIVE_WINDOW_GET_NEXT_FRAME_ID, &value);
++    return value;
++}
++
++/**
++ * Prototype of the function that an ANativeWindow implementation would call
++ * when ANativeWindow_query is called.
++ */
++typedef int (*ANativeWindow_queryFn)(const ANativeWindow* window, int what, int* value);
++
++/**
++ * Prototype of the function that intercepts an invocation of
++ * ANativeWindow_queryFn, along with a data pointer that's passed by the
++ * caller who set the interceptor, as well as arguments that would be
++ * passed to ANativeWindow_queryFn if it were to be called.
++ */
++typedef int (*ANativeWindow_queryInterceptor)(const ANativeWindow* window,
++                                                ANativeWindow_queryFn perform, void* data,
++                                                int what, int* value);
++
++/**
++ * Registers an interceptor for ANativeWindow_query. Instead of calling
++ * the underlying query function, instead the provided interceptor is
++ * called, which may optionally call the underlying query function. An
++ * optional data pointer is also provided to side-channel additional arguments.
++ *
++ * Note that usage of this should only be used for specialized use-cases by
++ * either the system partition or to Mainline modules. This should never be
++ * exposed to NDK or LL-NDK.
++ *
++ * Returns NO_ERROR on success, -errno if registration failed.
++ */
++static inline int ANativeWindow_setQueryInterceptor(ANativeWindow* window,
++                                            ANativeWindow_queryInterceptor interceptor,
++                                            void* data) {
++    return window->perform(window, NATIVE_WINDOW_SET_QUERY_INTERCEPTOR, interceptor, data);
++}
++
++__END_DECLS
+diff --git a/android-platform-include/vndk/hardware_buffer.h b/android-platform-include/vndk/hardware_buffer.h
+new file mode 100644
+index 000000000..90777578b
+--- /dev/null
++++ b/android-platform-include/vndk/hardware_buffer.h
+@@ -0,0 +1,182 @@
++/*
++ * Copyright 2017 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_VNDK_NATIVEWINDOW_AHARDWAREBUFFER_H
++#define ANDROID_VNDK_NATIVEWINDOW_AHARDWAREBUFFER_H
++
++// vndk is a superset of the NDK
++#include <android/hardware_buffer.h>
++#include <android/data_space.h>  /* RanchuWoA: 先给出完整的 ADataSpace，避免与 NDK 头冲突 */
++
++#include <cutils/native_handle.h>
++#include <errno.h>
++
++__BEGIN_DECLS
++
++/**
++ * Get the native handle from an AHardwareBuffer.
++ *
++ * \return a non-NULL native handle on success, NULL if \a buffer is nullptr or the operation fails
++ * for any reason.
++ */
++const native_handle_t* _Nullable AHardwareBuffer_getNativeHandle(
++        const AHardwareBuffer* _Nonnull buffer);
++
++enum CreateFromHandleMethod {
++    // enum values chosen to match internal GraphicBuffer::HandleWrapMethod
++    AHARDWAREBUFFER_CREATE_FROM_HANDLE_METHOD_REGISTER = 2,
++    AHARDWAREBUFFER_CREATE_FROM_HANDLE_METHOD_CLONE = 3,
++};
++
++/**
++ * Create an AHardwareBuffer from a native handle.
++ *
++ * This function wraps a native handle in an AHardwareBuffer suitable for use by applications or
++ * other parts of the system. The contents of desc will be returned by AHardwareBuffer_describe().
++ *
++ * If method is AHARDWAREBUFFER_CREATE_FROM_HANDLE_METHOD_REGISTER, the handle is assumed to be
++ * unregistered, and it will be registered/imported before being wrapped in the AHardwareBuffer.
++ * If successful, the AHardwareBuffer will own the handle.
++ *
++ * If method is AHARDWAREBUFFER_CREATE_FROM_HANDLE_METHOD_CLONE, the handle will be cloned and the
++ * clone registered. The AHardwareBuffer will own the cloned handle but not the original.
++ *
++ * \return 0 on success, -EINVAL if \a desc or \a handle or outBuffer is NULL, or an error number if
++ * the operation fails for any reason.
++ */
++int AHardwareBuffer_createFromHandle(const AHardwareBuffer_Desc* _Nonnull desc,
++                                     const native_handle_t* _Nonnull handle, int32_t method,
++                                     AHardwareBuffer* _Nullable* _Nonnull outBuffer);
++
++/**
++ * Buffer pixel formats.
++ */
++enum {
++    /* for future proofing, keep these in sync with system/graphics-base.h */
++
++    /* same as HAL_PIXEL_FORMAT_BGRA_8888 */
++    AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM           = 5,
++    /* same as HAL_PIXEL_FORMAT_YV12 */
++    AHARDWAREBUFFER_FORMAT_YV12                     = 0x32315659,
++    /* same as HAL_PIXEL_FORMAT_Y8 */
++    AHARDWAREBUFFER_FORMAT_Y8                       = 0x20203859,
++    /* same as HAL_PIXEL_FORMAT_Y16 */
++    AHARDWAREBUFFER_FORMAT_Y16                      = 0x20363159,
++    /* same as HAL_PIXEL_FORMAT_RAW16 */
++    AHARDWAREBUFFER_FORMAT_RAW16                    = 0x20,
++    /* same as HAL_PIXEL_FORMAT_RAW10 */
++    AHARDWAREBUFFER_FORMAT_RAW10                    = 0x25,
++    /* same as HAL_PIXEL_FORMAT_RAW12 */
++    AHARDWAREBUFFER_FORMAT_RAW12                    = 0x26,
++    /* same as HAL_PIXEL_FORMAT_RAW_OPAQUE */
++    AHARDWAREBUFFER_FORMAT_RAW_OPAQUE               = 0x24,
++    /* same as HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED */
++    AHARDWAREBUFFER_FORMAT_IMPLEMENTATION_DEFINED   = 0x22,
++    /* same as HAL_PIXEL_FORMAT_YCBCR_422_SP */
++    AHARDWAREBUFFER_FORMAT_YCbCr_422_SP             = 0x10,
++    /* same as HAL_PIXEL_FORMAT_YCRCB_420_SP */
++    AHARDWAREBUFFER_FORMAT_YCrCb_420_SP             = 0x11,
++    /* same as HAL_PIXEL_FORMAT_YCBCR_422_I */
++    AHARDWAREBUFFER_FORMAT_YCbCr_422_I              = 0x14,
++};
++
++/**
++ * Buffer usage flags.
++ */
++enum {
++    /* for future proofing, keep these in sync with hardware/gralloc.h */
++
++    /* The buffer will be written by the HW camera pipeline. */
++    AHARDWAREBUFFER_USAGE_CAMERA_WRITE              = 2UL << 16,
++    /* The buffer will be read by the HW camera pipeline. */
++    AHARDWAREBUFFER_USAGE_CAMERA_READ               = 4UL << 16,
++    /* Mask for the camera access values. */
++    AHARDWAREBUFFER_USAGE_CAMERA_MASK               = 6UL << 16,
++};
++
++/**
++ * Additional options for AHardwareBuffer_allocateWithOptions. These correspond to
++ * android.hardware.graphics.common.ExtendableType
++ */
++typedef struct {
++    const char* _Nonnull name;
++    int64_t value;
++} AHardwareBufferLongOptions;
++
++enum AHardwareBufferStatus : int32_t {
++    /* Success, no error */
++    AHARDWAREBUFFER_STATUS_OK = 0,
++    /* There's insufficient memory to satisfy the request */
++    AHARDWAREBUFFER_STATUS_NO_MEMORY = -ENOMEM,
++    /* The given argument is invalid */
++    AHARDWAREBUFFER_STATUS_BAD_VALUE = -EINVAL,
++    /* The requested operation is not supported by the device */
++    AHARDWAREBUFFER_STATUS_UNSUPPORTED = -ENOSYS,
++    /* An unknown error occurred */
++    AHARDWAREBUFFER_STATUS_UNKNOWN_ERROR = (-2147483647 - 1),
++};
++
++/**
++ * Allocates a buffer that matches the passed AHardwareBuffer_Desc with additional options
++ *
++ * If allocation succeeds, the buffer can be used according to the
++ * usage flags specified in its description. If a buffer is used in ways
++ * not compatible with its usage flags, the results are undefined and
++ * may include program termination.
++ *
++ * @param desc The AHardwareBuffer_Desc that describes the allocation to request. Note that `stride`
++ *             is ignored.
++ * @param additionalOptions A pointer to an array of AHardwareBufferLongOptions with additional
++ *                          string key + long value options that may be specified. May be null if
++ *                          `additionalOptionsSize` is 0
++ * @param additionalOptionsSize The number of additional options to pass
++ * @param outBuffer The resulting buffer allocation
++ * @return AHARDWAREBUFFER_STATUS_OK on success
++ *         AHARDWAREBUFFER_STATUS_NO_MEMORY if there's insufficient resources for the allocation
++ *         AHARDWAREBUFFER_STATUS_BAD_VALUE if the provided description & options are not supported
++ *         by the device
++ *         AHARDWAREBUFFER_STATUS_UNKNOWN_ERROR for any other error
++ * any reason. The returned buffer has a reference count of 1.
++ */
++enum AHardwareBufferStatus AHardwareBuffer_allocateWithOptions(
++        const AHardwareBuffer_Desc* _Nonnull desc,
++        const AHardwareBufferLongOptions* _Nullable additionalOptions, size_t additionalOptionsSize,
++        AHardwareBuffer* _Nullable* _Nonnull outBuffer) __INTRODUCED_IN(__ANDROID_API_V__);
++
++/**
++ * Queries the dataspace of the given AHardwareBuffer.
++ *
++ * @param buffer The non-null buffer for which to query the Dataspace
++ * @return The dataspace of the buffer, or ADATASPACE_UNKNOWN if one hasn't been set
++ */
++enum ADataSpace AHardwareBuffer_getDataSpace(const AHardwareBuffer* _Nonnull buffer)
++        __INTRODUCED_IN(__ANDROID_API_V__);
++
++/**
++ * Sets the dataspace of the given AHardwareBuffer
++ * @param buffer The non-null buffer for which to set the dataspace
++ * @param dataSpace The dataspace to set
++ * @return AHARDWAREBUFFER_STATUS_OK on success,
++ *         AHARDWAREBUFFER_STATUS_UNSUPPORTED if the device doesn't support setting the dataspace,
++ *         AHARDWAREBUFFER_STATUS_UNKNOWN_ERROR for any other failure.
++ */
++enum AHardwareBufferStatus AHardwareBuffer_setDataSpace(AHardwareBuffer* _Nonnull buffer,
++                                                        enum ADataSpace dataSpace)
++        __INTRODUCED_IN(__ANDROID_API_V__);
++
++__END_DECLS
++
++#endif /* ANDROID_VNDK_NATIVEWINDOW_AHARDWAREBUFFER_H */
+diff --git a/android-platform-include/vndk/window.h b/android-platform-include/vndk/window.h
+new file mode 100644
+index 000000000..500052c93
+--- /dev/null
++++ b/android-platform-include/vndk/window.h
+@@ -0,0 +1,333 @@
++/*
++ * Copyright (C) 2017 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_VNDK_NATIVEWINDOW_ANATIVEWINDOW_H
++#define ANDROID_VNDK_NATIVEWINDOW_ANATIVEWINDOW_H
++
++#include <nativebase/nativebase.h>
++
++// vndk is a superset of the NDK
++#include <android/native_window.h>
++
++
++__BEGIN_DECLS
++
++/*
++ * Convert this ANativeWindowBuffer into a AHardwareBuffer
++ */
++AHardwareBuffer* ANativeWindowBuffer_getHardwareBuffer(ANativeWindowBuffer* anwb);
++
++/*****************************************************************************/
++
++/*
++ * Stores a value into one of the 4 available slots
++ * Retrieve the value with ANativeWindow_OemStorageGet()
++ *
++ * slot: 0 to 3
++ *
++ * Returns 0 on success or -errno on error.
++ */
++int ANativeWindow_OemStorageSet(ANativeWindow* window, uint32_t slot, intptr_t value);
++
++
++/*
++ * Retrieves a value from one of the 4 available slots
++ * By default the returned value is 0 if it wasn't set by ANativeWindow_OemStorageSet()
++ *
++ * slot: 0 to 3
++ *
++ * Returns 0 on success or -errno on error.
++ */
++int ANativeWindow_OemStorageGet(ANativeWindow* window, uint32_t slot, intptr_t* value);
++
++
++/*
++ * Set the swap interval for this surface.
++ *
++ * Returns 0 on success or -errno on error.
++ */
++int ANativeWindow_setSwapInterval(ANativeWindow* window, int interval);
++
++
++/*
++ * queries that can be used with ANativeWindow_query() and ANativeWindow_queryf()
++ */
++enum ANativeWindowQuery {
++    /* The minimum number of buffers that must remain un-dequeued after a buffer
++     * has been queued.  This value applies only if set_buffer_count was used to
++     * override the number of buffers and if a buffer has since been queued.
++     * Users of the set_buffer_count ANativeWindow method should query this
++     * value before calling set_buffer_count.  If it is necessary to have N
++     * buffers simultaneously dequeued as part of the steady-state operation,
++     * and this query returns M then N+M buffers should be requested via
++     * native_window_set_buffer_count.
++     *
++     * Note that this value does NOT apply until a single buffer has been
++     * queued.  In particular this means that it is possible to:
++     *
++     * 1. Query M = min undequeued buffers
++     * 2. Set the buffer count to N + M
++     * 3. Dequeue all N + M buffers
++     * 4. Cancel M buffers
++     * 5. Queue, dequeue, queue, dequeue, ad infinitum
++     */
++    ANATIVEWINDOW_QUERY_MIN_UNDEQUEUED_BUFFERS = 3,
++
++    /*
++     * Default width of ANativeWindow buffers, these are the
++     * dimensions of the window buffers irrespective of the
++     * ANativeWindow_setBuffersDimensions() call and match the native window
++     * size.
++     */
++    ANATIVEWINDOW_QUERY_DEFAULT_WIDTH = 6,
++    ANATIVEWINDOW_QUERY_DEFAULT_HEIGHT = 7,
++
++    /*
++     * transformation that will most-likely be applied to buffers. This is only
++     * a hint, the actual transformation applied might be different.
++     *
++     * INTENDED USE:
++     *
++     * The transform hint can be used by a producer, for instance the GLES
++     * driver, to pre-rotate the rendering such that the final transformation
++     * in the composer is identity. This can be very useful when used in
++     * conjunction with the h/w composer HAL, in situations where it
++     * cannot handle arbitrary rotations.
++     *
++     * 1. Before dequeuing a buffer, the GL driver (or any other ANW client)
++     *    queries the ANW for NATIVE_WINDOW_TRANSFORM_HINT.
++     *
++     * 2. The GL driver overrides the width and height of the ANW to
++     *    account for NATIVE_WINDOW_TRANSFORM_HINT. This is done by querying
++     *    NATIVE_WINDOW_DEFAULT_{WIDTH | HEIGHT}, swapping the dimensions
++     *    according to NATIVE_WINDOW_TRANSFORM_HINT and calling
++     *    native_window_set_buffers_dimensions().
++     *
++     * 3. The GL driver dequeues a buffer of the new pre-rotated size.
++     *
++     * 4. The GL driver renders to the buffer such that the image is
++     *    already transformed, that is applying NATIVE_WINDOW_TRANSFORM_HINT
++     *    to the rendering.
++     *
++     * 5. The GL driver calls native_window_set_transform to apply
++     *    inverse transformation to the buffer it just rendered.
++     *    In order to do this, the GL driver needs
++     *    to calculate the inverse of NATIVE_WINDOW_TRANSFORM_HINT, this is
++     *    done easily:
++     *
++     *        int hintTransform, inverseTransform;
++     *        query(..., NATIVE_WINDOW_TRANSFORM_HINT, &hintTransform);
++     *        inverseTransform = hintTransform;
++     *        if (hintTransform & HAL_TRANSFORM_ROT_90)
++     *            inverseTransform ^= HAL_TRANSFORM_ROT_180;
++     *
++     *
++     * 6. The GL driver queues the pre-transformed buffer.
++     *
++     * 7. The composer combines the buffer transform with the display
++     *    transform.  If the buffer transform happens to cancel out the
++     *    display transform then no rotation is needed.
++     *
++     */
++    ANATIVEWINDOW_QUERY_TRANSFORM_HINT = 8,
++
++    /*
++     * Returns the age of the contents of the most recently dequeued buffer as
++     * the number of frames that have elapsed since it was last queued. For
++     * example, if the window is double-buffered, the age of any given buffer in
++     * steady state will be 2. If the dequeued buffer has never been queued, its
++     * age will be 0.
++     */
++    ANATIVEWINDOW_QUERY_BUFFER_AGE = 13,
++
++    /* min swap interval supported by this compositor */
++    ANATIVEWINDOW_QUERY_MIN_SWAP_INTERVAL = 0x10000,
++
++    /* max swap interval supported by this compositor */
++    ANATIVEWINDOW_QUERY_MAX_SWAP_INTERVAL = 0x10001,
++
++    /* horizontal resolution in DPI. value is float, use queryf() */
++    ANATIVEWINDOW_QUERY_XDPI = 0x10002,
++
++    /* vertical resolution in DPI. value is float, use queryf() */
++    ANATIVEWINDOW_QUERY_YDPI = 0x10003,
++};
++
++typedef enum ANativeWindowQuery ANativeWindowQuery;
++
++/*
++ * hook used to retrieve information about the native window.
++ *
++ * Returns 0 on success or -errno on error.
++ */
++int ANativeWindow_query(const ANativeWindow* window, ANativeWindowQuery query, int* value);
++int ANativeWindow_queryf(const ANativeWindow* window, ANativeWindowQuery query, float* value);
++
++
++/*
++ * Hook called by EGL to acquire a buffer. This call may block if no
++ * buffers are available.
++ *
++ * The window holds a reference to the buffer between dequeueBuffer and
++ * either queueBuffer or cancelBuffer, so clients only need their own
++ * reference if they might use the buffer after queueing or canceling it.
++ * Holding a reference to a buffer after queueing or canceling it is only
++ * allowed if a specific buffer count has been set.
++ *
++ * The libsync fence file descriptor returned in the int pointed to by the
++ * fenceFd argument will refer to the fence that must signal before the
++ * dequeued buffer may be written to.  A value of -1 indicates that the
++ * caller may access the buffer immediately without waiting on a fence.  If
++ * a valid file descriptor is returned (i.e. any value except -1) then the
++ * caller is responsible for closing the file descriptor.
++ *
++ * Returns 0 on success or -errno on error.
++ */
++int ANativeWindow_dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer, int* fenceFd);
++
++
++/*
++ * Hook called by EGL when modifications to the render buffer are done.
++ * This unlocks and post the buffer.
++ *
++ * The window holds a reference to the buffer between dequeueBuffer and
++ * either queueBuffer or cancelBuffer, so clients only need their own
++ * reference if they might use the buffer after queueing or canceling it.
++ * Holding a reference to a buffer after queueing or canceling it is only
++ * allowed if a specific buffer count has been set.
++ *
++ * The fenceFd argument specifies a libsync fence file descriptor for a
++ * fence that must signal before the buffer can be accessed.  If the buffer
++ * can be accessed immediately then a value of -1 should be used.  The
++ * caller must not use the file descriptor after it is passed to
++ * queueBuffer, and the ANativeWindow implementation is responsible for
++ * closing it.
++ *
++ * Returns 0 on success or -errno on error.
++ */
++int ANativeWindow_queueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd);
++
++
++/*
++ * Hook used to cancel a buffer that has been dequeued.
++ * No synchronization is performed between dequeue() and cancel(), so
++ * either external synchronization is needed, or these functions must be
++ * called from the same thread.
++ *
++ * The window holds a reference to the buffer between dequeueBuffer and
++ * either queueBuffer or cancelBuffer, so clients only need their own
++ * reference if they might use the buffer after queueing or canceling it.
++ * Holding a reference to a buffer after queueing or canceling it is only
++ * allowed if a specific buffer count has been set.
++ *
++ * The fenceFd argument specifies a libsync fence file decsriptor for a
++ * fence that must signal before the buffer can be accessed.  If the buffer
++ * can be accessed immediately then a value of -1 should be used.
++ *
++ * Note that if the client has not waited on the fence that was returned
++ * from dequeueBuffer, that same fence should be passed to cancelBuffer to
++ * ensure that future uses of the buffer are preceded by a wait on that
++ * fence.  The caller must not use the file descriptor after it is passed
++ * to cancelBuffer, and the ANativeWindow implementation is responsible for
++ * closing it.
++ *
++ * Returns 0 on success or -errno on error.
++ */
++int ANativeWindow_cancelBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd);
++
++/*
++ *  Sets the intended usage flags for the next buffers.
++ *
++ *  usage: one of AHARDWAREBUFFER_USAGE_* constant
++ *
++ *  By default (if this function is never called), a usage of
++ *      AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT
++ *  is assumed.
++ *
++ *  Calling this function will usually cause following buffers to be
++ *  reallocated.
++ */
++int ANativeWindow_setUsage(ANativeWindow* window, uint64_t usage);
++
++
++/*
++ * Sets the number of buffers associated with this native window.
++ */
++int ANativeWindow_setBufferCount(ANativeWindow* window, size_t bufferCount);
++
++
++/*
++ * All buffers dequeued after this call will have the dimensions specified.
++ * In particular, all buffers will have a fixed-size, independent from the
++ * native-window size. They will be scaled according to the scaling mode
++ * (see native_window_set_scaling_mode) upon window composition.
++ *
++ * If w and h are 0, the normal behavior is restored. That is, dequeued buffers
++ * following this call will be sized to match the window's size.
++ *
++ * Calling this function will reset the window crop to a NULL value, which
++ * disables cropping of the buffers.
++ */
++int ANativeWindow_setBuffersDimensions(ANativeWindow* window, uint32_t w, uint32_t h);
++
++
++/*
++ * All buffers dequeued after this call will have the format specified.
++ * format: one of AHARDWAREBUFFER_FORMAT_* constant
++ *
++ * If the specified format is 0, the default buffer format will be used.
++ */
++int ANativeWindow_setBuffersFormat(ANativeWindow* window, int format);
++
++
++/*
++ * All buffers queued after this call will be associated with the timestamp in nanosecond
++ * parameter specified. If the timestamp is set to NATIVE_WINDOW_TIMESTAMP_AUTO
++ * (the default), timestamps will be generated automatically when queueBuffer is
++ * called. The timestamp is measured in nanoseconds, and is normally monotonically
++ * increasing. The timestamp should be unaffected by time-of-day adjustments,
++ * and for a camera should be strictly monotonic but for a media player may be
++ * reset when the position is set.
++ */
++int ANativeWindow_setBuffersTimestamp(ANativeWindow* window, int64_t timestamp);
++
++
++/*
++ * Enable/disable shared buffer mode
++ */
++int ANativeWindow_setSharedBufferMode(ANativeWindow* window, bool sharedBufferMode);
++
++
++/*
++ * Enable/disable auto refresh when in shared buffer mode
++ */
++int ANativeWindow_setAutoRefresh(ANativeWindow* window, bool autoRefresh);
++
++/*
++ * Enable/disable the auto prerotation at buffer allocation when the buffer size
++ * is driven by the consumer.
++ *
++ * When buffer size is driven by the consumer and the transform hint specifies
++ * a 90 or 270 degree rotation, if auto prerotation is enabled, the width and
++ * height used for dequeueBuffer will be additionally swapped.
++ */
++int ANativeWindow_setAutoPrerotation(ANativeWindow* window, bool autoPrerotation);
++
++/*****************************************************************************/
++
++__END_DECLS
++
++#endif /* ANDROID_VNDK_NATIVEWINDOW_ANATIVEWINDOW_H */
+diff --git a/src/Main/SurfaceBytesStub.cpp b/src/Main/SurfaceBytesStub.cpp
+new file mode 100644
+index 000000000..d9363275e
+--- /dev/null
++++ b/src/Main/SurfaceBytesStub.cpp
+@@ -0,0 +1,145 @@
++// Surface::bytes 独立副本（避免 gl_main 链 gl_renderer 的循环依赖）
++#include "../Renderer/Surface.hpp"
++
++namespace sw {
++int Surface::bytes(Format format)
++	{
++		switch(format)
++		{
++		case FORMAT_NULL:				return 0;
++		case FORMAT_P8:					return 1;
++		case FORMAT_A8P8:				return 2;
++		case FORMAT_A8:					return 1;
++		case FORMAT_R8I:				return 1;
++		case FORMAT_R8:					return 1;
++		case FORMAT_R3G3B2:				return 1;
++		case FORMAT_R16I:				return 2;
++		case FORMAT_R16UI:				return 2;
++		case FORMAT_A8R3G3B2:			return 2;
++		case FORMAT_R5G6B5:				return 2;
++		case FORMAT_A1R5G5B5:			return 2;
++		case FORMAT_X1R5G5B5:			return 2;
++		case FORMAT_R5G5B5A1:           return 2;
++		case FORMAT_X4R4G4B4:			return 2;
++		case FORMAT_A4R4G4B4:			return 2;
++		case FORMAT_R4G4B4A4:           return 2;
++		case FORMAT_R8G8B8:				return 3;
++		case FORMAT_B8G8R8:             return 3;
++		case FORMAT_R32I:				return 4;
++		case FORMAT_R32UI:				return 4;
++		case FORMAT_X8R8G8B8:			return 4;
++	//	case FORMAT_X8G8R8B8Q:			return 4;
++		case FORMAT_A8R8G8B8:			return 4;
++	//	case FORMAT_A8G8R8B8Q:			return 4;
++		case FORMAT_X8B8G8R8I:			return 4;
++		case FORMAT_X8B8G8R8:			return 4;
++		case FORMAT_SRGB8_X8:			return 4;
++		case FORMAT_SRGB8_A8:			return 4;
++		case FORMAT_A8B8G8R8I:			return 4;
++		case FORMAT_R8UI:				return 1;
++		case FORMAT_G8R8UI:				return 2;
++		case FORMAT_X8B8G8R8UI:			return 4;
++		case FORMAT_A8B8G8R8UI:			return 4;
++		case FORMAT_A8B8G8R8:			return 4;
++		case FORMAT_R8_SNORM:			return 1;
++		case FORMAT_G8R8_SNORM:		return 2;
++		case FORMAT_X8B8G8R8_SNORM:	return 4;
++		case FORMAT_A8B8G8R8_SNORM:	return 4;
++		case FORMAT_A2R10G10B10:		return 4;
++		case FORMAT_A2B10G10R10:		return 4;
++		case FORMAT_A2B10G10R10UI:		return 4;
++		case FORMAT_G8R8I:				return 2;
++		case FORMAT_G8R8:				return 2;
++		case FORMAT_G16R16I:			return 4;
++		case FORMAT_G16R16UI:			return 4;
++		case FORMAT_G16R16:				return 4;
++		case FORMAT_G32R32I:			return 8;
++		case FORMAT_G32R32UI:			return 8;
++		case FORMAT_X16B16G16R16I:		return 8;
++		case FORMAT_X16B16G16R16UI:		return 8;
++		case FORMAT_A16B16G16R16I:		return 8;
++		case FORMAT_A16B16G16R16UI:		return 8;
++		case FORMAT_A16B16G16R16:		return 8;
++		case FORMAT_X32B32G32R32I:		return 16;
++		case FORMAT_X32B32G32R32UI:		return 16;
++		case FORMAT_A32B32G32R32I:		return 16;
++		case FORMAT_A32B32G32R32UI:		return 16;
++		// Compressed formats
++		case FORMAT_DXT1:				return 2;   // Column of four pixels
++		case FORMAT_DXT3:				return 4;   // Column of four pixels
++		case FORMAT_DXT5:				return 4;   // Column of four pixels
++		case FORMAT_ATI1:				return 2;   // Column of four pixels
++		case FORMAT_ATI2:				return 4;   // Column of four pixels
++		case FORMAT_ETC1:				return 2;   // Column of four pixels
++		case FORMAT_R11_EAC:			return 2;
++		case FORMAT_SIGNED_R11_EAC:		return 2;
++		case FORMAT_RG11_EAC:			return 4;
++		case FORMAT_SIGNED_RG11_EAC:	return 4;
++		case FORMAT_RGB8_ETC2:			return 2;
++		case FORMAT_SRGB8_ETC2:			return 2;
++		case FORMAT_RGB8_PUNCHTHROUGH_ALPHA1_ETC2:	return 2;
++		case FORMAT_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2:	return 2;
++		case FORMAT_RGBA8_ETC2_EAC:			return 4;
++		case FORMAT_SRGB8_ALPHA8_ETC2_EAC:	return 4;
++		// Bumpmap formats
++		case FORMAT_V8U8:				return 2;
++		case FORMAT_L6V5U5:				return 2;
++		case FORMAT_Q8W8V8U8:			return 4;
++		case FORMAT_X8L8V8U8:			return 4;
++		case FORMAT_A2W10V10U10:		return 4;
++		case FORMAT_V16U16:				return 4;
++		case FORMAT_A16W16V16U16:		return 8;
++		case FORMAT_Q16W16V16U16:		return 8;
++		// Luminance formats
++		case FORMAT_L8:					return 1;
++		case FORMAT_A4L4:				return 1;
++		case FORMAT_L16:				return 2;
++		case FORMAT_A8L8:				return 2;
++		case FORMAT_L16F:               return 2;
++		case FORMAT_A16L16F:            return 4;
++		case FORMAT_L32F:               return 4;
++		case FORMAT_A32L32F:            return 8;
++		// Floating-point formats
++		case FORMAT_A16F:				return 2;
++		case FORMAT_R16F:				return 2;
++		case FORMAT_G16R16F:			return 4;
++		case FORMAT_B16G16R16F:			return 6;
++		case FORMAT_X16B16G16R16F:		return 8;
++		case FORMAT_A16B16G16R16F:		return 8;
++		case FORMAT_X16B16G16R16F_UNSIGNED: return 8;
++		case FORMAT_A32F:				return 4;
++		case FORMAT_R32F:				return 4;
++		case FORMAT_G32R32F:			return 8;
++		case FORMAT_B32G32R32F:			return 12;
++		case FORMAT_X32B32G32R32F:		return 16;
++		case FORMAT_A32B32G32R32F:		return 16;
++		case FORMAT_X32B32G32R32F_UNSIGNED: return 16;
++		// Depth/stencil formats
++		case FORMAT_D16:				return 2;
++		case FORMAT_D32:				return 4;
++		case FORMAT_D24X8:				return 4;
++		case FORMAT_D24S8:				return 4;
++		case FORMAT_D24FS8:				return 4;
++		case FORMAT_D32F:				return 4;
++		case FORMAT_D32FS8:				return 4;
++		case FORMAT_D32F_COMPLEMENTARY:	return 4;
++		case FORMAT_D32FS8_COMPLEMENTARY: return 4;
++		case FORMAT_D32F_LOCKABLE:		return 4;
++		case FORMAT_D32FS8_TEXTURE:		return 4;
++		case FORMAT_D32F_SHADOW:		return 4;
++		case FORMAT_D32FS8_SHADOW:		return 4;
++		case FORMAT_DF24S8:				return 4;
++		case FORMAT_DF16S8:				return 2;
++		case FORMAT_INTZ:				return 4;
++		case FORMAT_S8:					return 1;
++		case FORMAT_YV12_BT601:         return 1;   // Y plane only
++		case FORMAT_YV12_BT709:         return 1;   // Y plane only
++		case FORMAT_YV12_JFIF:          return 1;   // Y plane only
++		default:
++			((void)0);
++		}
++
++		return 0;
++	}
++
++}
