@@ -1,7 +1,7 @@
 """定位镜像内部分区/文件系统魔数。"""
 from pathlib import Path
 
-IMG = Path(r"C:\Users\admin\Documents\Emulator\images\android-35\arm64-v8a")
+IMG = Path(__file__).resolve().parents[2] / "images" / "android-35" / "arm64-v8a"
 
 MAGICS = {
     b"EFI PART": "GPT header",

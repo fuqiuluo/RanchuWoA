@@ -7,7 +7,7 @@
 #  - WHPX 硬件加速
 #  - 磁盘→virtio 槽位映射(倒序): 第1个-device→slot31(vda) 第2个→slot30(metadata by-name)
 set -e
-ROOT="/c/Users/admin/Documents/Emulator"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMG="$ROOT/images/android-35/arm64-v8a"
 QEMU="$ROOT/qemu-ranchu/build/qemu-system-aarch64.exe"
 OUT="$ROOT/images/android-35/arm64-v8a/m2_boot.log"

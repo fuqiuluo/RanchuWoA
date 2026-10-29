@@ -205,3 +205,12 @@ bash gfx/gralloc/build.sh              # → gfx/gralloc/out（AIDL 生成代码
   `avdctl start <名字> --verbose-boot`，看 `logs/console.log` 里的内核与 init 日志。仍不行就 `wipe`。
 - **adb 显示 offline**：`adb reconnect offline`，或 `adb kill-server` 后等半分钟。
 - **Git Bash 里中文乱码**：用 `py -X utf8 ...`（avdctl 自己已处理）；adb 的 guest 路径被改写时 `export MSYS_NO_PATHCONV=1`。
+
+## 许可
+
+本项目以 [Apache License 2.0](LICENSE) 发布。部分内容来自第三方，保留其原有许可：
+
+- `docs/reference/` 的源码摘录仅供对照阅读、不参与编译，以各文件自身的许可头为准（多数 Apache-2.0，两个 goldfish sync 驱动为 GPL-2.0），来源见 [docs/reference/README.md](docs/reference/README.md)。
+- `gfx/gralloc/aidl/`、`gfx/gralloc/include/` 的 AIDL 与头文件来自 AOSP（Apache-2.0）。
+- `gfx/legacy/nullgfx/platform-libs/libbinder_ndk.so` 取自官方 Android 15 模拟器镜像中的同名系统库（源码为 AOSP libbinder_ndk，Apache-2.0）。
+- 运行所需的 QEMU、SwiftShader 与 Android 系统镜像由脚本从各自官方渠道下载，本项目不分发；`patches/` 下的补丁分别适用于其上游源码（QEMU 为 GPL-2.0，SwiftShader 为 Apache-2.0）。

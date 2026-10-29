@@ -8,11 +8,12 @@
 """
 import hashlib
 import os
+import tempfile
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-OUT = Path(r"C:\Users\admin\AppData\Local\Temp\apk")
+OUT = Path(tempfile.gettempdir()) / "apk"
 
 KEYGEN_PREFIX = b"Android key wrapping key generation SHA512"
 RAW_KEY_LEN = 64   # aes-256-xts 双密钥
@@ -23,6 +24,7 @@ wrap_key = hashlib.sha512(KEYGEN_PREFIX + app_id).digest()[:32]
 nonce = os.urandom(12)
 ct = AESGCM(wrap_key).encrypt(nonce, raw_key, None)
 
+OUT.mkdir(parents=True, exist_ok=True)
 (OUT / "version").write_bytes(b"1")
 (OUT / "encrypted_key").write_bytes(nonce + ct)
 (OUT / "raw_key_debug").write_bytes(raw_key)
