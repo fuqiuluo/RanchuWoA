@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    RanchuWoA 设备特性调整：
+    - 蓝牙：handheld_core_hardware.xml 声明了蓝牙，但没有宿主蓝牙控制器（ranchu 走宿主 vhci 转发），
+      蓝牙栈启动时找不到 HCI 会 abort 并反复崩溃，这里标为不可用，SystemServer 就不启动蓝牙服务。
+    - 以太网：官方模拟器经 virtio-wifi + 宿主侧 AP 上网；我们直接让 EthernetService 接管 virtio-net 的
+      eth0（slirp 提供 DHCP/DNS），ConnectivityService 正常建默认网络，netd 的策略路由也随之正确。
+-->
+<permissions>
+    <unavailable-feature name="android.hardware.bluetooth" />
+    <unavailable-feature name="android.hardware.bluetooth_le" />
+    <feature name="android.hardware.ethernet" />
+</permissions>

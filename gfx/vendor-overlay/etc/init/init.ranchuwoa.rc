@@ -1,0 +1,8 @@
+# RanchuWoA：无宿主渲染器的图形栈（woa gralloc + guest SwiftShader + hwc3 client/DRM 模式）
+# GLES 驱动由内核命令行 androidboot.hardwareegl=swiftshader 选择（init.ranchu.rc 读取）。
+on early-init
+    # hwc3：所有图层由 SurfaceFlinger 用 RenderEngine 合成（client），客户端目标经 virtio-gpu KMS 扫描输出
+    setprop ro.vendor.hwcomposer.mode client
+    setprop ro.vendor.hwcomposer.display_finder_mode drm
+    # 屏幕密度，可用 androidboot.lcd_density=<dpi> 覆盖
+    setprop ro.sf.lcd_density ${ro.boot.lcd_density:-320}

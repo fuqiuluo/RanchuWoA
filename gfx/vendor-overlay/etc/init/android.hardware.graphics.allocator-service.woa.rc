@@ -1,0 +1,9 @@
+# RanchuWoA gralloc：AIDL IAllocator V2 + stable-C IMapper v5（mapper.woa.so），不依赖宿主渲染器
+service vendor.graphics.allocator-woa /vendor/bin/hw/android.hardware.graphics.allocator-service.woa
+    class hal animation
+    interface aidl android.hardware.graphics.allocator.IAllocator/default
+    user system
+    group graphics drmrpc
+    capabilities SYS_NICE
+    onrestart restart surfaceflinger
+    task_profiles ServiceCapacityLow

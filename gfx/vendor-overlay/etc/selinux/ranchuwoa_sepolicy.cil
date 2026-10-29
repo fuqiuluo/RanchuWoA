@@ -1,0 +1,9 @@
+; @ranchuwoa-addon: base
+; RanchuWoA vendor 策略补充：由 scripts/vendor_install.py 追加到 /vendor/etc/selinux/vendor_sepolicy.cil 末尾，
+; 并删掉 precompiled_sepolicy，让 init 开机时现编（约 0.5 s）。
+
+; guest 里的 GLES 是 SwiftShader，着色器要 JIT，进程需要 execmem（否则 mprotect 改不成可执行，
+; 跳进 rw- 页就 SEGV_ACCERR）。模拟器 vendor 策略给了 surfaceflinger/bootanim，平台策略给了应用与 zygote，
+; 唯独没有 system_server：按电源键/超时灭屏时 DisplayPowerController 的 ColorFade 动画在 system_server
+; 的 PowerManager 线程里用 GL 画，enforcing 下 system_server 直接崩溃、整个框架重启。
+(allow system_server_202404 self (process (execmem)))
