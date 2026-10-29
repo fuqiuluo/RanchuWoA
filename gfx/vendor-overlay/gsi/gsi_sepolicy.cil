@@ -1,0 +1,25 @@
+; @ranchuwoa-addon: gsi
+; RanchuWoA GSI 补丁：追加到 GSI 实验盘的 /vendor/etc/selinux/vendor_sepolicy.cil 末尾（scripts/vendor_install.py --gsi），
+; 在通用补充 etc/selinux/ranchuwoa_sepolicy.cil 之后。
+; ColorOS（OPLUS）GSI 的 system_ext 上下文文件引用了只在 OPLUS 真机 vendor 策略里定义的类型；
+; 类型不存在时 init 初始化属性区失败（invalid_context）直接重启。这里只补类型声明。
+
+; system_ext_property_contexts：ro.vendor.oplus.*、vendor.oplus.eng.* 等
+(type vendor_oplus_prop)
+(roletype object_r vendor_oplus_prop)
+(type vendor_engineer_prop)
+(roletype object_r vendor_engineer_prop)
+(typeattributeset property_type (vendor_oplus_prop vendor_engineer_prop))
+(typeattributeset vendor_property_type (vendor_oplus_prop vendor_engineer_prop))
+
+; system_ext_seapp_contexts：com.oplus.camera 等的应用数据目录
+(type opluscamera_app_data_file)
+(roletype object_r opluscamera_app_data_file)
+(typeattributeset file_type (opluscamera_app_data_file))
+(typeattributeset data_file_type (opluscamera_app_data_file))
+(typeattributeset app_data_file_type (opluscamera_app_data_file))
+
+; system_ext_service_contexts：com.silead.fingerprintService
+(type silead_fp_service)
+(roletype object_r silead_fp_service)
+(typeattributeset service_manager_type (silead_fp_service))
