@@ -1,0 +1,4066 @@
+--- a/hw/android/goldfish-address-space.c
++++ b/hw/android/goldfish-address-space.c
+@@ -0,0 +1,305 @@
++/*
++ * goldfish-address-space.c — RanchuWoA goldfish address space PCI 设备
++ *
++ * PCI vendor 0x607D device 0xF153。gralloc/图形栈的共享内存通道：
++ *   BAR0 = 控制寄存器（52B），BAR1 = 64 位共享内存区（大小可配）。
++ * 协议与内核驱动 goldfish_drivers/goldfish_address_space.c 对齐：
++ *   ALLOCATE_BLOCK   : guest 写 size regs -> cmd=1 -> 读 offset regs
++ *   DEALLOCATE_BLOCK : guest 写 offset regs -> cmd=2
++ *   GEN/DESTROY_HANDLE, TELL_PING_INFO_ADDR: gfxstream 句柄/门铃（无渲染器时简化）
++ *   PHYS_START regs  : 返回 BAR1 的 guest 物理地址
++ */
++
++#include "qemu/osdep.h"
++#include "hw/pci/pci.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/pci/pci_device.h"
++#include "hw/pci/pci_ids.h"
++#include "qemu/error-report.h"
++#include "qom/object.h"
++
++#define GAS_DEBUG 0     /* 1：把寄存器写入打到 stderr */
++
++#define GAS_VENDOR_ID 0x607D
++#define GAS_DEVICE_ID 0xF153
++
++enum {
++    GAS_REG_COMMAND = 0x00,
++    GAS_REG_STATUS = 0x04,
++    GAS_REG_GUEST_PAGE_SIZE = 0x08,
++    GAS_REG_BLOCK_SIZE_LOW = 0x0C,
++    GAS_REG_BLOCK_SIZE_HIGH = 0x10,
++    GAS_REG_BLOCK_OFFSET_LOW = 0x14,
++    GAS_REG_BLOCK_OFFSET_HIGH = 0x18,
++    GAS_REG_PING = 0x1C,
++    GAS_REG_PING_INFO_ADDR_LOW = 0x20,
++    GAS_REG_PING_INFO_ADDR_HIGH = 0x24,
++    GAS_REG_HANDLE = 0x28,
++    GAS_REG_PHYS_START_LOW = 0x2C,
++    GAS_REG_PHYS_START_HIGH = 0x30,
++    GAS_REG_PING_WITH_DATA = 0x34,
++};
++
++enum {
++    GAS_CMD_ALLOCATE_BLOCK = 1,
++    GAS_CMD_DEALLOCATE_BLOCK = 2,
++    GAS_CMD_GEN_HANDLE = 3,
++    GAS_CMD_DESTROY_HANDLE = 4,
++    GAS_CMD_TELL_PING_INFO_ADDR = 5,
++};
++
++/* 简单块分配器：容量递增数组 + 请求计数的 bump 分配 */
++typedef struct GasBlock {
++    uint64_t offset;
++    uint64_t size;
++    bool used;
++} GasBlock;
++
++#define TYPE_GOLDFISH_ADDRESS_SPACE "goldfish-address-space"
++OBJECT_DECLARE_SIMPLE_TYPE(GasState, GOLDFISH_ADDRESS_SPACE)
++
++struct GasState {
++    PCIDevice parent_obj;
++
++    MemoryRegion ctrl;
++    MemoryRegion area;
++
++    uint64_t area_size;
++    uint32_t guest_page_size;
++
++    uint32_t status;
++    uint64_t block_size;
++    uint64_t block_offset;
++    uint64_t ping_info_addr;
++    uint32_t handle;
++    uint32_t next_handle;
++
++    GasBlock *blocks;
++    uint32_t nblocks, capblocks;
++};
++
++static uint64_t gas_alloc(GasState *s, uint64_t size)
++{
++    /* 对齐到页 */
++    uint64_t ps = s->guest_page_size ?: 4096;
++    uint64_t aligned = ((size + ps - 1) / ps) * ps;
++
++    /* 找空闲可复用块（首次匹配足够） */
++    uint64_t cursor = 0;
++    for (uint32_t i = 0; i < s->nblocks; i++) {
++        if (!s->blocks[i].used && s->blocks[i].size == aligned) {
++            s->blocks[i].used = true;
++            return s->blocks[i].offset;
++        }
++    }
++    /* bump 到已用块之后 */
++    for (uint32_t i = 0; i < s->nblocks; i++) {
++        if (s->blocks[i].used &&
++            s->blocks[i].offset + s->blocks[i].size > cursor) {
++            cursor = s->blocks[i].offset + s->blocks[i].size;
++        }
++    }
++    if (cursor + aligned > s->area_size) {
++        error_report("gf-as: 空间耗尽 (need 0x%" PRIx64 ")", aligned);
++        return UINT64_MAX;
++    }
++    if (s->nblocks == s->capblocks) {
++        s->capblocks = s->capblocks ? s->capblocks * 2 : 32;
++        s->blocks = g_renew(GasBlock, s->blocks, s->capblocks);
++    }
++    s->blocks[s->nblocks] = (GasBlock){ cursor, aligned, true };
++    s->nblocks++;
++    return cursor;
++}
++
++static void gas_free(GasState *s, uint64_t offset)
++{
++    for (uint32_t i = 0; i < s->nblocks; i++) {
++        if (s->blocks[i].used && s->blocks[i].offset == offset) {
++            s->blocks[i].used = false;
++            return;
++        }
++    }
++}
++
++static uint64_t gas_bar1_addr(GasState *s)
++{
++    /* BAR1 的 guest 物理地址（由 PCI 总线分配后更新） */
++    return pci_get_bar_addr(&s->parent_obj, 1);
++}
++
++static void gas_cmd(GasState *s, uint32_t cmd)
++{
++    switch (cmd) {
++    case GAS_CMD_ALLOCATE_BLOCK: {
++        uint64_t off = gas_alloc(s, s->block_size);
++        if (off == UINT64_MAX) {
++            s->status = 12; /* ENOMEM */
++        } else {
++            s->block_offset = off;
++            s->status = 0;
++        }
++        break;
++    }
++    case GAS_CMD_DEALLOCATE_BLOCK:
++        gas_free(s, s->block_offset);
++        s->status = 0;
++        break;
++    case GAS_CMD_GEN_HANDLE:
++        s->handle = ++s->next_handle;
++        s->status = 0;
++        break;
++    case GAS_CMD_DESTROY_HANDLE:
++        s->handle = 0;
++        s->status = 0;
++        break;
++    case GAS_CMD_TELL_PING_INFO_ADDR:
++        s->status = 0;
++        break;
++    default:
++        s->status = 22; /* EINVAL */
++    }
++}
++
++static void gas_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
++{
++    GasState *s = opaque;
++    if (GAS_DEBUG) {
++        error_report("gf-as: write reg 0x%" HWADDR_PRIX " = 0x%" PRIx64, off, val);
++    }
++    switch (off) {
++    case GAS_REG_COMMAND:
++        gas_cmd(s, (uint32_t)val);
++        break;
++    case GAS_REG_GUEST_PAGE_SIZE:
++        s->guest_page_size = (uint32_t)val;
++        break;
++    case GAS_REG_BLOCK_SIZE_LOW:
++        s->block_size = (s->block_size & ~0xFFFFFFFFULL) | val;
++        break;
++    case GAS_REG_BLOCK_SIZE_HIGH:
++        s->block_size = (s->block_size & 0xFFFFFFFFULL) | (val << 32);
++        break;
++    case GAS_REG_BLOCK_OFFSET_LOW:
++        s->block_offset = (s->block_offset & ~0xFFFFFFFFULL) | val;
++        break;
++    case GAS_REG_BLOCK_OFFSET_HIGH:
++        s->block_offset = (s->block_offset & 0xFFFFFFFFULL) | (val << 32);
++        break;
++    case GAS_REG_PING_INFO_ADDR_LOW:
++        s->ping_info_addr = (s->ping_info_addr & ~0xFFFFFFFFULL) | val;
++        break;
++    case GAS_REG_PING_INFO_ADDR_HIGH:
++        s->ping_info_addr = (s->ping_info_addr & 0xFFFFFFFFULL) | (val << 32);
++        break;
++    default:
++        break;
++    }
++}
++
++static uint64_t gas_read(void *opaque, hwaddr off, unsigned size)
++{
++    GasState *s = opaque;
++    switch (off) {
++    case GAS_REG_STATUS:
++        return s->status;
++    case GAS_REG_GUEST_PAGE_SIZE:
++        return s->guest_page_size;
++    case GAS_REG_BLOCK_SIZE_LOW:
++        return s->block_size & 0xFFFFFFFF;
++    case GAS_REG_BLOCK_SIZE_HIGH:
++        return s->block_size >> 32;
++    case GAS_REG_BLOCK_OFFSET_LOW:
++        return s->block_offset & 0xFFFFFFFF;
++    case GAS_REG_BLOCK_OFFSET_HIGH:
++        return s->block_offset >> 32;
++    case GAS_REG_HANDLE:
++        return s->handle;
++    case GAS_REG_PHYS_START_LOW: {
++        uint64_t a = gas_bar1_addr(s);
++        return a & 0xFFFFFFFF;
++    }
++    case GAS_REG_PHYS_START_HIGH: {
++        uint64_t a = gas_bar1_addr(s);
++        return a >> 32;
++    }
++    case GAS_REG_PING_INFO_ADDR_LOW:
++        return s->ping_info_addr & 0xFFFFFFFF;
++    case GAS_REG_PING_INFO_ADDR_HIGH:
++        return s->ping_info_addr >> 32;
++    default:
++        return 0;
++    }
++}
++
++static const MemoryRegionOps gas_ops = {
++    .read = gas_read,
++    .write = gas_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void gas_realize(PCIDevice *dev, Error **errp)
++{
++    GasState *s = GOLDFISH_ADDRESS_SPACE(dev);
++
++    if (s->area_size < 0x100000) {
++        error_setg(errp, "goldfish-address-space: area-size 最小 1MB");
++        return;
++    }
++
++    memory_region_init_io(&s->ctrl, OBJECT(s), &gas_ops, s,
++                          "gf-as.ctrl", 0x1000);
++    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->ctrl);
++
++    memory_region_init_ram(&s->area, OBJECT(s), "gf-as.area",
++                           s->area_size, errp);
++    /* 64 位 + prefetchable：内核 memremap(MEMREMAP_WB) 要求可缓存 BAR */
++    pci_register_bar(dev, 1,
++                     PCI_BASE_ADDRESS_SPACE_MEMORY |
++                     PCI_BASE_ADDRESS_MEM_TYPE_64 |
++                     PCI_BASE_ADDRESS_MEM_PREFETCH, &s->area);
++
++    s->guest_page_size = 4096;
++    s->next_handle = 0;
++    pci_config_set_vendor_id(dev->config, GAS_VENDOR_ID);
++    pci_config_set_device_id(dev->config, GAS_DEVICE_ID);
++    dev->config[PCI_REVISION_ID] = 0x01; /* 内核 probe 要求 revision==1 */
++    pci_config_set_class(dev->config, PCI_CLASS_OTHERS);
++}
++
++static const Property gas_properties[] = {
++    DEFINE_PROP_UINT64("area-size", GasState, area_size, 128 * 1024 * 1024),
++};
++
++static void gas_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(oc);
++
++    k->realize = gas_realize;
++    k->vendor_id = GAS_VENDOR_ID;
++    k->device_id = GAS_DEVICE_ID;
++    k->class_id = PCI_CLASS_OTHERS;
++    dc->desc = "RanchuWoA goldfish address space (gralloc shared memory)";
++    device_class_set_props(dc, gas_properties);
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo gas_info = {
++    .name = TYPE_GOLDFISH_ADDRESS_SPACE,
++    .parent = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(GasState),
++    .class_init = gas_class_init,
++    .interfaces = (InterfaceInfo[]) {
++        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
++        { },
++    },
++};
++
++static void gas_register(void)
++{
++    type_register_static(&gas_info);
++}
++
++type_init(gas_register);
+--- a/hw/android/goldfish-battery.c
++++ b/hw/android/goldfish-battery.c
+@@ -0,0 +1,138 @@
++/*
++ * goldfish-battery.c — RanchuWoA goldfish battery 设备
++ *
++ * 寄存器布局按内核 drivers/power/supply/goldfish_battery.c：
++ *   0x00 INT_STATUS(R)/INT_ENABLE(W)  0x08 AC_ONLINE   0x0c STATUS
++ *   0x10 HEALTH  0x14 PRESENT  0x18 CAPACITY  0x1c VOLTAGE_UV
++ *   0x20 TEMP    0x24 CHARGE_TYPE  0x28 CHARGING_SWITCH  0x30 CURRENT_UA
++ * 恒定上报：AC 在线、电池在位、电量 100、状态 FULL、健康 GOOD。
++ */
++
++#include "qemu/osdep.h"
++#include "hw/core/sysbus.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev.h"
++#include "system/address-spaces.h"
++#include "system/memory.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++
++#define TYPE_GOLDFISH_BATTERY "goldfish-battery"
++OBJECT_DECLARE_SIMPLE_TYPE(GoldfishBatteryState, GOLDFISH_BATTERY)
++
++enum {
++    REG_INT_STATUS = 0x00,
++    REG_INT_ENABLE = 0x04,
++    REG_AC_ONLINE = 0x08,
++    REG_STATUS = 0x0c,
++    REG_HEALTH = 0x10,
++    REG_PRESENT = 0x14,
++    REG_CAPACITY = 0x18,
++    REG_VOLTAGE = 0x1c,
++    REG_TEMP = 0x20,
++    REG_CHARGE_TYPE = 0x24,
++    REG_CHARGING_SWITCH = 0x28,
++    REG_CURRENT = 0x30,
++    REG_CYCLE_COUNT = 0x34,
++};
++
++/* POWER_SUPPLY_STATUS_* / HEALTH_* 内核枚举值 */
++#define BATT_STATUS_FULL   4
++#define BATT_HEALTH_GOOD   1
++
++struct GoldfishBatteryState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    qemu_irq irq;
++    uint32_t int_enable;
++};
++
++static uint64_t gf_batt_read(void *opaque, hwaddr offset, unsigned size)
++{
++    GoldfishBatteryState *s = opaque;
++    switch (offset) {
++    case REG_INT_STATUS:
++        /* 读清中断 */
++        qemu_set_irq(s->irq, 0);
++        return 0;
++    case REG_AC_ONLINE:
++        return 1;
++    case REG_STATUS:
++        return BATT_STATUS_FULL;
++    case REG_HEALTH:
++        return BATT_HEALTH_GOOD;
++    case REG_PRESENT:
++        return 1;
++    case REG_CAPACITY:
++        return 100;
++    case REG_VOLTAGE:
++        return 4350000;       /* µV */
++    case REG_TEMP:
++        return 250;           /* 0.1°C */
++    case REG_CHARGE_TYPE:
++        return 0;             /* N/A */
++    case REG_CHARGING_SWITCH:
++        return 0;
++    case REG_CURRENT:
++        return 0;             /* µA（未充电） */
++    case REG_CYCLE_COUNT:
++        return 0;
++    default:
++        return 0;
++    }
++}
++
++static void gf_batt_write(void *opaque, hwaddr offset, uint64_t value,
++                          unsigned size)
++{
++    GoldfishBatteryState *s = opaque;
++    if (offset == REG_INT_ENABLE) {
++        s->int_enable = value;
++    }
++}
++
++static const MemoryRegionOps gf_batt_ops = {
++    .read = gf_batt_read,
++    .write = gf_batt_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void gf_batt_realize(DeviceState *dev, Error **errp)
++{
++    GoldfishBatteryState *s = GOLDFISH_BATTERY(dev);
++    memory_region_init_io(&s->iomem, OBJECT(s), &gf_batt_ops, s,
++                          "goldfish.battery", 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++}
++
++static void gf_batt_reset(DeviceState *dev)
++{
++    GoldfishBatteryState *s = GOLDFISH_BATTERY(dev);
++    s->int_enable = 0;
++    qemu_set_irq(s->irq, 0);
++}
++
++static void gf_batt_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    dc->realize = gf_batt_realize;
++    device_class_set_legacy_reset(dc, gf_batt_reset);
++    dc->desc = "RanchuWoA goldfish battery device";
++    dc->user_creatable = false;
++}
++
++static const TypeInfo gf_batt_info = {
++    .name = TYPE_GOLDFISH_BATTERY,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(GoldfishBatteryState),
++    .class_init = gf_batt_class_init,
++};
++
++static void gf_batt_register(void)
++{
++    type_register_static(&gf_batt_info);
++}
++
++type_init(gf_batt_register);
+--- a/hw/android/goldfish-pipe.c
++++ b/hw/android/goldfish-pipe.c
+@@ -0,0 +1,990 @@
++/*
++ * goldfish-pipe.c — RanchuWoA 自研 goldfish pipe 设备（v2 协议）
++ *
++ * Android 模拟器 guest 与 host 之间的核心通信通道（adb/logcat 等全走它）。
++ * 按 android15-6.6 内核驱动 drivers/platform/goldfish/goldfish_pipe.c 的
++ * ABI 实现（内核只支持 v2，版本 < 2 直接 -EINVAL）。
++ *
++ * 寄存器（32-bit LE MMIO）:
++ *   W 0x00 CMD              — 写 pipe id 触发命令（读该 pipe 的命令缓冲）
++ *   W 0x04/0x08/0x0c SIGNAL_BUFFER(_HIGH/_COUNT) — 已唤醒管道共享缓冲
++ *   W 0x14/0x18 OPEN_BUFFER(_HIGH)               — open_command_param
++ *   RW 0x24 VERSION         — 驱动先写 2 再读，设备返回 2 并重置全部管道
++ *   R 0x30 GET_SIGNALLED    — 填充共享缓冲、返回条数、按需降 IRQ
++ *
++ * guest ABI 结构偏移（以内核源码为准，与旧规范文档不同）:
++ *   goldfish_pipe_command: cmd@0 id@4 status@8 reserved@12
++ *                          buffers_count@16 consumed_size@20
++ *                          ptrs@24 (336*8) sizes@24+2688 (336*4)
++ *   open_command_param:    command_buffer_ptr@0(u64) rw_params_max_count@8(u32)
++ *   signalled_pipe_buffer: id@0(u32) flags@4(u32)
++ */
++
++#include "qemu/osdep.h"
++#include "hw/core/sysbus.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev.h"
++#include "system/address-spaces.h"
++#include "system/memory.h"
++#include "qemu/log.h"
++#include "qemu/error-report.h"
++#include "qemu/sockets.h"
++#include "qemu/main-loop.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "qom/object.h"
++#include "ranchu-sensors.h"
++
++#ifdef _WIN32
++#define gf_sock_errno() WSAGetLastError()
++#else
++#define gf_sock_errno() errno
++#endif
++
++/* ---- guest ABI 常量（与内核 goldfish_pipe_qemu.h 一致） ---- */
++#define GF_PIPE_VERSION   2
++#define GF_MAX_BUFFERS    336
++
++enum {
++    GF_CMD_OPEN = 1, GF_CMD_CLOSE, GF_CMD_POLL, GF_CMD_WRITE,
++    GF_CMD_WAKE_ON_WRITE, GF_CMD_READ, GF_CMD_WAKE_ON_READ,
++    GF_CMD_WAKE_ON_DONE_IO,
++};
++
++#define GF_ERR_INVAL  (-1)
++#define GF_ERR_AGAIN  (-2)
++
++#define GF_POLL_IN    (1 << 0)
++#define GF_POLL_OUT   (1 << 1)
++#define GF_POLL_HUP   (1 << 2)
++
++#define GF_WAKE_CLOSED (1 << 0)
++#define GF_WAKE_READ   (1 << 1)
++#define GF_WAKE_WRITE  (1 << 2)
++
++/* goldfish_pipe_command 字段偏移 */
++#define CMD_OFF_CMD       0
++#define CMD_OFF_STATUS    8
++#define CMD_OFF_CNT      16
++#define CMD_OFF_CONSUMED 20
++#define CMD_OFF_PTRS     24
++#define CMD_OFF_SIZES    (CMD_OFF_PTRS + GF_MAX_BUFFERS * 8)
++
++#define GF_RING_SIZE  (256 * 1024)
++#define GF_NAME_MAX   160
++
++#define TYPE_GOLDFISH_PIPE "goldfish-pipe"
++OBJECT_DECLARE_SIMPLE_TYPE(GoldfishPipeState, GOLDFISH_PIPE)
++
++typedef struct GfPipe GfPipe;
++typedef struct GfPipeSvc GfPipeSvc;
++
++typedef struct {            /* host->guest 输出环形缓冲 */
++    uint8_t *buf;
++    size_t head, tail, cap;
++} GfRing;
++
++struct GfPipe {
++    uint32_t id;
++    uint64_t cmd_buf;            /* guest 物理地址：goldfish_pipe_command */
++    bool closed;
++    bool armed_read;
++    char name[GF_NAME_MAX];
++    size_t name_len;
++    const GfPipeSvc *svc;
++    void *priv;
++    GfRing out;
++    bool out_full;
++    uint8_t wanted;
++    QTAILQ_ENTRY(GfPipe) wanted_entry;
++};
++
++struct GoldfishPipeState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    qemu_irq irq;
++
++    uint64_t signalled_buf_addr;
++    uint32_t signalled_count;
++    uint64_t open_cmd_addr;
++
++    GfPipe **pipes;
++    uint32_t pipes_capacity;
++
++    QTAILQ_HEAD(, GfPipe) wanted_list;
++    bool irq_raised;
++};
++
++/* ------------------------------------------------------------------ */
++/* 环形缓冲                                                            */
++/* ------------------------------------------------------------------ */
++
++static size_t gf_ring_used(const GfRing *r) { return r->head - r->tail; }
++static size_t gf_ring_free(const GfRing *r) { return r->cap - gf_ring_used(r); }
++
++static void gf_ring_put(GfRing *r, const uint8_t *data, size_t len)
++{
++    g_assert(gf_ring_free(r) >= len);
++    for (size_t i = 0; i < len; i++) {
++        r->buf[r->head++ % r->cap] = data[i];
++    }
++    if (r->tail >= r->cap) {
++        r->head -= r->cap;
++        r->tail -= r->cap;
++    }
++}
++
++static size_t gf_ring_take(GfRing *r, uint8_t *dst, size_t len)
++{
++    size_t n = MIN(len, gf_ring_used(r));
++    for (size_t i = 0; i < n; i++) {
++        dst[i] = r->buf[r->tail++ % r->cap];
++    }
++    return n;
++}
++
++/* ------------------------------------------------------------------ */
++/* guest 内存辅助                                                      */
++/* ------------------------------------------------------------------ */
++
++static uint32_t gf_read_le32(uint64_t addr)
++{
++    uint8_t b[4];
++    address_space_read(&address_space_memory, addr,
++                       MEMTXATTRS_UNSPECIFIED, b, 4);
++    return ldl_le_p(b);
++}
++
++static uint64_t gf_read_le64(uint64_t addr)
++{
++    uint8_t b[8];
++    address_space_read(&address_space_memory, addr,
++                       MEMTXATTRS_UNSPECIFIED, b, 8);
++    return ldq_le_p(b);
++}
++
++static void gf_write_le32(uint64_t addr, uint32_t v)
++{
++    uint8_t b[4];
++    stl_le_p(b, v);
++    address_space_write(&address_space_memory, addr,
++                        MEMTXATTRS_UNSPECIFIED, b, 4);
++}
++
++/* ------------------------------------------------------------------ */
++/* 唤醒                                                                */
++/* ------------------------------------------------------------------ */
++
++static void gf_pipe_want(GoldfishPipeState *s, GfPipe *p, uint8_t flags)
++{
++    if (!flags || p->closed) {
++        return;
++    }
++    if (p->wanted == 0) {
++        QTAILQ_INSERT_TAIL(&s->wanted_list, p, wanted_entry);
++    }
++    p->wanted |= flags;
++    if (!s->irq_raised) {
++        s->irq_raised = true;
++        qemu_set_irq(s->irq, 1);
++    }
++}
++
++static void gf_pipe_data_arrived(GoldfishPipeState *s, GfPipe *p)
++{
++    if (p->armed_read && gf_ring_used(&p->out) > 0) {
++        p->armed_read = false;
++        gf_pipe_want(s, p, GF_WAKE_READ);
++    }
++}
++
++static void gf_pipe_closed_by_host(GoldfishPipeState *s, GfPipe *p)
++{
++    if (p->closed) {
++        return;
++    }
++    p->closed = true;
++    gf_pipe_want(s, p, GF_WAKE_CLOSED);
++}
++
++/* ------------------------------------------------------------------ */
++/* 服务框架                                                            */
++/* ------------------------------------------------------------------ */
++
++struct GfPipeSvc {
++    const char *prefix;
++    int (*connect)(GoldfishPipeState *s, GfPipe *p, const char *name);
++    void (*recv)(GoldfishPipeState *s, GfPipe *p,
++                 const uint8_t *data, size_t len);
++    void (*drained)(GoldfishPipeState *s, GfPipe *p);
++    void (*close)(GoldfishPipeState *s, GfPipe *p);
++};
++
++static void gf_send_to_guest(GoldfishPipeState *s, GfPipe *p,
++                             const uint8_t *data, size_t len)
++{
++    size_t free_ = gf_ring_free(&p->out);
++    size_t n = MIN(len, free_);
++    gf_ring_put(&p->out, data, n);
++    if (n < len) {
++        p->out_full = true;
++    }
++    gf_pipe_data_arrived(s, p);
++}
++
++static void gf_maybe_drained(GoldfishPipeState *s, GfPipe *p)
++{
++    if (p->out_full && gf_ring_free(&p->out) > GF_RING_SIZE / 2) {
++        p->out_full = false;
++        if (p->svc && p->svc->drained) {
++            p->svc->drained(s, p);
++        }
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* logcat 服务                                                         */
++/* ------------------------------------------------------------------ */
++
++static int gf_logcat_connect(GoldfishPipeState *s, GfPipe *p,
++                             const char *name)
++{
++    return 0;
++}
++
++static void gf_logcat_recv(GoldfishPipeState *s, GfPipe *p,
++                           const uint8_t *data, size_t len)
++{
++    static GMutex lock;
++    g_mutex_lock(&lock);
++    fwrite(data, 1, len, stderr);
++    g_mutex_unlock(&lock);
++}
++
++static const GfPipeSvc gf_svc_logcat = {
++    .prefix = "logcat",
++    .connect = gf_logcat_connect,
++    .recv = gf_logcat_recv,
++};
++
++/* ------------------------------------------------------------------ */
++/* adb 桥接                                                            */
++/* ------------------------------------------------------------------ */
++
++/*
++ * guest 打开 "pipe:qemud:adb:5555" 后：
++ *   guest->"accept" ; adb server 连入 host:5555 后 host->"ok" ;
++ *   guest->"start" 进入字节透传。
++ * host 侧向 adb server(127.0.0.1:5037) 发 "0012host:emulator:5555" 注册。
++ */
++
++enum { GF_ADB_ST_WAIT_ACCEPT, GF_ADB_ST_WAIT_CONN, GF_ADB_ST_WAIT_START,
++       GF_ADB_ST_STREAMING };
++
++typedef struct GfAdbPipe {
++    int st;
++    int sock;                 /* 与 adb server 的连接 */
++    uint8_t *wr_pending;      /* guest->host 待发数据 */
++    size_t wr_len, wr_off;
++} GfAdbPipe;
++
++typedef struct GfAdbHost {
++    GoldfishPipeState *pipe_dev;
++    int listen_fd;            /* host:5555 监听 */
++    GfAdbPipe *early;         /* adb server 先于 guest 到达时暂存 */
++    GfPipe *early_pipe;       /* 暂存对应的 guest 管道（未 accept 前） */
++    int reg_fd;               /* 5037 注册连接 */
++    QEMUTimer *retry_timer;
++    bool reg_sent;
++} GfAdbHost;
++
++static GfAdbHost gf_adb_host = {
++    .listen_fd = -1,
++    .reg_fd = -1,
++};
++
++static void gf_adb_reg_retry_timer_cb(void *opaque);
++
++static void gf_adb_reg_schedule(GfAdbHost *h)
++{
++    if (!h->retry_timer) {
++        h->retry_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
++                                      gf_adb_reg_retry_timer_cb, h);
++    }
++    timer_mod(h->retry_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 3000);
++}
++
++static void gf_adb_reg_connected(void *opaque);      /* writable 回调 */
++static void gf_adb_reg_readable(void *opaque);       /* readable 回调 */
++
++static void gf_adb_reg_start(GfAdbHost *h)
++{
++    struct sockaddr_in sa = {
++        .sin_family = AF_INET,
++        .sin_port = htons(5037),
++        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
++    };
++    int fd = qemu_socket(AF_INET, SOCK_STREAM, 0);
++    if (fd < 0) {
++        gf_adb_reg_schedule(h);
++        return;
++    }
++    qemu_set_blocking(fd, false, NULL);
++    int r = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
++    if (r < 0 && gf_sock_errno() != EWOULDBLOCK &&
++        gf_sock_errno() != EINPROGRESS) {
++        closesocket(fd);
++        gf_adb_reg_schedule(h);
++        return;
++    }
++    h->reg_fd = fd;
++    h->reg_sent = false;
++    error_report("gf-adb: 正在连接 adb server(5037)...");
++    qemu_set_fd_handler(fd, NULL, gf_adb_reg_connected, h);
++}
++
++static void gf_adb_reg_retry_timer_cb(void *opaque)
++{
++    GfAdbHost *h = opaque;
++    if (h->reg_fd < 0) {
++        gf_adb_reg_start(h);
++    }
++}
++
++static void gf_adb_reg_connected(void *opaque)
++{
++    GfAdbHost *h = opaque;
++    static const char msg[] = "0012host:emulator:5555";
++    ssize_t r = send(h->reg_fd, msg, sizeof(msg) - 1, 0);
++    if (r < 0 && gf_sock_errno() == EWOULDBLOCK) {
++        return;   /* 继续等 writable */
++    }
++    h->reg_sent = true;
++    /* 等 adb server 应答后关闭；它随后会连 5555 */
++    qemu_set_fd_handler(h->reg_fd, gf_adb_reg_readable, NULL, h);
++}
++
++static void gf_adb_reg_readable(void *opaque)
++{
++    GfAdbHost *h = opaque;
++    char buf[64];
++    ssize_t r = recv(h->reg_fd, buf, sizeof(buf), 0);
++    if (r > 0) {
++        return;   /* 继续读到对端关闭或静默 */
++    }
++    qemu_set_fd_handler(h->reg_fd, NULL, NULL, NULL);
++    closesocket(h->reg_fd);
++    h->reg_fd = -1;
++    if (!h->reg_sent) {
++        gf_adb_reg_schedule(h);
++        return;
++    }
++    error_report("gf-adb: registered with adb server (emulator:5555)");
++}
++
++static void gf_adb_sock_readable(void *opaque);
++static void gf_adb_sock_writable(void *opaque);
++
++/* adb server 连入 5555 */
++static void gf_adb_listen_cb(void *opaque)
++{
++    GfAdbHost *h = &gf_adb_host;
++    struct sockaddr_in sa;
++    socklen_t slen = sizeof(sa);
++    int fd = accept(h->listen_fd, (struct sockaddr *)&sa, &slen);
++    if (fd < 0) {
++        return;
++    }
++    qemu_set_blocking(fd, false, NULL);
++    error_report("gf-adb: adb server 连入 5555");
++
++    GfAdbPipe *a = g_new0(GfAdbPipe, 1);
++    a->st = GF_ADB_ST_WAIT_CONN;
++    a->sock = fd;
++    if (h->early_pipe && h->early) {
++        /* guest 已 accept 等连接：换绑 */
++        closesocket(h->early->sock);
++        g_free(h->early->wr_pending);
++        g_free(h->early);
++        h->early = a;
++        gf_send_to_guest(h->pipe_dev, h->early_pipe,
++                         (const uint8_t *)"ok", 2);
++        h->early->st = GF_ADB_ST_WAIT_START;
++    } else {
++        h->early = a;   /* 等 guest 的 accept */
++    }
++}
++
++static void gf_adb_host_init(GoldfishPipeState *s)
++{
++    GfAdbHost *h = &gf_adb_host;
++    h->pipe_dev = s;
++    if (h->listen_fd >= 0) {
++        return;
++    }
++    struct sockaddr_in sa = {
++        .sin_family = AF_INET,
++        .sin_port = htons(5555),
++        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
++    };
++    int fd = qemu_socket(AF_INET, SOCK_STREAM, 0);
++    if (fd < 0 || bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
++        listen(fd, 4) < 0) {
++        error_report("gf-adb: 5555 监听失败: %s", strerror(gf_sock_errno()));
++        if (fd >= 0) {
++            closesocket(fd);
++        }
++        return;
++    }
++    qemu_set_blocking(fd, false, NULL);
++    h->listen_fd = fd;
++    qemu_set_fd_handler(fd, gf_adb_listen_cb, NULL, h);
++    gf_adb_reg_start(h);
++}
++
++static GfPipe *gf_adb_pipe_of(void *opaque)   /* opaque 即 GfPipe* */
++{
++    return opaque;
++}
++
++static void gf_adb_sock_readable(void *opaque)
++{
++    GfPipe *p = gf_adb_pipe_of(opaque);
++    GoldfishPipeState *s = gf_adb_host.pipe_dev;
++    GfAdbPipe *a = p->priv;
++    uint8_t tmp[65536];
++    ssize_t r = recv(a->sock, tmp, sizeof(tmp), 0);
++    if (r > 0) {
++        gf_send_to_guest(s, p, tmp, r);
++    } else if (r == 0 || gf_sock_errno() != EWOULDBLOCK) {
++        qemu_set_fd_handler(a->sock, NULL, NULL, NULL);
++        closesocket(a->sock);
++        a->sock = -1;
++        gf_pipe_closed_by_host(s, p);
++    }
++}
++
++static void gf_adb_sock_writable(void *opaque)
++{
++    GfPipe *p = gf_adb_pipe_of(opaque);
++    GoldfishPipeState *s = gf_adb_host.pipe_dev;
++    GfAdbPipe *a = p->priv;
++    while (a->wr_len > a->wr_off) {
++        ssize_t r = send(a->sock, a->wr_pending + a->wr_off,
++                         a->wr_len - a->wr_off, 0);
++        if (r > 0) {
++            a->wr_off += r;
++        } else if (r < 0 && gf_sock_errno() == EWOULDBLOCK) {
++            return;
++        } else {
++            qemu_set_fd_handler(a->sock, NULL, NULL, NULL);
++            closesocket(a->sock);
++            a->sock = -1;
++            gf_pipe_closed_by_host(s, p);
++            return;
++        }
++    }
++    a->wr_len = a->wr_off = 0;
++    qemu_set_fd_handler(a->sock, gf_adb_sock_readable, NULL, p);
++}
++
++static int gf_adb_connect(GoldfishPipeState *s, GfPipe *p, const char *name)
++{
++    gf_adb_host_init(s);
++    GfAdbPipe *a = g_new0(GfAdbPipe, 1);
++    a->st = GF_ADB_ST_WAIT_ACCEPT;
++    a->sock = -1;
++    p->priv = a;
++    return 0;
++}
++
++static void gf_adb_recv(GoldfishPipeState *s, GfPipe *p,
++                        const uint8_t *data, size_t len)
++{
++    GfAdbHost *h = &gf_adb_host;
++    GfAdbPipe *a = p->priv;
++
++    switch (a->st) {
++    case GF_ADB_ST_WAIT_ACCEPT:
++        if (len >= 6 && !memcmp(data, "accept", 6)) {
++            a->st = GF_ADB_ST_WAIT_CONN;
++            if (h->early && h->early->st == GF_ADB_ST_WAIT_CONN) {
++                /* adb server 已连入：接管其 socket */
++                g_free(a->wr_pending);
++                g_free(a);
++                p->priv = a = h->early;
++                gf_send_to_guest(s, p, (const uint8_t *)"ok", 2);
++                a->st = GF_ADB_ST_WAIT_START;
++            } else {
++                h->early = a;
++                h->early_pipe = p;   /* 等 listen 回调发 ok */
++            }
++        } else {
++            gf_pipe_closed_by_host(s, p);
++        }
++        break;
++    case GF_ADB_ST_WAIT_START:
++        if (len >= 5 && !memcmp(data, "start", 5)) {
++            a->st = GF_ADB_ST_STREAMING;
++            qemu_set_fd_handler(a->sock, gf_adb_sock_readable, NULL, p);
++            error_report("gf-adb: adb 透传已建立");
++        }
++        break;
++    case GF_ADB_ST_STREAMING: {
++        if (a->sock < 0) {
++            return;
++        }
++        size_t off = 0;
++        if (a->wr_len == a->wr_off) {
++            ssize_t r = send(a->sock, data, len, 0);
++            if (r > 0) {
++                off = r;
++            } else if (r < 0 && gf_sock_errno() != EWOULDBLOCK) {
++                qemu_set_fd_handler(a->sock, NULL, NULL, NULL);
++                closesocket(a->sock);
++                a->sock = -1;
++                gf_pipe_closed_by_host(s, p);
++                return;
++            }
++        }
++        if (off < len) {
++            size_t pend = a->wr_len - a->wr_off;
++            a->wr_pending = g_realloc(a->wr_pending, pend + len - off);
++            memmove(a->wr_pending, a->wr_pending + a->wr_off, pend);
++            memcpy(a->wr_pending + pend, data + off, len - off);
++            a->wr_len = pend + len - off;
++            a->wr_off = 0;
++            qemu_set_fd_handler(a->sock, gf_adb_sock_readable,
++                                gf_adb_sock_writable, p);
++        }
++        break;
++    }
++    default:
++        break;
++    }
++    if (h->early == a && a->st == GF_ADB_ST_STREAMING) {
++        h->early_pipe = NULL;
++    }
++}
++
++static void gf_adb_drained(GoldfishPipeState *s, GfPipe *p)
++{
++    GfAdbPipe *a = p->priv;
++    if (a->st == GF_ADB_ST_STREAMING && a->sock >= 0 &&
++        a->wr_len == a->wr_off) {
++        qemu_set_fd_handler(a->sock, gf_adb_sock_readable, NULL, p);
++    }
++}
++
++static void gf_adb_close(GoldfishPipeState *s, GfPipe *p)
++{
++    GfAdbHost *h = &gf_adb_host;
++    GfAdbPipe *a = p->priv;
++    if (a->sock >= 0) {
++        qemu_set_fd_handler(a->sock, NULL, NULL, NULL);
++        closesocket(a->sock);
++        a->sock = -1;
++    }
++    if (h->early == a) {
++        h->early = NULL;
++        h->early_pipe = NULL;
++    }
++    g_free(a->wr_pending);
++    g_free(a);
++    p->priv = NULL;
++}
++
++static const GfPipeSvc gf_svc_adb = {
++    .prefix = "pipe:qemud:adb:",
++    .connect = gf_adb_connect,
++    .recv = gf_adb_recv,
++    .drained = gf_adb_drained,
++    .close = gf_adb_close,
++};
++
++/* ------------------------------------------------------------------ */
++/* qemud:sensors（协议实现在 ranchu-sensors.c，与 vsock 传输共用）      */
++/* ------------------------------------------------------------------ */
++
++typedef struct GfSensorsPipe {
++    GoldfishPipeState *s;
++    GfPipe *p;
++    RanchuSensors *rs;
++} GfSensorsPipe;
++
++static void gf_sensors_send(void *opaque, const uint8_t *data, size_t len)
++{
++    GfSensorsPipe *g = opaque;
++    gf_send_to_guest(g->s, g->p, data, len);
++}
++
++static int gf_sensors_connect(GoldfishPipeState *s, GfPipe *p,
++                              const char *name)
++{
++    GfSensorsPipe *g = g_new0(GfSensorsPipe, 1);
++    g->s = s;
++    g->p = p;
++    g->rs = ranchu_sensors_new(gf_sensors_send, g);
++    p->priv = g;
++    return 0;
++}
++
++static void gf_sensors_recv(GoldfishPipeState *s, GfPipe *p,
++                            const uint8_t *data, size_t len)
++{
++    GfSensorsPipe *g = p->priv;
++    ranchu_sensors_recv(g->rs, data, len);
++}
++
++static void gf_sensors_close(GoldfishPipeState *s, GfPipe *p)
++{
++    GfSensorsPipe *g = p->priv;
++    if (g) {
++        ranchu_sensors_free(g->rs);
++        g_free(g);
++        p->priv = NULL;
++    }
++}
++
++static const GfPipeSvc gf_svc_sensors = {
++    .prefix = "pipe:qemud:sensors",
++    .connect = gf_sensors_connect,
++    .recv = gf_sensors_recv,
++    .close = gf_sensors_close,
++};
++
++/* ------------------------------------------------------------------ */
++/* 服务分派与命令处理                                                   */
++/* ------------------------------------------------------------------ */
++
++static const GfPipeSvc *gf_svcs[] = { &gf_svc_adb, &gf_svc_logcat, &gf_svc_sensors };
++
++static void gf_pipe_connect_service(GoldfishPipeState *s, GfPipe *p)
++{
++    error_report("gf-pipe: 管道 %u 请求服务: \"%s\"", p->id, p->name);
++    for (size_t i = 0; i < ARRAY_SIZE(gf_svcs); i++) {
++        if (g_str_has_prefix(p->name, gf_svcs[i]->prefix)) {
++            p->svc = gf_svcs[i];
++            if (gf_svcs[i]->connect(s, p, p->name) == 0) {
++                return;
++            }
++            p->svc = NULL;
++            break;
++        }
++    }
++    qemu_log_mask(LOG_UNIMP,
++                  "gf-pipe: 未知服务 \"%s\"，关闭管道\n", p->name);
++    gf_pipe_closed_by_host(s, p);
++}
++
++static void gf_pipe_free(GoldfishPipeState *s, GfPipe *p)
++{
++    if (p->svc && p->svc->close) {
++        p->svc->close(s, p);
++    }
++    if (p->wanted) {
++        QTAILQ_REMOVE(&s->wanted_list, p, wanted_entry);
++    }
++    if (gf_adb_host.early_pipe == p) {
++        gf_adb_host.early_pipe = NULL;
++        gf_adb_host.early = NULL;
++    }
++    g_free(p->out.buf);
++    g_free(p);
++}
++
++static void gf_cmd_write(GoldfishPipeState *s, GfPipe *p)
++{
++    uint64_t cmdbuf = p->cmd_buf;
++    uint32_t cnt = gf_read_le32(cmdbuf + CMD_OFF_CNT);
++    if (cnt == 0 || cnt > GF_MAX_BUFFERS) {
++        gf_write_le32(cmdbuf + CMD_OFF_STATUS, GF_ERR_INVAL);
++        return;
++    }
++    uint64_t total_bytes = 0, copied = 0;
++    for (uint32_t i = 0; i < cnt; i++) {
++        total_bytes += gf_read_le32(cmdbuf + CMD_OFF_SIZES + i * 4);
++    }
++
++    size_t dlen = MIN(total_bytes, (uint64_t)GF_RING_SIZE);
++    uint8_t *data = g_malloc(dlen);
++    for (uint32_t i = 0; i < cnt && copied < dlen; i++) {
++        uint64_t ptr = gf_read_le64(cmdbuf + CMD_OFF_PTRS + i * 8);
++        uint32_t sz = gf_read_le32(cmdbuf + CMD_OFF_SIZES + i * 4);
++        size_t want = MIN((size_t)sz, dlen - copied);
++        address_space_read(&address_space_memory, ptr,
++                           MEMTXATTRS_UNSPECIFIED, data + copied, want);
++        copied += want;
++    }
++
++    if (!p->svc && p->name_len == 0) {
++        size_t n = MIN(dlen, GF_NAME_MAX - 1);
++        memcpy(p->name, data, n);
++        p->name[n] = 0;
++        p->name_len = n;
++        gf_pipe_connect_service(s, p);
++    } else if (p->svc && p->svc->recv) {
++        p->svc->recv(s, p, data, dlen);
++    }
++    g_free(data);
++    gf_write_le32(cmdbuf + CMD_OFF_CONSUMED, (int32_t)total_bytes);
++    gf_write_le32(cmdbuf + CMD_OFF_STATUS, (int32_t)total_bytes);
++}
++
++static void gf_cmd_read(GoldfishPipeState *s, GfPipe *p)
++{
++    uint64_t cmdbuf = p->cmd_buf;
++    uint32_t cnt = gf_read_le32(cmdbuf + CMD_OFF_CNT);
++    if (cnt == 0 || cnt > GF_MAX_BUFFERS) {
++        gf_write_le32(cmdbuf + CMD_OFF_STATUS, GF_ERR_INVAL);
++        return;
++    }
++    size_t got = 0;
++    uint8_t tmp[8192];
++    for (uint32_t i = 0; i < cnt && gf_ring_used(&p->out) > 0; i++) {
++        uint64_t ptr = gf_read_le64(cmdbuf + CMD_OFF_PTRS + i * 8);
++        uint32_t sz = gf_read_le32(cmdbuf + CMD_OFF_SIZES + i * 4);
++        size_t done = 0;
++        while (done < sz && gf_ring_used(&p->out) > 0) {
++            size_t chunk = MIN(sz - done, sizeof(tmp));
++            chunk = gf_ring_take(&p->out, tmp, chunk);
++            address_space_write(&address_space_memory, ptr + done,
++                                MEMTXATTRS_UNSPECIFIED, tmp, chunk);
++            done += chunk;
++        }
++        got += done;
++    }
++    if (got == 0) {
++        if (p->closed) {
++            gf_write_le32(cmdbuf + CMD_OFF_CONSUMED, 0);
++            gf_write_le32(cmdbuf + CMD_OFF_STATUS, 0);    /* EOF */
++        } else {
++            gf_write_le32(cmdbuf + CMD_OFF_STATUS, GF_ERR_AGAIN);
++        }
++        return;
++    }
++    gf_write_le32(cmdbuf + CMD_OFF_CONSUMED, (int32_t)got);
++    gf_write_le32(cmdbuf + CMD_OFF_STATUS, (int32_t)got);
++    gf_maybe_drained(s, p);
++}
++
++static void gf_pipe_reset_all(GoldfishPipeState *s)
++{
++    for (uint32_t i = 0; i < s->pipes_capacity; i++) {
++        if (s->pipes[i]) {
++            gf_pipe_free(s, s->pipes[i]);
++            s->pipes[i] = NULL;
++        }
++    }
++    QTAILQ_INIT(&s->wanted_list);
++    qemu_set_irq(s->irq, 0);
++    s->irq_raised = false;
++}
++
++static void gf_do_open(GoldfishPipeState *s, uint32_t id)
++{
++    /* open_cmd_addr -> open_command_param{command_buffer_ptr, max_cnt} */
++    uint64_t cmd_ptr = gf_read_le64(s->open_cmd_addr);
++    uint32_t cmd = gf_read_le32(cmd_ptr + CMD_OFF_CMD);
++    if (cmd != GF_CMD_OPEN) {
++        return;
++    }
++    GfPipe *p = g_new0(GfPipe, 1);
++    p->id = id;
++    p->cmd_buf = cmd_ptr;
++    p->out.buf = g_malloc(GF_RING_SIZE);
++    p->out.cap = GF_RING_SIZE;
++    if (id >= s->pipes_capacity) {
++        uint32_t newcap = MAX(s->pipes_capacity * 2, id + 1);
++        s->pipes = g_renew(GfPipe *, s->pipes, newcap);
++        memset(s->pipes + s->pipes_capacity, 0,
++               (newcap - s->pipes_capacity) * sizeof(void *));
++        s->pipes_capacity = newcap;
++    }
++    s->pipes[id] = p;
++    gf_write_le32(cmd_ptr + CMD_OFF_STATUS, 0);
++}
++
++static void gf_do_command(GoldfishPipeState *s, GfPipe *p)
++{
++    uint64_t cmdbuf = p->cmd_buf;
++    uint32_t cmd = gf_read_le32(cmdbuf + CMD_OFF_CMD);
++
++    switch (cmd) {
++    case GF_CMD_CLOSE:
++        gf_write_le32(cmdbuf + CMD_OFF_STATUS, 0);
++        s->pipes[p->id] = NULL;
++        gf_pipe_free(s, p);
++        break;
++    case GF_CMD_POLL: {
++        uint32_t st = GF_POLL_OUT;
++        if (gf_ring_used(&p->out) > 0 || p->closed) {
++            st |= GF_POLL_IN;
++        }
++        if (p->closed) {
++            st |= GF_POLL_HUP;
++        }
++        gf_write_le32(cmdbuf + CMD_OFF_STATUS, st);
++        break;
++    }
++    case GF_CMD_WRITE:
++        if (p->closed) {
++            gf_write_le32(cmdbuf + CMD_OFF_STATUS, GF_ERR_INVAL);
++        } else {
++            gf_cmd_write(s, p);
++        }
++        break;
++    case GF_CMD_READ:
++        gf_cmd_read(s, p);
++        break;
++    case GF_CMD_WAKE_ON_READ:
++        p->armed_read = true;
++        if (gf_ring_used(&p->out) > 0) {
++            p->armed_read = false;
++            gf_pipe_want(s, p, GF_WAKE_READ);
++        }
++        gf_write_le32(cmdbuf + CMD_OFF_STATUS, 0);
++        break;
++    case GF_CMD_WAKE_ON_WRITE:
++    case GF_CMD_WAKE_ON_DONE_IO:
++        gf_write_le32(cmdbuf + CMD_OFF_STATUS, 0);
++        break;
++    default:
++        gf_write_le32(cmdbuf + CMD_OFF_STATUS, GF_ERR_INVAL);
++        break;
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* MMIO                                                                */
++/* ------------------------------------------------------------------ */
++
++static void gf_pipe_write(void *opaque, hwaddr offset, uint64_t value,
++                          unsigned size)
++{
++    GoldfishPipeState *s = opaque;
++    switch (offset) {
++    case 0: {   /* PIPE_REG_CMD：value = pipe id */
++        if (value < s->pipes_capacity && s->pipes[value]) {
++            gf_do_command(s, s->pipes[value]);
++        } else {
++            gf_do_open(s, (uint32_t)value);
++        }
++        break;
++    }
++    case 4:
++        s->signalled_buf_addr = (uint64_t)value << 32;
++        break;
++    case 8:
++        s->signalled_buf_addr |= value;
++        break;
++    case 12:
++        s->signalled_count = value;
++        break;
++    case 20:
++        s->open_cmd_addr = (uint64_t)value << 32;
++        break;
++    case 24:
++        s->open_cmd_addr |= value;
++        break;
++    case 36:    /* VERSION 写：驱动版本 */
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "gf-pipe: 未知写寄存器 0x%" HWADDR_PRIX "\n", offset);
++        break;
++    }
++}
++
++static uint64_t gf_pipe_read(void *opaque, hwaddr offset, unsigned size)
++{
++    GoldfishPipeState *s = opaque;
++    switch (offset) {
++    case 36:    /* VERSION 读：重置并返回 2 */
++        gf_pipe_reset_all(s);
++        return GF_PIPE_VERSION;
++    case 48: {  /* GET_SIGNALLED */
++        if (!s->signalled_buf_addr || !s->signalled_count) {
++            return 0;
++        }
++        uint32_t n = 0;
++        GfPipe *p;
++        while (n < s->signalled_count &&
++               (p = QTAILQ_FIRST(&s->wanted_list)) != NULL) {
++            QTAILQ_REMOVE(&s->wanted_list, p, wanted_entry);
++            uint8_t entry[8];
++            stl_le_p(entry, p->id);
++            stl_le_p(entry + 4, p->wanted);
++            address_space_write(&address_space_memory,
++                                s->signalled_buf_addr + (uint64_t)n * 8,
++                                MEMTXATTRS_UNSPECIFIED, entry, 8);
++            p->wanted = 0;
++            n++;
++        }
++        if (QTAILQ_EMPTY(&s->wanted_list)) {
++            qemu_set_irq(s->irq, 0);
++            s->irq_raised = false;
++        }
++        return n;
++    }
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "gf-pipe: 未知读寄存器 0x%" HWADDR_PRIX "\n", offset);
++        return 0;
++    }
++}
++
++static const MemoryRegionOps gf_pipe_ops = {
++    .read = gf_pipe_read,
++    .write = gf_pipe_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ */
++/* 设备生命周期                                                        */
++/* ------------------------------------------------------------------ */
++
++static void gf_pipe_reset(DeviceState *dev)
++{
++    GoldfishPipeState *s = GOLDFISH_PIPE(dev);
++    gf_pipe_reset_all(s);
++    s->signalled_buf_addr = 0;
++    s->signalled_count = 0;
++    s->open_cmd_addr = 0;
++}
++
++static void gf_pipe_realize(DeviceState *dev, Error **errp)
++{
++    GoldfishPipeState *s = GOLDFISH_PIPE(dev);
++    memory_region_init_io(&s->iomem, OBJECT(s), &gf_pipe_ops, s,
++                          "goldfish.pipe", 0x2000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++    QTAILQ_INIT(&s->wanted_list);
++}
++
++static void gf_pipe_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    dc->realize = gf_pipe_realize;
++    device_class_set_legacy_reset(dc, gf_pipe_reset);
++    dc->desc = "RanchuWoA goldfish pipe device (protocol v2)";
++    dc->user_creatable = false;
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo gf_pipe_info = {
++    .name = TYPE_GOLDFISH_PIPE,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(GoldfishPipeState),
++    .class_init = gf_pipe_class_init,
++};
++
++static void gf_pipe_register(void)
++{
++    type_register_static(&gf_pipe_info);
++}
++
++type_init(gf_pipe_register);
+--- a/hw/android/goldfish-sync.c
++++ b/hw/android/goldfish-sync.c
+@@ -0,0 +1,171 @@
++/*
++ * goldfish-sync.c — RanchuWoA goldfish sync 设备（fence/timeline）
++ *
++ * 平台设备 @0xa020000 IRQ SPI 81（地址/中断在 hw/arm/virt.c 里分配）, compatible "google,goldfish-sync"。
++ * 协议与内核驱动 goldfish_drivers/goldfish_sync.c 对齐：
++ *   guest 写 GUESTCOMMAND_ADDR + 触发 BATCH_GUESTCOMMAND ->
++ *   设备从 guest 内存读 guestcmd{host_command, glsync_handle,
++ *   thread_handle, guest_timeline_handle}。
++ * 无 gfxstream 渲染器时 timeline/fence 命令为轻量记账实现。
++ */
++
++#include "qemu/osdep.h"
++#include "hw/core/sysbus.h"
++#include "hw/core/irq.h"
++#include "qemu/error-report.h"
++#include "system/address-spaces.h"
++#include "qemu/log.h"
++#include "qom/object.h"
++
++#define GS_DEBUG 0      /* 1：把寄存器写入打到 stderr */
++
++enum {
++    SYNC_REG_BATCH_COMMAND = 0x00,
++    SYNC_REG_BATCH_GUESTCOMMAND = 0x04,
++    SYNC_REG_BATCH_COMMAND_ADDR = 0x08,
++    SYNC_REG_BATCH_COMMAND_ADDR_HIGH = 0x0C,
++    SYNC_REG_BATCH_GUESTCOMMAND_ADDR = 0x10,
++    SYNC_REG_BATCH_GUESTCOMMAND_ADDR_HIGH = 0x14,
++    SYNC_REG_INIT = 0x18,
++};
++
++/* host_command 枚举 */
++enum {
++    CMD_SYNC_READY = 0,
++    CMD_CREATE_SYNC_TIMELINE = 1,
++    CMD_CREATE_SYNC_FENCE = 2,
++    CMD_SYNC_TIMELINE_INC = 3,
++    CMD_DESTROY_SYNC_TIMELINE = 4,
++    CMD_TRIGGER_HOST_WAIT = 5,
++};
++
++struct guestcmd {
++    uint64_t host_command;
++    uint64_t glsync_handle;
++    uint64_t thread_handle;
++    uint64_t guest_timeline_handle;
++};
++
++#define TYPE_GOLDFISH_SYNC "goldfish-sync"
++OBJECT_DECLARE_SIMPLE_TYPE(GoldfishSyncState, GOLDFISH_SYNC)
++
++struct GoldfishSyncState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    qemu_irq irq;
++
++    uint64_t hostcmd_addr;      /* guest 批量命令缓冲 GPA */
++    uint64_t guestcmd_addr;
++    uint64_t next_timeline;
++    bool initialized;
++};
++
++static void gs_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
++{
++    GoldfishSyncState *s = opaque;
++    if (GS_DEBUG) {
++        error_report("gf-sync: write reg 0x%" HWADDR_PRIX " = 0x%" PRIx64, off, val);
++    }
++    switch (off) {
++    case SYNC_REG_BATCH_GUESTCOMMAND_ADDR:
++        s->guestcmd_addr = (s->guestcmd_addr & ~0xFFFFFFFFULL) | val;
++        break;
++    case SYNC_REG_BATCH_GUESTCOMMAND_ADDR_HIGH:
++        s->guestcmd_addr = (s->guestcmd_addr & 0xFFFFFFFFULL) | (val << 32);
++        break;
++    case SYNC_REG_BATCH_COMMAND_ADDR:
++        s->hostcmd_addr = (s->hostcmd_addr & ~0xFFFFFFFFULL) | val;
++        break;
++    case SYNC_REG_BATCH_COMMAND_ADDR_HIGH:
++        s->hostcmd_addr = (s->hostcmd_addr & 0xFFFFFFFFULL) | (val << 32);
++        break;
++    case SYNC_REG_BATCH_GUESTCOMMAND: {
++        /* val=0 触发一批 guest 命令处理 */
++        struct guestcmd cmd;
++        if (s->guestcmd_addr == 0) {
++            break;
++        }
++        address_space_read(&address_space_memory, s->guestcmd_addr,
++                           MEMTXATTRS_UNSPECIFIED, &cmd, sizeof(cmd));
++        switch (cmd.host_command) {
++        case CMD_CREATE_SYNC_TIMELINE:
++        case CMD_SYNC_TIMELINE_INC:
++        case CMD_DESTROY_SYNC_TIMELINE:
++        case CMD_TRIGGER_HOST_WAIT:
++            /* 无渲染器：记账即可，guest 侧 sw_sync 自己管 fence */
++            qemu_log_mask(LOG_UNIMP,
++                          "gf-sync: cmd %llu tl=%llu (记账)\n",
++                          (unsigned long long)cmd.host_command,
++                          (unsigned long long)cmd.guest_timeline_handle);
++            break;
++        default:
++            break;
++        }
++        break;
++    }
++    case SYNC_REG_BATCH_COMMAND:
++        /* guest 处理完 host 命令后写 0 降 IRQ */
++        if (val == 0) {
++            qemu_set_irq(s->irq, 0);
++        }
++        break;
++    case SYNC_REG_INIT:
++        s->initialized = true;
++        qemu_log_mask(LOG_UNIMP, "gf-sync: 初始化完成\n");
++        break;
++    default:
++        break;
++    }
++}
++
++static uint64_t gs_read(void *opaque, hwaddr off, unsigned size)
++{
++    GoldfishSyncState *s = opaque;
++    switch (off) {
++    case SYNC_REG_BATCH_COMMAND:
++        /* 无 host 命令待处理 */
++        return 0;
++    case SYNC_REG_INIT:
++        return s->initialized ? 1 : 0;
++    default:
++        return 0;
++    }
++}
++
++static const MemoryRegionOps gs_ops = {
++    .read = gs_read,
++    .write = gs_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void gs_realize(DeviceState *dev, Error **errp)
++{
++    GoldfishSyncState *s = GOLDFISH_SYNC(dev);
++    memory_region_init_io(&s->iomem, OBJECT(s), &gs_ops, s,
++                          "goldfish.sync", 0x2000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++}
++
++static void gs_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    dc->realize = gs_realize;
++    dc->desc = "RanchuWoA goldfish sync device";
++    dc->user_creatable = false;
++}
++
++static const TypeInfo gs_info = {
++    .name = TYPE_GOLDFISH_SYNC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(GoldfishSyncState),
++    .class_init = gs_class_init,
++};
++
++static void gs_register(void)
++{
++    type_register_static(&gs_info);
++}
++
++type_init(gs_register);
+--- a/hw/android/ranchu-sensors.c
++++ b/hw/android/ranchu-sensors.c
+@@ -0,0 +1,185 @@
++/*
++ * RanchuWoA: qemud:sensors 服务 —— ranchu 多合一传感器 HAL 的宿主端。
++ *
++ * 协议（device/generic/goldfish/sensors，libqemud 帧格式："%04x" 十六进制长度 + 负载）：
++ *   guest->"list-sensors"        host->"<掩码>"（按 kQemuSensorName 的下标）
++ *   guest->"time:<ns>" / "set-delay:<ms>" / "set:<名字>:<0|1>"
++ *   host->"acceleration:x:y:z"、"magnetic:x:y:z"、"light:v" ……、"sync:<us>"
++ * HAL 构造时若打不开通道会直接 abort，而 system_server 会一直等 ISensors 服务，
++ * 所以没有这个服务 Android 起不来。这里报告一组静态读数：竖屏直立、静止、室内光照。
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/timer.h"
++#include "ranchu-sensors.h"
++
++enum {
++    RS_ACCEL = 0,
++    RS_GYRO = 1,
++    RS_MAGNETIC = 2,
++    RS_ORIENTATION = 3,
++    RS_TEMPERATURE = 4,
++    RS_PROXIMITY = 5,
++    RS_LIGHT = 6,
++    RS_PRESSURE = 7,
++    RS_HUMIDITY = 8,
++    RS_COUNT = 9,
++};
++
++static const char *const rs_names[RS_COUNT] = {
++    "acceleration", "gyroscope", "magnetic-field", "orientation", "temperature",
++    "proximity", "light", "pressure", "humidity",
++};
++
++struct RanchuSensors {
++    RanchuSensorsSendFn send;
++    void *opaque;
++    QEMUTimer *timer;
++    uint32_t enabled;       /* 按 rs_names 下标的位图 */
++    uint32_t delay_ms;
++    uint8_t in[512];        /* guest->host 帧重组 */
++    size_t in_len;
++};
++
++static void G_GNUC_PRINTF(2, 3) rs_send(RanchuSensors *s, const char *fmt, ...)
++{
++    char msg[128];
++    char frame[136];
++    va_list ap;
++
++    va_start(ap, fmt);
++    int len = vsnprintf(msg, sizeof(msg), fmt, ap);
++    va_end(ap);
++    if (len <= 0 || len >= (int)sizeof(msg)) {
++        return;
++    }
++    snprintf(frame, sizeof(frame), "%04x%s", len, msg);
++    s->send(s->opaque, (const uint8_t *)frame, 4 + len);
++}
++
++static void rs_arm(RanchuSensors *s)
++{
++    if (s->enabled) {
++        timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->delay_ms);
++    } else {
++        timer_del(s->timer);
++    }
++}
++
++static void rs_tick(void *opaque)
++{
++    RanchuSensors *s = opaque;
++    uint32_t e = s->enabled;
++
++    if (e & (1u << RS_ACCEL)) {
++        rs_send(s, "acceleration:0.0:9.80665:0.0");
++    }
++    if (e & (1u << RS_GYRO)) {
++        rs_send(s, "gyroscope:0.0:0.0:0.0");
++    }
++    if (e & (1u << RS_MAGNETIC)) {
++        rs_send(s, "magnetic:0.0:5.9:-48.4");
++    }
++    if (e & (1u << RS_ORIENTATION)) {
++        rs_send(s, "orientation:0.0:-90.0:0.0");
++    }
++    if (e & (1u << RS_TEMPERATURE)) {
++        rs_send(s, "temperature:25.0");
++    }
++    if (e & (1u << RS_PROXIMITY)) {
++        rs_send(s, "proximity:1.0");
++    }
++    if (e & (1u << RS_LIGHT)) {
++        rs_send(s, "light:300.0");
++    }
++    if (e & (1u << RS_PRESSURE)) {
++        rs_send(s, "pressure:1013.25");
++    }
++    if (e & (1u << RS_HUMIDITY)) {
++        rs_send(s, "humidity:40.0");
++    }
++    rs_send(s, "sync:%" PRId64, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL));
++    rs_arm(s);
++}
++
++static void rs_command(RanchuSensors *s, const char *cmd)
++{
++    if (strcmp(cmd, "list-sensors") == 0) {
++        rs_send(s, "%u", (1u << RS_COUNT) - 1);
++    } else if (g_str_has_prefix(cmd, "set-delay:")) {
++        unsigned long v = strtoul(cmd + 10, NULL, 10);
++        s->delay_ms = MAX(10ul, MIN(v, 1000ul));
++        rs_arm(s);
++    } else if (g_str_has_prefix(cmd, "set:")) {
++        const char *name = cmd + 4;
++        const char *colon = strrchr(name, ':');
++        if (!colon) {
++            return;
++        }
++        for (int i = 0; i < RS_COUNT; i++) {
++            if (strlen(rs_names[i]) == (size_t)(colon - name) &&
++                strncmp(rs_names[i], name, colon - name) == 0) {
++                if (atoi(colon + 1)) {
++                    s->enabled |= 1u << i;
++                } else {
++                    s->enabled &= ~(1u << i);
++                }
++            }
++        }
++        rs_arm(s);
++    }
++    /* "time:<ns>" 等其余命令无需应答 */
++}
++
++RanchuSensors *ranchu_sensors_new(RanchuSensorsSendFn send, void *opaque)
++{
++    RanchuSensors *s = g_new0(RanchuSensors, 1);
++    s->send = send;
++    s->opaque = opaque;
++    s->delay_ms = 200;
++    s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, rs_tick, s);
++    return s;
++}
++
++void ranchu_sensors_recv(RanchuSensors *s, const uint8_t *data, size_t len)
++{
++    while (len > 0) {
++        size_t n = MIN(len, sizeof(s->in) - s->in_len);
++        memcpy(s->in + s->in_len, data, n);
++        s->in_len += n;
++        data += n;
++        len -= n;
++        /* 逐帧消费 */
++        while (s->in_len >= 4) {
++            char hdr[5];
++            memcpy(hdr, s->in, 4);
++            hdr[4] = 0;
++            unsigned long flen = strtoul(hdr, NULL, 16);
++            if (flen >= sizeof(s->in) - 4) {
++                s->in_len = 0;          /* 帧坏了，丢弃 */
++                break;
++            }
++            if (s->in_len < 4 + flen) {
++                break;
++            }
++            char cmd[sizeof(s->in)];
++            memcpy(cmd, s->in + 4, flen);
++            cmd[flen] = 0;
++            memmove(s->in, s->in + 4 + flen, s->in_len - 4 - flen);
++            s->in_len -= 4 + flen;
++            rs_command(s, cmd);
++        }
++        if (s->in_len == sizeof(s->in)) {
++            s->in_len = 0;
++        }
++    }
++}
++
++void ranchu_sensors_free(RanchuSensors *s)
++{
++    if (s) {
++        timer_free(s->timer);
++        g_free(s);
++    }
++}
+--- a/hw/android/ranchu-sensors.h
++++ b/hw/android/ranchu-sensors.h
+@@ -0,0 +1,19 @@
++/*
++ * RanchuWoA: qemud:sensors 服务（ranchu 多合一传感器 HAL 的宿主端），与传输层无关。
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_ANDROID_RANCHU_SENSORS_H
++#define HW_ANDROID_RANCHU_SENSORS_H
++
++typedef struct RanchuSensors RanchuSensors;
++
++/* send 把一段字节（已含 qemud 帧头）交给传输层发往 guest */
++typedef void (*RanchuSensorsSendFn)(void *opaque, const uint8_t *data, size_t len);
++
++RanchuSensors *ranchu_sensors_new(RanchuSensorsSendFn send, void *opaque);
++/* guest 发来的字节流（qemud 帧，可能被任意切分） */
++void ranchu_sensors_recv(RanchuSensors *s, const uint8_t *data, size_t len);
++void ranchu_sensors_free(RanchuSensors *s);
++
++#endif
+--- a/hw/android/ranchu-vsock.c
++++ b/hw/android/ranchu-vsock.c
+@@ -0,0 +1,1364 @@
++/*
++ * RanchuWoA: 纯用户态 virtio-vsock 设备（ranchu-vsock-device）。
++ *
++ * Android 15 模拟器镜像把非图形 qemud 服务（sensors 等）从 goldfish pipe 搬到了 virtio-vsock：
++ * guest 连宿主（CID 2）端口 5000，先写 "pipe:qemud:<服务>\0"，之后按 qemud 帧格式收发；
++ * adbd 也同时监听 vsock:5555。Windows 宿主没有 vhost-vsock，这里在 QEMU 进程里直接实现
++ * virtio-vsock 的设备端（规范 5.10，只做 STREAM）：
++ *   - guest -> 宿主 5000：内置服务 qemud:sensors、qemud:boot-properties、QemuMiscPipe、
++ *     clipboard（与 Windows 剪贴板双向同步）、qemud:camera（空摄像头列表）、qemud:gps（固定位置）；
++ *     其余服务名（如 qemud:fingerprintlisten）保持连接、丢弃数据——不能 RST：goldfish HAL
++ *     普遍把对端关闭当成可读的 EOF，在 read/epoll 循环里 100% 空转；
++ *   - 宿主 TCP 转发：forward=<宿主端口>:<guest 端口>[;...]，本机连上宿主端口后
++ *     由设备向 guest 发起 vsock 连接（adb connect 127.0.0.1:<宿主端口> 直连 guest adbd）；
++ *   - 正常关机：guest 开机完成后（poweroff-ready），system_powerdown（QMP/HMP、SDL 关窗）由设备
++ *     自己当 adb 客户端连 guest adbd 执行 svc power shutdown，取代板子的电源键（Android 只把它当锁屏）。
++ * 其余目标端口一律 RST（guest 的 vsock ping 端口 5001 本来就期望失败）。
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include <math.h>
++#include "qapi/error.h"
++#include "qemu/error-report.h"
++#include "qemu/iov.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "qemu/sockets.h"
++#include "qemu/queue.h"
++#include "qemu/timer.h"
++#include "system/runstate.h"
++#include "hw/virtio/virtio.h"
++#include "hw/core/qdev-properties.h"
++#include "standard-headers/linux/virtio_ids.h"
++#include "standard-headers/linux/virtio_vsock.h"
++#include "qom/object.h"
++#include "ranchu-sensors.h"
++
++#define TYPE_RANCHU_VSOCK "ranchu-vsock-device"
++OBJECT_DECLARE_SIMPLE_TYPE(RanchuVsock, RANCHU_VSOCK)
++
++#define RV_HOST_CID         2
++#define RV_PIPE_PORT        5000        /* qemu pipe over vsock 的服务端口 */
++#define RV_ADBD_PORT        5555        /* guest adbd 监听的 vsock 端口 */
++#define RV_MAX_PAYLOAD      4000        /* guest rx 缓冲 4096 字节（含 44 字节头） */
++#define RV_BUF_ALLOC        (256 * 1024)
++#define RV_QUEUE_SIZE       128
++
++typedef struct RvConn RvConn;
++
++typedef enum {
++    RV_CONNECTING,      /* 宿主发起，等 guest RESPONSE */
++    RV_CONNECTED,
++    RV_CLOSING,         /* 已发 SHUTDOWN，等 guest RST */
++} RvState;
++
++struct RvConn {
++    RanchuVsock *dev;
++    uint32_t local_port;        /* 宿主侧端口 */
++    uint32_t peer_port;         /* guest 侧端口 */
++    RvState state;
++    /* 流控（规范 5.10.6.3）：guest 通告的缓冲与已消费量；本侧已发/已消费量 */
++    uint32_t peer_buf_alloc;
++    uint32_t peer_fwd_cnt;
++    uint32_t tx_cnt;
++    uint32_t fwd_cnt;
++    uint32_t credit_sent_fwd;
++    /* 转发连接：宿主 socket */
++    int sock;
++    GByteArray *sock_out;       /* guest -> socket 待写 */
++    bool sock_reading;
++    /* 内置服务：先收服务名（以 NUL 结尾） */
++    char name[160];
++    size_t name_len;
++    bool name_done;
++    const struct RvService *svc;
++    void *svc_priv;
++    GByteArray *in;             /* 服务的输入重组缓冲 */
++    QTAILQ_ENTRY(RvConn) next;
++};
++
++typedef struct RvService {
++    const char *name;           /* 完整服务名（guest 写入的 "pipe:..."） */
++    void (*open)(RvConn *c);
++    void (*recv)(RvConn *c, const uint8_t *data, size_t len);
++    void (*close)(RvConn *c);
++} RvService;
++
++typedef struct RvPkt {
++    struct virtio_vsock_hdr hdr;
++    uint8_t *data;
++    QSIMPLEQ_ENTRY(RvPkt) next;
++} RvPkt;
++
++typedef struct RvForward {
++    RanchuVsock *dev;
++    int listen_fd;
++    uint32_t host_port;
++    uint32_t guest_port;
++} RvForward;
++
++struct RanchuVsock {
++    VirtIODevice parent_obj;
++    VirtQueue *rx_vq;
++    VirtQueue *tx_vq;
++    VirtQueue *evt_vq;
++    uint64_t guest_cid;
++    char *forward;
++    QTAILQ_HEAD(, RvConn) conns;
++    QSIMPLEQ_HEAD(, RvPkt) rxq;
++    GPtrArray *forwards;
++    uint32_t next_local_port;
++    char *boot_props;           /* "键=值;键=值"，经 qemud:boot-properties 交给 qemu-props */
++    RvConn *clip_conn;          /* 当前的 clipboard 连接 */
++    struct RvClipboard *clip;   /* 宿主剪贴板桥（仅 Windows） */
++    bool debug;                 /* debug=on 时把连接状态变化打到 stderr */
++    QEMUTimer *adb_reg_timer;   /* bootcomplete 后延迟登记 adb，避开 adbd 重启 */
++    double gps_lat, gps_lon, gps_alt;   /* qemud:gps 报给 guest 的固定位置（gps 属性） */
++    bool boot_completed;        /* 收到过 QemuMiscPipe 的 bootcomplete（guest 重启时清零） */
++    Notifier powerdown;         /* system_powerdown / 关窗 → 经 adbd 请求 guest 正常关机 */
++};
++
++#define RV_DBG(s, fmt, ...) do { \
++        if ((s)->debug) { \
++            info_report("ranchu-vsock: " fmt, ##__VA_ARGS__); \
++        } \
++    } while (0)
++
++static void rv_flush_rx(RanchuVsock *s);
++static void rv_conn_free(RvConn *c);
++static void rv_sock_readable(void *opaque);
++static void rv_sock_writable(void *opaque);
++
++/* ------------------------------------------------------------------ */
++/* 发往 guest 的包                                                      */
++/* ------------------------------------------------------------------ */
++
++static void rv_queue_raw(RanchuVsock *s, uint32_t src_port, uint32_t dst_port,
++                         uint16_t op, uint32_t flags, uint32_t fwd_cnt,
++                         const uint8_t *data, uint32_t len)
++{
++    RvPkt *p = g_new0(RvPkt, 1);
++    p->hdr.src_cid = cpu_to_le64(RV_HOST_CID);
++    p->hdr.dst_cid = cpu_to_le64(s->guest_cid);
++    p->hdr.src_port = cpu_to_le32(src_port);
++    p->hdr.dst_port = cpu_to_le32(dst_port);
++    p->hdr.len = cpu_to_le32(len);
++    p->hdr.type = cpu_to_le16(VIRTIO_VSOCK_TYPE_STREAM);
++    p->hdr.op = cpu_to_le16(op);
++    p->hdr.flags = cpu_to_le32(flags);
++    p->hdr.buf_alloc = cpu_to_le32(RV_BUF_ALLOC);
++    p->hdr.fwd_cnt = cpu_to_le32(fwd_cnt);
++    if (len) {
++        p->data = g_memdup2(data, len);
++    }
++    QSIMPLEQ_INSERT_TAIL(&s->rxq, p, next);
++}
++
++static void rv_send(RvConn *c, uint16_t op, uint32_t flags)
++{
++    rv_queue_raw(c->dev, c->local_port, c->peer_port, op, flags, c->fwd_cnt, NULL, 0);
++    c->credit_sent_fwd = c->fwd_cnt;
++    rv_flush_rx(c->dev);
++}
++
++/* 内置服务 / socket 向 guest 发数据（按包切分，计入 tx_cnt） */
++static void rv_send_data(RvConn *c, const uint8_t *data, size_t len)
++{
++    while (len > 0) {
++        uint32_t n = MIN(len, RV_MAX_PAYLOAD);
++        rv_queue_raw(c->dev, c->local_port, c->peer_port, VIRTIO_VSOCK_OP_RW, 0,
++                     c->fwd_cnt, data, n);
++        c->tx_cnt += n;
++        c->credit_sent_fwd = c->fwd_cnt;
++        data += n;
++        len -= n;
++    }
++    rv_flush_rx(c->dev);
++}
++
++static uint32_t rv_peer_credit(RvConn *c)
++{
++    uint32_t in_flight = c->tx_cnt - c->peer_fwd_cnt;
++    return c->peer_buf_alloc > in_flight ? c->peer_buf_alloc - in_flight : 0;
++}
++
++static void rv_flush_rx(RanchuVsock *s)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    bool pushed = false;
++
++    if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
++        return;
++    }
++    while (!QSIMPLEQ_EMPTY(&s->rxq)) {
++        RvPkt *p = QSIMPLEQ_FIRST(&s->rxq);
++        uint32_t len = le32_to_cpu(p->hdr.len);
++        VirtQueueElement *elem = virtqueue_pop(s->rx_vq, sizeof(VirtQueueElement));
++        if (!elem) {
++            break;          /* guest 还没补 rx 缓冲；等 rx 队列的 kick */
++        }
++        size_t room = iov_size(elem->in_sg, elem->in_num);
++        if (room < sizeof(p->hdr) + len) {
++            error_report("ranchu-vsock: guest rx 缓冲太小 (%zu < %zu)，丢包",
++                         room, sizeof(p->hdr) + len);
++            virtqueue_push(s->rx_vq, elem, 0);
++        } else {
++            iov_from_buf(elem->in_sg, elem->in_num, 0, &p->hdr, sizeof(p->hdr));
++            if (len) {
++                iov_from_buf(elem->in_sg, elem->in_num, sizeof(p->hdr), p->data, len);
++            }
++            virtqueue_push(s->rx_vq, elem, sizeof(p->hdr) + len);
++        }
++        g_free(elem);
++        QSIMPLEQ_REMOVE_HEAD(&s->rxq, next);
++        g_free(p->data);
++        g_free(p);
++        pushed = true;
++    }
++    if (pushed) {
++        virtio_notify(vdev, s->rx_vq);
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* 连接管理                                                            */
++/* ------------------------------------------------------------------ */
++
++static RvConn *rv_find(RanchuVsock *s, uint32_t local_port, uint32_t peer_port)
++{
++    RvConn *c;
++    QTAILQ_FOREACH(c, &s->conns, next) {
++        if (c->local_port == local_port && c->peer_port == peer_port) {
++            return c;
++        }
++    }
++    return NULL;
++}
++
++static RvConn *rv_conn_new(RanchuVsock *s, uint32_t local_port, uint32_t peer_port)
++{
++    RvConn *c = g_new0(RvConn, 1);
++    c->dev = s;
++    c->local_port = local_port;
++    c->peer_port = peer_port;
++    c->sock = -1;
++    QTAILQ_INSERT_TAIL(&s->conns, c, next);
++    return c;
++}
++
++static void rv_conn_free(RvConn *c)
++{
++    QTAILQ_REMOVE(&c->dev->conns, c, next);
++    if (c->sock >= 0) {
++        qemu_set_fd_handler(c->sock, NULL, NULL, NULL);
++        closesocket(c->sock);
++    }
++    if (c->sock_out) {
++        g_byte_array_free(c->sock_out, true);
++    }
++    if (c->svc && c->svc->close) {
++        c->svc->close(c);
++    }
++    if (c->in) {
++        g_byte_array_free(c->in, true);
++    }
++    g_free(c);
++}
++
++/* 宿主侧主动关闭：发 SHUTDOWN，等 guest 回 RST 再释放 */
++static void rv_conn_shutdown(RvConn *c)
++{
++    if (c->sock >= 0) {
++        qemu_set_fd_handler(c->sock, NULL, NULL, NULL);
++        closesocket(c->sock);
++        c->sock = -1;
++    }
++    if (c->state == RV_CONNECTED) {
++        c->state = RV_CLOSING;
++        rv_send(c, VIRTIO_VSOCK_OP_SHUTDOWN,
++                VIRTIO_VSOCK_SHUTDOWN_RCV | VIRTIO_VSOCK_SHUTDOWN_SEND);
++    } else {
++        rv_send(c, VIRTIO_VSOCK_OP_RST, 0);
++        rv_conn_free(c);
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* 内置服务（端口 5000）                                                 */
++/* ------------------------------------------------------------------ */
++
++/* qemud 帧："%04x" 长度 + 负载 */
++static void rv_qemud_send(RvConn *c, const char *msg, size_t len)
++{
++    char hdr[8];
++    snprintf(hdr, sizeof(hdr), "%04zx", len);
++    rv_send_data(c, (const uint8_t *)hdr, 4);
++    if (len) {
++        rv_send_data(c, (const uint8_t *)msg, len);
++    }
++}
++
++/* 从 c->in 里取一个 qemud 帧；没有完整帧返回 NULL（调用方 g_free） */
++static char *rv_qemud_take(RvConn *c)
++{
++    if (c->in->len < 4) {
++        return NULL;
++    }
++    char hdr[5];
++    memcpy(hdr, c->in->data, 4);
++    hdr[4] = 0;
++    size_t flen = strtoul(hdr, NULL, 16);
++    if (c->in->len < 4 + flen) {
++        return NULL;
++    }
++    char *msg = g_strndup((const char *)c->in->data + 4, flen);
++    g_byte_array_remove_range(c->in, 0, 4 + flen);
++    return msg;
++}
++
++/* ---- qemud:sensors（协议在 ranchu-sensors.c） ---- */
++
++static void rv_sensors_send(void *opaque, const uint8_t *data, size_t len)
++{
++    rv_send_data(opaque, data, len);
++}
++
++static void rv_sensors_open(RvConn *c)
++{
++    c->svc_priv = ranchu_sensors_new(rv_sensors_send, c);
++}
++
++static void rv_sensors_recv(RvConn *c, const uint8_t *data, size_t len)
++{
++    ranchu_sensors_recv(c->svc_priv, data, len);
++}
++
++static void rv_sensors_close(RvConn *c)
++{
++    ranchu_sensors_free(c->svc_priv);
++}
++
++/* ---- qemud:boot-properties：qemu-props 发 "list"，逐帧回 "键=值"，单个 NUL 帧结束 ---- */
++
++static void rv_bootprops_recv(RvConn *c, const uint8_t *data, size_t len)
++{
++    g_byte_array_append(c->in, data, len);
++    char *msg;
++    while ((msg = rv_qemud_take(c))) {
++        if (strcmp(msg, "list") == 0) {
++            if (c->dev->boot_props && *c->dev->boot_props) {
++                g_auto(GStrv) items = g_strsplit(c->dev->boot_props, ";", 0);
++                for (int i = 0; items[i]; i++) {
++                    if (strchr(items[i], '=')) {
++                        rv_qemud_send(c, items[i], strlen(items[i]));
++                    }
++                }
++            }
++            rv_qemud_send(c, "", 1);    /* 含结尾 NUL 的空串 = 列表结束 */
++        }
++        g_free(msg);
++    }
++}
++
++/*
++ * 向本机 adb server（127.0.0.1:5037）登记 "host:emulator:<端口>"，与官方模拟器相同：
++ * adb server 随即连到该端口（即我们的转发口），设备显示为 emulator-<端口-1>。
++ * adb server 没开时连接直接被拒，忽略即可；重复登记是无害的。
++ */
++/* 向本机 adb server（127.0.0.1:5037）发一条 smart-socket 请求；server 没开时忽略 */
++static void rv_adb_server_cmd(const char *msg)
++{
++    struct sockaddr_in sa = {
++        .sin_family = AF_INET,
++        .sin_port = htons(5037),
++        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
++    };
++    char req[80];
++    int fd = qemu_socket(AF_INET, SOCK_STREAM, 0);
++
++    if (fd < 0) {
++        return;
++    }
++    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
++        snprintf(req, sizeof(req), "%04zx%s", strlen(msg), msg);
++        if (send(fd, req, strlen(req), 0) < 0) {
++            /* 忽略 */
++        }
++    }
++    closesocket(fd);
++}
++
++/*
++ * 与官方模拟器相同，向 adb server 登记 "host:emulator:<端口>"：server 随即连到该端口
++ * （即我们的转发口），设备显示为 emulator-<端口-1>。若 server 里还留着上一次运行的同名
++ * offline 传输，登记会被忽略，所以在没有活动 adb 连接时先发 host:reconnect-offline。
++ */
++static void rv_adb_register(RanchuVsock *s)
++{
++    for (guint i = 0; i < s->forwards->len; i++) {
++        RvForward *f = g_ptr_array_index(s->forwards, i);
++        RvConn *c;
++        bool live = false;
++
++        if (f->guest_port != 5555) {
++            continue;
++        }
++        QTAILQ_FOREACH(c, &s->conns, next) {
++            if (c->sock >= 0 && c->peer_port == f->guest_port && c->state == RV_CONNECTED) {
++                live = true;
++            }
++        }
++        if (live) {
++            continue;
++        }
++        char msg[40];
++        snprintf(msg, sizeof(msg), "host:emulator:%u", f->host_port);
++        RV_DBG(s, "向 adb server 登记 %s", msg);
++        rv_adb_server_cmd("host:reconnect-offline");
++        rv_adb_server_cmd(msg);
++    }
++}
++
++/* ---- QemuMiscPipe：[int32 长度][含 NUL 的消息]，回 [int32 0]；bootcomplete 打到宿主日志 ---- */
++
++static void rv_misc_recv(RvConn *c, const uint8_t *data, size_t len)
++{
++    g_byte_array_append(c->in, data, len);
++    while (c->in->len >= 4) {
++        int32_t mlen = ldl_le_p(c->in->data);
++        if (mlen < 0 || mlen > 4096) {
++            g_byte_array_set_size(c->in, 0);
++            return;
++        }
++        if (c->in->len < 4 + (guint)mlen) {
++            return;
++        }
++        g_autofree char *msg = g_strndup((const char *)c->in->data + 4, mlen);
++        g_byte_array_remove_range(c->in, 0, 4 + mlen);
++        if (strcmp(msg, "bootcomplete") == 0) {
++            info_report("ranchu: guest boot completed");
++            c->dev->boot_completed = true;
++            /* 开机完成时 adbd 可能因 usb 配置变化重启一次，稍等再登记 */
++            timer_mod(c->dev->adb_reg_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 3000);
++        } else if (strcmp(msg, "heartbeat") == 0) {
++            rv_adb_register(c->dev);    /* adb server 后启动/重启时也能在 30 秒内发现模拟器 */
++        }
++        uint8_t zero[4] = {0, 0, 0, 0};
++        rv_send_data(c, zero, sizeof(zero));
++    }
++}
++
++/* ---- clipboard：[uint32 LE 长度][UTF-8 文本]，双向 ---- */
++
++#ifdef _WIN32
++/*
++ * 宿主剪贴板桥：独立线程持有一个 message-only 窗口，负责 SetClipboardData（窗口所有权要求）
++ * 和 WM_CLIPBOARDUPDATE 监听；宿主侧变化经 BH 回到主循环再发给 guest。窗口必须在有消息
++ * 循环的线程里，否则别的进程清空剪贴板时向我们 SendMessage 会被卡住。
++ */
++#define RV_WM_SET_TEXT (WM_APP + 1)
++
++typedef struct RvClipboard {
++    RanchuVsock *dev;
++    HWND hwnd;
++    QemuMutex lock;
++    char *to_guest;             /* 剪贴板线程 -> 主循环 */
++    QEMUBH *bh;
++    bool suppress_update;       /* 忽略自己 SetClipboardData 引发的那次通知 */
++} RvClipboard;
++
++static void rv_clip_set_host_text(RvClipboard *cb, gunichar2 *w)
++{
++    size_t n = 0;
++    int tries = 0;
++    while (w[n]) {
++        n++;
++    }
++    while (!OpenClipboard(cb->hwnd)) {
++        if (++tries >= 10) {
++            return;
++        }
++        Sleep(20);
++    }
++    EmptyClipboard();
++    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (n + 1) * sizeof(gunichar2));
++    if (h) {
++        memcpy(GlobalLock(h), w, (n + 1) * sizeof(gunichar2));
++        GlobalUnlock(h);
++        if (SetClipboardData(CF_UNICODETEXT, h)) {
++            cb->suppress_update = true;
++        } else {
++            GlobalFree(h);
++        }
++    }
++    CloseClipboard();
++}
++
++static void rv_clip_read_host_text(RvClipboard *cb)
++{
++    char *utf8 = NULL;
++    int tries = 0;
++    while (!OpenClipboard(cb->hwnd)) {
++        if (++tries >= 10) {
++            return;
++        }
++        Sleep(20);
++    }
++    HANDLE h = GetClipboardData(CF_UNICODETEXT);
++    if (h) {
++        const gunichar2 *w = GlobalLock(h);
++        if (w) {
++            utf8 = g_utf16_to_utf8(w, -1, NULL, NULL, NULL);
++            GlobalUnlock(h);
++        }
++    }
++    CloseClipboard();
++    if (utf8) {
++        qemu_mutex_lock(&cb->lock);
++        g_free(cb->to_guest);
++        cb->to_guest = utf8;
++        qemu_mutex_unlock(&cb->lock);
++        qemu_bh_schedule(cb->bh);
++    }
++}
++
++static LRESULT CALLBACK rv_clip_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
++{
++    RvClipboard *cb = (RvClipboard *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
++
++    switch (msg) {
++    case RV_WM_SET_TEXT:
++        rv_clip_set_host_text(cb, (gunichar2 *)lp);
++        g_free((gunichar2 *)lp);
++        return 0;
++    case WM_CLIPBOARDUPDATE:
++        if (cb && cb->suppress_update) {
++            cb->suppress_update = false;
++        } else if (cb) {
++            /*
++             * 不在通知里立刻读：很多程序（如 PowerShell Set-Clipboard）写剪贴板要先清空再写入，
++             * 两次 OpenClipboard 之间我们若抢着打开，对方第二次就会失败。延迟一点再读。
++             */
++            SetTimer(hwnd, 1, 150, NULL);
++        }
++        return 0;
++    case WM_TIMER:
++        KillTimer(hwnd, 1);
++        if (cb) {
++            rv_clip_read_host_text(cb);
++        }
++        return 0;
++    default:
++        return DefWindowProcW(hwnd, msg, wp, lp);
++    }
++}
++
++static DWORD WINAPI rv_clip_thread(LPVOID arg)
++{
++    RvClipboard *cb = arg;
++    WNDCLASSW wc = { 0 };
++    MSG msg;
++
++    wc.lpfnWndProc = rv_clip_wndproc;
++    wc.hInstance = GetModuleHandleW(NULL);
++    wc.lpszClassName = L"RanchuWoAClipboard";
++    RegisterClassW(&wc);
++    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0,
++                                HWND_MESSAGE, NULL, wc.hInstance, NULL);
++    if (!hwnd) {
++        return 1;
++    }
++    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cb);
++    cb->hwnd = hwnd;
++    AddClipboardFormatListener(hwnd);
++    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
++        TranslateMessage(&msg);
++        DispatchMessageW(&msg);
++    }
++    return 0;
++}
++
++static void rv_clip_bh(void *opaque)
++{
++    RvClipboard *cb = opaque;
++    RvConn *c = cb->dev->clip_conn;
++
++    qemu_mutex_lock(&cb->lock);
++    char *text = cb->to_guest;
++    cb->to_guest = NULL;
++    qemu_mutex_unlock(&cb->lock);
++    if (text && c) {
++        uint8_t hdr[4];
++        stl_le_p(hdr, strlen(text));
++        rv_send_data(c, hdr, 4);
++        rv_send_data(c, (const uint8_t *)text, strlen(text));
++    }
++    g_free(text);
++}
++
++static void rv_clip_init(RanchuVsock *s)
++{
++    RvClipboard *cb = g_new0(RvClipboard, 1);
++    cb->dev = s;
++    qemu_mutex_init(&cb->lock);
++    cb->bh = qemu_bh_new(rv_clip_bh, cb);
++    CloseHandle(CreateThread(NULL, 0, rv_clip_thread, cb, 0, NULL));
++    s->clip = cb;
++}
++
++static void rv_clip_to_host(RanchuVsock *s, const char *utf8, size_t len)
++{
++    RvClipboard *cb = s->clip;
++    if (!cb || !cb->hwnd) {
++        return;
++    }
++    gunichar2 *w = g_utf8_to_utf16(utf8, len, NULL, NULL, NULL);
++    if (w) {
++        PostMessageW(cb->hwnd, RV_WM_SET_TEXT, 0, (LPARAM)w);
++    }
++}
++#else
++static void rv_clip_init(RanchuVsock *s)
++{
++}
++
++static void rv_clip_to_host(RanchuVsock *s, const char *utf8, size_t len)
++{
++}
++#endif
++
++static void rv_adb_reg_timer_cb(void *opaque)
++{
++    rv_adb_register(opaque);
++}
++
++static void rv_clip_open(RvConn *c)
++{
++    c->dev->clip_conn = c;
++}
++
++static void rv_clip_recv(RvConn *c, const uint8_t *data, size_t len)
++{
++    g_byte_array_append(c->in, data, len);
++    while (c->in->len >= 4) {
++        uint32_t mlen = ldl_le_p(c->in->data);
++        if (mlen > 16 * 1024 * 1024) {
++            g_byte_array_set_size(c->in, 0);
++            return;
++        }
++        if (c->in->len < 4 + mlen) {
++            return;
++        }
++        rv_clip_to_host(c->dev, (const char *)c->in->data + 4, mlen);
++        g_byte_array_remove_range(c->in, 0, 4 + mlen);
++    }
++}
++
++static void rv_clip_close(RvConn *c)
++{
++    if (c->dev->clip_conn == c) {
++        c->dev->clip_conn = NULL;
++    }
++}
++
++/*
++ * ---- qemud:camera：查询是以 NUL 结尾的裸字符串（不带 qemud 帧），
++ * 回复为 "%08x" 长度 + "ok:<数据>" / "ok\0" / "ko..."（见相机 HAL 的 qemu_channel.cpp）----
++ */
++
++static void rv_camera_reply(RvConn *c, const char *body, size_t len)
++{
++    char hdr[16];
++    snprintf(hdr, sizeof(hdr), "%08zx", len);
++    rv_send_data(c, (const uint8_t *)hdr, 8);
++    rv_send_data(c, (const uint8_t *)body, len);
++}
++
++static void rv_camera_recv(RvConn *c, const uint8_t *data, size_t len)
++{
++    g_byte_array_append(c->in, data, len);
++    for (;;) {
++        const uint8_t *nul = c->in->len ? memchr(c->in->data, 0, c->in->len) : NULL;
++        if (!nul) {
++            return;
++        }
++        size_t qlen = nul - c->in->data;
++        bool is_list = qlen == 4 && memcmp(c->in->data, "list", 4) == 0;
++        g_byte_array_remove_range(c->in, 0, qlen + 1);
++        /*
++         * 没有宿主摄像头：list 回只含结尾 NUL 的空列表，相机 HAL 就不注册 QEMU 摄像头；
++         * 其余查询只会发给列表里的摄像头，一律 ko
++         */
++        if (is_list) {
++            rv_camera_reply(c, "ok:", 4);   /* 含结尾 NUL */
++        } else {
++            rv_camera_reply(c, "ko", 3);
++        }
++    }
++}
++
++/*
++ * ---- qemud:gps：GNSS HAL 在有应用请求定位时连上来，读 NMEA 语句（自己按 '$' 和换行切分）。
++ * 每秒推一组 $GPGGA（海拔、卫星数）+ $GPRMC（经纬度），位置固定为 gps 属性 ----
++ */
++
++typedef struct RvGps {
++    RvConn *conn;
++    QEMUTimer *timer;
++} RvGps;
++
++static void rv_nmea_send(RvConn *c, const char *body)
++{
++    uint8_t sum = 0;
++    for (const char *p = body; *p; p++) {
++        sum ^= (uint8_t)*p;
++    }
++    g_autofree char *line = g_strdup_printf("$%s*%02X\r\n", body, sum);
++    rv_send_data(c, (const uint8_t *)line, strlen(line));
++}
++
++/* 十进制度数 -> NMEA 的 "ddmm.mmmm,N"（经度是 dddmm.mmmm） */
++static char *rv_nmea_coord(double deg, int deg_digits, char pos, char neg)
++{
++    char hemi = deg < 0 ? neg : pos;
++    double a = fabs(deg);
++    int d = (int)a;
++    double m = MIN((a - d) * 60.0, 59.9999);
++    return g_strdup_printf("%0*d%07.4f,%c", deg_digits, d, m, hemi);
++}
++
++static void rv_gps_tick(void *opaque)
++{
++    RvGps *g = opaque;
++    RanchuVsock *s = g->conn->dev;
++    g_autoptr(GDateTime) now = g_date_time_new_now_utc();
++    int hms = g_date_time_get_hour(now) * 10000 + g_date_time_get_minute(now) * 100 +
++              g_date_time_get_second(now);
++    int dmy = g_date_time_get_day_of_month(now) * 10000 + g_date_time_get_month(now) * 100 +
++              g_date_time_get_year(now) % 100;
++    g_autofree char *lat = rv_nmea_coord(s->gps_lat, 2, 'N', 'S');
++    g_autofree char *lon = rv_nmea_coord(s->gps_lon, 3, 'E', 'W');
++    g_autofree char *gga = g_strdup_printf("GPGGA,%06d,%s,%s,1,8,0.9,%.1f,M,0.0,M,,",
++                                           hms, lat, lon, s->gps_alt);
++    g_autofree char *rmc = g_strdup_printf("GPRMC,%06d,A,%s,%s,0.0,0.0,%06d,0.0,E",
++                                           hms, lat, lon, dmy);
++    rv_nmea_send(g->conn, gga);     /* 先 GGA：HAL 记下海拔，随后的 RMC 定位会带上 */
++    rv_nmea_send(g->conn, rmc);
++    timer_mod(g->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
++}
++
++static void rv_gps_open(RvConn *c)
++{
++    RvGps *g = g_new0(RvGps, 1);
++    g->conn = c;
++    g->timer = timer_new_ms(QEMU_CLOCK_REALTIME, rv_gps_tick, g);
++    c->svc_priv = g;
++    timer_mod(g->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 200);
++}
++
++static void rv_gps_close(RvConn *c)
++{
++    RvGps *g = c->svc_priv;
++    timer_free(g->timer);
++    g_free(g);
++}
++
++/*
++ * ---- 宿主发起的 adb 客户端：请求 guest 正常关机 ----
++ * 模拟器镜像 ro.adb.secure=0，adbd 在 vsock:5555 上无需认证：CNXN 握手后 OPEN 一条关机的 shell 命令。
++ * 协议见 AOSP packages/modules/adb/protocol.txt：24 字节小端头
++ * {命令, arg0, arg1, 负载长度, 负载字节和, 命令 ^ 0xffffffff} + 负载。
++ */
++#define ADB_CNXN    0x4e584e43
++#define ADB_OPEN    0x4e45504f
++#define ADB_OKAY    0x59414b4f
++#define ADB_WRTE    0x45545257
++#define ADB_VERSION 0x01000001
++#define ADB_MAXDATA (256 * 1024)
++#define ADB_LOCAL_ID 1
++
++static void rv_adb_msg(RvConn *c, uint32_t cmd, uint32_t arg0, uint32_t arg1,
++                       const char *data, uint32_t len)
++{
++    uint8_t h[24];
++    uint32_t sum = 0;
++
++    for (uint32_t i = 0; i < len; i++) {
++        sum += (uint8_t)data[i];
++    }
++    stl_le_p(h, cmd);
++    stl_le_p(h + 4, arg0);
++    stl_le_p(h + 8, arg1);
++    stl_le_p(h + 12, len);
++    stl_le_p(h + 16, sum);
++    stl_le_p(h + 20, cmd ^ 0xffffffff);
++    rv_send_data(c, h, sizeof(h));
++    if (len) {
++        rv_send_data(c, (const uint8_t *)data, len);
++    }
++}
++
++/* vsock 连接建立（guest 回 RESPONSE）后调用 */
++static void rv_adbctl_open(RvConn *c)
++{
++    static const char banner[] = "host::";
++    rv_adb_msg(c, ADB_CNXN, ADB_VERSION, ADB_MAXDATA, banner, sizeof(banner));
++}
++
++static void rv_adbctl_recv(RvConn *c, const uint8_t *data, size_t len)
++{
++    g_byte_array_append(c->in, data, len);
++    while (c->in->len >= 24) {
++        uint32_t cmd = ldl_le_p(c->in->data);
++        uint32_t arg0 = ldl_le_p(c->in->data + 4);
++        uint32_t plen = ldl_le_p(c->in->data + 12);
++        if (plen > ADB_MAXDATA) {
++            g_byte_array_set_size(c->in, 0);
++            return;
++        }
++        if (c->in->len < 24 + plen) {
++            return;
++        }
++        g_byte_array_remove_range(c->in, 0, 24 + plen);
++        if (cmd == ADB_CNXN) {
++            /*
++             * svc power shutdown 走框架的 ShutdownThread（关机广播、AM/PM 收尾），与电源菜单的"关机"相同；
++             * 它在关机完成前不返回，失败（如 system_server 异常）时才退回 init 层的 reboot -p
++             */
++            static const char svc[] = "shell:svc power shutdown || reboot -p";
++            info_report("ranchu-vsock: 经 adbd 请求 guest 关机");
++            rv_adb_msg(c, ADB_OPEN, ADB_LOCAL_ID, 0, svc, sizeof(svc));
++        } else if (cmd == ADB_WRTE) {
++            rv_adb_msg(c, ADB_OKAY, ADB_LOCAL_ID, arg0, NULL, 0);    /* 命令输出，确认后丢弃 */
++        }
++    }
++}
++
++static const RvService rv_adbctl_service = { "（宿主 adb 客户端）", rv_adbctl_open, rv_adbctl_recv, NULL };
++
++static uint32_t rv_next_port(RanchuVsock *s)
++{
++    uint32_t port = s->next_local_port++;
++    if (s->next_local_port < 49152) {
++        s->next_local_port = 49152;
++    }
++    return port;
++}
++
++/* guest 开机完成后才有 adbd 可连；之前的关机请求交给板子的电源键 */
++static bool rv_poweroff_ready(RanchuVsock *s)
++{
++    return s->boot_completed && (VIRTIO_DEVICE(s)->status & VIRTIO_CONFIG_S_DRIVER_OK);
++}
++
++static void rv_powerdown_req(Notifier *n, void *opaque)
++{
++    RanchuVsock *s = container_of(n, RanchuVsock, powerdown);
++
++    if (!rv_poweroff_ready(s)) {
++        return;
++    }
++    RvConn *c = rv_conn_new(s, rv_next_port(s), RV_ADBD_PORT);
++    c->state = RV_CONNECTING;
++    c->svc = &rv_adbctl_service;
++    c->name_done = true;                /* 不是 guest 发起的服务连接，没有服务名 */
++    c->in = g_byte_array_new();
++    rv_send(c, VIRTIO_VSOCK_OP_REQUEST, 0);
++}
++
++static const RvService rv_services[] = {
++    { "pipe:qemud:sensors", rv_sensors_open, rv_sensors_recv, rv_sensors_close },
++    { "pipe:qemud:boot-properties", NULL, rv_bootprops_recv, NULL },
++    { "pipe:QemuMiscPipe", NULL, rv_misc_recv, NULL },
++    { "pipe:clipboard", rv_clip_open, rv_clip_recv, rv_clip_close },
++    { "pipe:qemud:camera", NULL, rv_camera_recv, NULL },
++    { "pipe:qemud:gps", rv_gps_open, NULL, rv_gps_close },
++    /* 指纹 HAL 发 "listen" 后只等 "on:<指纹 id>"/"off" 事件；没有指纹输入就一直不发 */
++    { "pipe:qemud:fingerprintlisten", NULL, NULL, NULL },
++};
++
++/* 未实现的服务：保持连接、丢弃数据（RST 会让 guest 端在 EOF 上空转，见文件头） */
++static const RvService rv_silent_service = { "", NULL, NULL, NULL };
++
++static void rv_service_dispatch(RvConn *c)
++{
++    c->svc = &rv_silent_service;
++    for (size_t i = 0; i < ARRAY_SIZE(rv_services); i++) {
++        if (strcmp(c->name, rv_services[i].name) == 0) {
++            c->svc = &rv_services[i];
++            break;
++        }
++    }
++    if (c->svc == &rv_silent_service) {
++        info_report("ranchu-vsock: 未实现的服务 \"%s\"，保持连接并丢弃数据", c->name);
++    }
++    c->in = g_byte_array_new();
++    if (c->svc->open) {
++        c->svc->open(c);
++    }
++}
++
++static void rv_service_recv(RvConn *c, const uint8_t *data, size_t len)
++{
++    while (len > 0 && !c->name_done) {
++        uint8_t ch = *data++;
++        len--;
++        if (ch == 0) {
++            c->name[c->name_len] = 0;
++            c->name_done = true;
++            rv_service_dispatch(c);
++        } else if (c->name_len < sizeof(c->name) - 1) {
++            c->name[c->name_len++] = ch;
++        }
++    }
++    if (len > 0 && c->svc && c->svc->recv) {
++        c->svc->recv(c, data, len);
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* 宿主 TCP 转发                                                        */
++/* ------------------------------------------------------------------ */
++
++static void rv_sock_update_handlers(RvConn *c)
++{
++    bool want_read = c->state == RV_CONNECTED && rv_peer_credit(c) > 0;
++    bool want_write = c->sock_out && c->sock_out->len > 0;
++    c->sock_reading = want_read;
++    qemu_set_fd_handler(c->sock, want_read ? rv_sock_readable : NULL,
++                        want_write ? rv_sock_writable : NULL, c);
++}
++
++static void rv_sock_readable(void *opaque)
++{
++    RvConn *c = opaque;
++    uint8_t buf[RV_MAX_PAYLOAD * 4];
++    uint32_t credit = rv_peer_credit(c);
++
++    if (credit == 0) {
++        rv_sock_update_handlers(c);
++        return;
++    }
++    ssize_t r = recv(c->sock, (char *)buf, MIN(sizeof(buf), credit), 0);
++    if (r > 0) {
++        rv_send_data(c, buf, r);
++        rv_sock_update_handlers(c);
++    } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
++        RV_DBG(c->dev, "宿主 socket 关闭（本端 %u，r=%zd）", c->local_port, r);
++        rv_conn_shutdown(c);
++    }
++}
++
++static void rv_sock_writable(void *opaque)
++{
++    RvConn *c = opaque;
++
++    while (c->sock_out && c->sock_out->len > 0) {
++        ssize_t r = send(c->sock, (const char *)c->sock_out->data, c->sock_out->len, 0);
++        if (r > 0) {
++            g_byte_array_remove_range(c->sock_out, 0, r);
++        } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
++            break;
++        } else {
++            rv_conn_shutdown(c);
++            return;
++        }
++    }
++    rv_sock_update_handlers(c);
++}
++
++static void rv_sock_deliver(RvConn *c, const uint8_t *data, size_t len)
++{
++    if (c->sock < 0) {
++        return;
++    }
++    if (!c->sock_out) {
++        c->sock_out = g_byte_array_new();
++    }
++    g_byte_array_append(c->sock_out, data, len);
++    rv_sock_writable(c);
++}
++
++static void rv_forward_accept(void *opaque)
++{
++    RvForward *f = opaque;
++    RanchuVsock *s = f->dev;
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    struct sockaddr_in sa;
++    socklen_t slen = sizeof(sa);
++    int fd = accept(f->listen_fd, (struct sockaddr *)&sa, &slen);
++
++    if (fd < 0) {
++        return;
++    }
++    if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
++        closesocket(fd);    /* guest 驱动还没起来 */
++        return;
++    }
++    qemu_set_blocking(fd, false, NULL);
++    RvConn *c = rv_conn_new(s, rv_next_port(s), f->guest_port);
++    c->sock = fd;
++    c->state = RV_CONNECTING;
++    RV_DBG(s, "宿主 %u 连入，向 guest:%u 发 REQUEST（本端 %u）", f->host_port, f->guest_port,
++           c->local_port);
++    rv_send(c, VIRTIO_VSOCK_OP_REQUEST, 0);
++}
++
++static void rv_forward_setup(RanchuVsock *s, Error **errp)
++{
++    if (!s->forward || !*s->forward) {
++        return;
++    }
++    g_auto(GStrv) items = g_strsplit(s->forward, ";", 0);
++    for (int i = 0; items[i]; i++) {
++        unsigned hp, gp;
++        if (sscanf(items[i], "%u:%u", &hp, &gp) != 2 || !hp || hp > 65535) {
++            error_setg(errp, "ranchu-vsock: forward 格式应为 <宿主端口>:<guest 端口>[;...]，得到 \"%s\"",
++                       items[i]);
++            return;
++        }
++        struct sockaddr_in sa = {
++            .sin_family = AF_INET,
++            .sin_port = htons(hp),
++            .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
++        };
++        int fd = qemu_socket(AF_INET, SOCK_STREAM, 0);
++        if (fd < 0 || bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 || listen(fd, 8) < 0) {
++            error_setg(errp, "ranchu-vsock: 无法监听 127.0.0.1:%u", hp);
++            if (fd >= 0) {
++                closesocket(fd);
++            }
++            return;
++        }
++        qemu_set_blocking(fd, false, NULL);
++        RvForward *f = g_new0(RvForward, 1);
++        f->dev = s;
++        f->listen_fd = fd;
++        f->host_port = hp;
++        f->guest_port = gp;
++        g_ptr_array_add(s->forwards, f);
++        qemu_set_fd_handler(fd, rv_forward_accept, NULL, f);
++        info_report("ranchu-vsock: 127.0.0.1:%u -> guest vsock:%u", hp, gp);
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* guest -> 宿主                                                        */
++/* ------------------------------------------------------------------ */
++
++static void rv_handle_packet(RanchuVsock *s, const struct virtio_vsock_hdr *h,
++                             const uint8_t *data)
++{
++    uint16_t op = le16_to_cpu(h->op);
++    uint32_t src_port = le32_to_cpu(h->src_port);
++    uint32_t dst_port = le32_to_cpu(h->dst_port);
++    uint32_t len = le32_to_cpu(h->len);
++
++    if (le64_to_cpu(h->dst_cid) != RV_HOST_CID ||
++        le16_to_cpu(h->type) != VIRTIO_VSOCK_TYPE_STREAM) {
++        if (op != VIRTIO_VSOCK_OP_RST) {
++            rv_queue_raw(s, dst_port, src_port, VIRTIO_VSOCK_OP_RST, 0, 0, NULL, 0);
++        }
++        return;
++    }
++
++    RvConn *c = rv_find(s, dst_port, src_port);
++    if (c) {
++        c->peer_buf_alloc = le32_to_cpu(h->buf_alloc);
++        c->peer_fwd_cnt = le32_to_cpu(h->fwd_cnt);
++    }
++    if (op != VIRTIO_VSOCK_OP_RW && op != VIRTIO_VSOCK_OP_CREDIT_UPDATE) {
++        RV_DBG(s, "guest op=%u %u->%u flags=%u conn=%p state=%d", op, src_port, dst_port,
++               le32_to_cpu(h->flags), c, c ? (int)c->state : -1);
++    }
++
++    switch (op) {
++    case VIRTIO_VSOCK_OP_REQUEST:
++        if (c || dst_port != RV_PIPE_PORT) {
++            rv_queue_raw(s, dst_port, src_port, VIRTIO_VSOCK_OP_RST, 0, 0, NULL, 0);
++            return;
++        }
++        c = rv_conn_new(s, dst_port, src_port);
++        c->peer_buf_alloc = le32_to_cpu(h->buf_alloc);
++        c->peer_fwd_cnt = le32_to_cpu(h->fwd_cnt);
++        c->state = RV_CONNECTED;
++        rv_send(c, VIRTIO_VSOCK_OP_RESPONSE, 0);
++        break;
++    case VIRTIO_VSOCK_OP_RESPONSE:
++        if (!c || c->state != RV_CONNECTING) {
++            rv_queue_raw(s, dst_port, src_port, VIRTIO_VSOCK_OP_RST, 0, 0, NULL, 0);
++            return;
++        }
++        c->state = RV_CONNECTED;
++        if (c->sock >= 0) {
++            rv_sock_update_handlers(c);
++        } else if (c->svc && c->svc->open) {
++            c->svc->open(c);                /* 宿主发起的内置客户端（如关机用的 adb 客户端） */
++        }
++        break;
++    case VIRTIO_VSOCK_OP_RW:
++        if (!c || c->state != RV_CONNECTED) {
++            if (!c) {
++                rv_queue_raw(s, dst_port, src_port, VIRTIO_VSOCK_OP_RST, 0, 0, NULL, 0);
++            }
++            return;
++        }
++        c->fwd_cnt += len;
++        if (c->sock >= 0) {
++            rv_sock_deliver(c, data, len);
++        } else {
++            rv_service_recv(c, data, len);
++        }
++        if (c && c->fwd_cnt - c->credit_sent_fwd > RV_BUF_ALLOC / 4) {
++            rv_send(c, VIRTIO_VSOCK_OP_CREDIT_UPDATE, 0);
++        }
++        break;
++    case VIRTIO_VSOCK_OP_CREDIT_UPDATE:
++        if (c && c->sock >= 0 && c->state == RV_CONNECTED) {
++            rv_sock_update_handlers(c);
++        }
++        break;
++    case VIRTIO_VSOCK_OP_CREDIT_REQUEST:
++        if (c) {
++            rv_send(c, VIRTIO_VSOCK_OP_CREDIT_UPDATE, 0);
++        }
++        break;
++    case VIRTIO_VSOCK_OP_SHUTDOWN:
++        if (c) {
++            rv_send(c, VIRTIO_VSOCK_OP_RST, 0);
++            rv_conn_free(c);
++        }
++        break;
++    case VIRTIO_VSOCK_OP_RST:
++        if (c) {
++            rv_conn_free(c);
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static void rv_handle_tx(VirtIODevice *vdev, VirtQueue *vq)
++{
++    RanchuVsock *s = RANCHU_VSOCK(vdev);
++    VirtQueueElement *elem;
++
++    while ((elem = virtqueue_pop(vq, sizeof(VirtQueueElement)))) {
++        struct virtio_vsock_hdr h;
++        size_t total = iov_size(elem->out_sg, elem->out_num);
++        if (total >= sizeof(h)) {
++            iov_to_buf(elem->out_sg, elem->out_num, 0, &h, sizeof(h));
++            uint32_t len = le32_to_cpu(h.len);
++            if (len <= total - sizeof(h) && len <= 64 * 1024) {
++                g_autofree uint8_t *data = len ? g_malloc(len) : NULL;
++                if (len) {
++                    iov_to_buf(elem->out_sg, elem->out_num, sizeof(h), data, len);
++                }
++                rv_handle_packet(s, &h, data);
++            }
++        }
++        virtqueue_push(vq, elem, 0);
++        g_free(elem);
++    }
++    virtio_notify(vdev, vq);
++    rv_flush_rx(s);
++}
++
++static void rv_handle_rx(VirtIODevice *vdev, VirtQueue *vq)
++{
++    rv_flush_rx(RANCHU_VSOCK(vdev));
++}
++
++static void rv_handle_evt(VirtIODevice *vdev, VirtQueue *vq)
++{
++}
++
++/* ------------------------------------------------------------------ */
++/* 设备                                                                */
++/* ------------------------------------------------------------------ */
++
++static void rv_drop_all(RanchuVsock *s)
++{
++    while (!QTAILQ_EMPTY(&s->conns)) {
++        rv_conn_free(QTAILQ_FIRST(&s->conns));
++    }
++    while (!QSIMPLEQ_EMPTY(&s->rxq)) {
++        RvPkt *p = QSIMPLEQ_FIRST(&s->rxq);
++        QSIMPLEQ_REMOVE_HEAD(&s->rxq, next);
++        g_free(p->data);
++        g_free(p);
++    }
++}
++
++static void rv_get_config(VirtIODevice *vdev, uint8_t *config)
++{
++    RanchuVsock *s = RANCHU_VSOCK(vdev);
++    struct virtio_vsock_config cfg = {};
++
++    cfg.guest_cid = cpu_to_le64(s->guest_cid);
++    memcpy(config, &cfg, sizeof(cfg));
++}
++
++static uint64_t rv_get_features(VirtIODevice *vdev, uint64_t f, Error **errp)
++{
++    return f;
++}
++
++static int rv_set_status(VirtIODevice *vdev, uint8_t status)
++{
++    RanchuVsock *s = RANCHU_VSOCK(vdev);
++
++    if (status & VIRTIO_CONFIG_S_DRIVER_OK) {
++        rv_flush_rx(s);
++    }
++    return 0;
++}
++
++static void rv_reset(VirtIODevice *vdev)
++{
++    RanchuVsock *s = RANCHU_VSOCK(vdev);
++
++    rv_drop_all(s);
++    s->boot_completed = false;
++}
++
++static void rv_realize(DeviceState *dev, Error **errp)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++    RanchuVsock *s = RANCHU_VSOCK(dev);
++
++    if (s->guest_cid <= 2 || s->guest_cid >= UINT32_MAX) {
++        error_setg(errp, "ranchu-vsock: guest-cid 必须 > 2");
++        return;
++    }
++    QTAILQ_INIT(&s->conns);
++    QSIMPLEQ_INIT(&s->rxq);
++    s->forwards = g_ptr_array_new_with_free_func(g_free);
++    s->next_local_port = 49152;
++
++    virtio_init(vdev, VIRTIO_ID_VSOCK, sizeof(struct virtio_vsock_config));
++    s->rx_vq = virtio_add_queue(vdev, RV_QUEUE_SIZE, rv_handle_rx);
++    s->tx_vq = virtio_add_queue(vdev, RV_QUEUE_SIZE, rv_handle_tx);
++    s->evt_vq = virtio_add_queue(vdev, 16, rv_handle_evt);
++
++    s->adb_reg_timer = timer_new_ms(QEMU_CLOCK_REALTIME, rv_adb_reg_timer_cb, s);
++    s->powerdown.notify = rv_powerdown_req;
++    qemu_register_powerdown_notifier(&s->powerdown);
++    rv_clip_init(s);
++    rv_forward_setup(s, errp);
++}
++
++static void rv_unrealize(DeviceState *dev)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++    RanchuVsock *s = RANCHU_VSOCK(dev);
++
++    rv_drop_all(s);
++    notifier_remove(&s->powerdown);
++    for (guint i = 0; i < s->forwards->len; i++) {
++        RvForward *f = g_ptr_array_index(s->forwards, i);
++        qemu_set_fd_handler(f->listen_fd, NULL, NULL, NULL);
++        closesocket(f->listen_fd);
++    }
++    g_ptr_array_free(s->forwards, true);
++    virtio_delete_queue(s->rx_vq);
++    virtio_delete_queue(s->tx_vq);
++    virtio_delete_queue(s->evt_vq);
++    virtio_cleanup(vdev);
++}
++
++static const Property rv_properties[] = {
++    DEFINE_PROP_UINT64("guest-cid", RanchuVsock, guest_cid, 3),
++    DEFINE_PROP_STRING("forward", RanchuVsock, forward),
++    DEFINE_PROP_STRING("boot-props", RanchuVsock, boot_props),
++    DEFINE_PROP_BOOL("debug", RanchuVsock, debug, false),
++};
++
++/*
++ * gps 属性 "纬度;经度[;海拔米]"：不是 qdev 静态属性，运行中也能改
++ * （QMP qom-set <设备路径> gps "31.23;121.47"），下一秒的 NMEA 就用新位置。
++ */
++static char *rv_get_gps(Object *obj, Error **errp)
++{
++    RanchuVsock *s = RANCHU_VSOCK(obj);
++    char lat[G_ASCII_DTOSTR_BUF_SIZE], lon[G_ASCII_DTOSTR_BUF_SIZE];
++    char alt[G_ASCII_DTOSTR_BUF_SIZE];
++
++    return g_strdup_printf("%s;%s;%s", g_ascii_dtostr(lat, sizeof(lat), s->gps_lat),
++                           g_ascii_dtostr(lon, sizeof(lon), s->gps_lon),
++                           g_ascii_dtostr(alt, sizeof(alt), s->gps_alt));
++}
++
++static void rv_set_gps(Object *obj, const char *value, Error **errp)
++{
++    RanchuVsock *s = RANCHU_VSOCK(obj);
++    g_auto(GStrv) v = g_strsplit(value, ";", 0);
++    guint n = g_strv_length(v);
++    char *e1 = NULL, *e2 = NULL, *e3 = NULL;
++    double lat = n >= 2 ? g_ascii_strtod(v[0], &e1) : NAN;
++    double lon = n >= 2 ? g_ascii_strtod(v[1], &e2) : NAN;
++    double alt = n >= 3 ? g_ascii_strtod(v[2], &e3) : s->gps_alt;
++
++    if (n < 2 || n > 3 || *e1 || *e2 || (e3 && *e3) ||
++        !(fabs(lat) <= 90) || !(fabs(lon) <= 180) || !isfinite(alt)) {
++        error_setg(errp, "ranchu-vsock: gps 格式应为 <纬度>;<经度>[;<海拔米>]，得到 \"%s\"", value);
++        return;
++    }
++    s->gps_lat = lat;
++    s->gps_lon = lon;
++    s->gps_alt = alt;
++}
++
++/* 只读：此时 system_powerdown 会由本设备经 adbd 正常关机（板子不必再按电源键，UI 关窗也可等 guest 关机） */
++static bool rv_get_poweroff_ready(Object *obj, Error **errp)
++{
++    return rv_poweroff_ready(RANCHU_VSOCK(obj));
++}
++
++static void rv_instance_init(Object *obj)
++{
++    RanchuVsock *s = RANCHU_VSOCK(obj);
++
++    /* 默认位置与官方模拟器相同（Google 总部） */
++    s->gps_lat = 37.4220;
++    s->gps_lon = -122.0841;
++    s->gps_alt = 5.0;
++}
++
++static void rv_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
++
++    device_class_set_props(dc, rv_properties);
++    object_class_property_add_str(klass, "gps", rv_get_gps, rv_set_gps);
++    object_class_property_set_description(klass, "gps", "固定 GPS 位置：纬度;经度[;海拔米]");
++    object_class_property_add_bool(klass, "poweroff-ready", rv_get_poweroff_ready, NULL);
++    object_class_property_set_description(klass, "poweroff-ready",
++                                          "guest 已开机完成，system_powerdown 会经 adbd 正常关机");
++    dc->desc = "RanchuWoA userspace virtio-vsock (qemud services + TCP forward)";
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++    vdc->realize = rv_realize;
++    vdc->unrealize = rv_unrealize;
++    vdc->get_config = rv_get_config;
++    vdc->get_features = rv_get_features;
++    vdc->set_status = rv_set_status;
++    vdc->reset = rv_reset;
++}
++
++static const TypeInfo rv_info = {
++    .name = TYPE_RANCHU_VSOCK,
++    .parent = TYPE_VIRTIO_DEVICE,
++    .instance_size = sizeof(RanchuVsock),
++    .instance_init = rv_instance_init,
++    .class_init = rv_class_init,
++};
++
++static void rv_register_types(void)
++{
++    type_register_static(&rv_info);
++}
++
++type_init(rv_register_types)
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -1,5 +1,14 @@
+ arm_common_ss = ss.source_set()
+ arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('virt.c'))
++# RanchuWoA: goldfish 设备（源码位于 hw/android/）
++arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files(
++  '../android/goldfish-pipe.c',
++  '../android/goldfish-battery.c',
++  '../android/goldfish-address-space.c',
++  '../android/goldfish-sync.c',
++  '../android/ranchu-sensors.c',
++  '../android/ranchu-vsock.c',
++))
+ arm_common_ss.add(when: 'CONFIG_ACPI', if_true: files('virt-acpi-build.c'))
+ arm_common_ss.add(when: 'CONFIG_DIGIC', if_true: files('digic_boards.c'))
+ arm_common_ss.add(when: 'CONFIG_EMCRAFT_SF2', if_true: files('msf2-som.c'))
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -70,6 +70,7 @@
+ #include "hw/intc/arm_gicv3_its_common.h"
+ #include "hw/intc/arm_gicv5_common.h"
+ #include "hw/core/irq.h"
++#include "system/block-backend-global-state.h"
+ #include "kvm_arm.h"
+ #include "whpx_arm.h"
+ #include "hw/firmware/smbios.h"
+@@ -428,6 +429,60 @@
+         create_randomness(ms, "/chosen");
+     }
+ 
++    /* RanchuWoA: Android 固件节点 + goldfish 设备节点 */
++    if (vms->ranchu_devices) {
++        qemu_fdt_add_subnode(fdt, "/firmware");
++        qemu_fdt_add_subnode(fdt, "/firmware/android");
++        qemu_fdt_setprop_string(fdt, "/firmware/android", "compatible",
++                                "android,firmware");
++        qemu_fdt_setprop_string(fdt, "/firmware/android", "hardware",
++                                "ranchu");
++
++        /* goldfish pipe @ 0xa010000, IRQ SPI 78 (LEVEL_HIGH) */
++        qemu_fdt_add_subnode(fdt, "/goldfish_pipe@a010000");
++        {
++            const char compat[] = "google,android-pipe\0generic,android-pipe";
++            qemu_fdt_setprop(fdt, "/goldfish_pipe@a010000", "compatible",
++                             compat, sizeof(compat));
++        }
++        qemu_fdt_setprop_sized_cells(fdt, "/goldfish_pipe@a010000", "reg",
++                                     2, 0xa010000ULL, 2, 0x2000ULL);
++        qemu_fdt_setprop_cells(fdt, "/goldfish_pipe@a010000", "interrupts",
++                               gic_fdt_irq_type_spi(vms), 78,
++                               GIC_FDT_IRQ_FLAGS_LEVEL_HI);
++
++        /* goldfish sync @ 0xa020000, IRQ SPI 81 (LEVEL_HIGH) */
++        qemu_fdt_add_subnode(fdt, "/goldfish_sync@a020000");
++        {
++            const char sync_compat[] =
++                "google,goldfish-sync\0generic,goldfish-sync";
++            qemu_fdt_setprop(fdt, "/goldfish_sync@a020000", "compatible",
++                             sync_compat, sizeof(sync_compat));
++        }
++        qemu_fdt_setprop_sized_cells(fdt, "/goldfish_sync@a020000", "reg",
++                                     2, 0xa020000ULL, 2, 0x2000ULL);
++        qemu_fdt_setprop_cells(fdt, "/goldfish_sync@a020000", "interrupts",
++                               gic_fdt_irq_type_spi(vms), 81,
++                               GIC_FDT_IRQ_FLAGS_LEVEL_HI);
++
++        /*
++         * goldfish battery @ 0xa040000, IRQ SPI 79 (LEVEL_HIGH)。地址与官方 A15 模拟器相同：
++         * vendor sepolicy 按 /devices/platform/a040000.goldfish_battery/... 给唤醒源节点打标签
++         */
++        qemu_fdt_add_subnode(fdt, "/goldfish_battery@a040000");
++        {
++            const char compat[] =
++                "google,goldfish-battery\0generic,goldfish-battery";
++            qemu_fdt_setprop(fdt, "/goldfish_battery@a040000", "compatible",
++                             compat, sizeof(compat));
++        }
++        qemu_fdt_setprop_sized_cells(fdt, "/goldfish_battery@a040000", "reg",
++                                     2, 0xa040000ULL, 2, 0x1000ULL);
++        qemu_fdt_setprop_cells(fdt, "/goldfish_battery@a040000", "interrupts",
++                               gic_fdt_irq_type_spi(vms), 79,
++                               GIC_FDT_IRQ_FLAGS_LEVEL_HI);
++    }
++
+     if (vms->secure) {
+         qemu_fdt_add_subnode(fdt, "/secure-chosen");
+         if (vms->dtb_randomness) {
+@@ -1581,6 +1636,17 @@
+ {
+     VirtMachineState *s = container_of(n, VirtMachineState, powerdown_notifier);
+ 
++    /*
++     * RanchuWoA: Android 把电源键短按当锁屏。guest 开机完成后 ranchu-vsock-device 会自己
++     * 经 adbd 请求正常关机（它也注册了 powerdown 通知），这时不再按电源键。
++     */
++    if (s->ranchu_devices) {
++        Object *rv = object_resolve_path_type("", "ranchu-vsock-device", NULL);
++        if (rv && object_property_get_bool(rv, "poweroff-ready", NULL)) {
++            return;
++        }
++    }
++
+     if (s->acpi_dev) {
+         acpi_send_event(s->acpi_dev, ACPI_POWER_DOWN_STATUS);
+     } else {
+@@ -1709,7 +1775,7 @@
+     }
+ }
+ 
+-static void create_virtio_devices(const VirtMachineState *vms)
++static void create_virtio_devices(VirtMachineState *vms)
+ {
+     int i;
+     hwaddr size = vms->memmap[VIRT_MMIO].size;
+@@ -1746,7 +1812,7 @@
+         int irq = vms->irqmap[VIRT_MMIO] + i;
+         hwaddr base = vms->memmap[VIRT_MMIO].base + i * size;
+ 
+-        sysbus_create_simple("virtio-mmio", base,
++        vms->mmio_transports[i] = sysbus_create_simple("virtio-mmio", base,
+                              qdev_get_gpio_in(vms->gic, irq));
+     }
+ 
+@@ -3234,6 +3300,50 @@
+      */
+     create_virtio_devices(vms);
+ 
++    /* RanchuWoA: goldfish 设备（地址/IRQ 与 create_fdt 注入的节点一致） */
++    if (vms->ranchu_devices) {
++        sysbus_create_simple("goldfish-pipe", 0xa010000ULL,
++                             qdev_get_gpio_in(vms->gic, 78));
++        sysbus_create_simple("goldfish-battery", 0xa040000ULL,
++                             qdev_get_gpio_in(vms->gic, 79));
++        sysbus_create_simple("goldfish-sync", 0xa020000ULL,
++                             qdev_get_gpio_in(vms->gic, 81));
++
++        /*
++         * 钉盘：把 -drive if=none,id=... 的盘按 ranchu 约定固定到
++         * virtio-mmio 槽位（slot29=system/vda, 30=metadata/vdb, 31=data/vdc）。
++         * 通过显式 realize 到指定 transport 的总线，绕开 CLI -device
++         * 顺序与 qbus 分配的倒序问题。
++         */
++        static const struct { const char *prop; int slot; } ranchu_disks[] = {
++            { "ranchu-system-disk",   29 },   /* vda: vbmeta+super(GPT名扫描) */
++            { "ranchu-metadata-disk", 30 },   /* vdb: by-name metadata @a003c00 */
++            { "ranchu-data-disk",     31 },   /* vdc: 裸 ext4, vendor fstab 期望 vdc */
++        };
++        for (size_t i = 0; i < ARRAY_SIZE(ranchu_disks); i++) {
++            const char *drive_name = vms->ranchu_disk_names[i];
++            if (!drive_name || !drive_name[0]) {
++                continue;
++            }
++            BlockBackend *blk = blk_by_name(drive_name);
++            if (!blk) {
++                error_report("ranchu: drive '%s' 不存在 (属性 %s)",
++                             drive_name, ranchu_disks[i].prop);
++                exit(1);
++            }
++            DeviceState *t = vms->mmio_transports[ranchu_disks[i].slot];
++            if (!t) {
++                error_report("ranchu: slot %d transport 未创建",
++                             ranchu_disks[i].slot);
++                exit(1);
++            }
++            BusState *vbus = QLIST_FIRST(&t->child_bus);
++            DeviceState *vd = qdev_new("virtio-blk-device");
++            qdev_prop_set_drive_err(vd, "drive", blk, &error_abort);
++            qdev_realize_and_unref(vd, vbus, &error_abort);
++        }
++    }
++
+     vms->fw_cfg = create_fw_cfg(vms, &address_space_memory);
+     rom_set_fw(vms->fw_cfg);
+ 
+@@ -3278,6 +3388,49 @@
+     vms->secure = value;
+ }
+ 
++/* RanchuWoA: -M virt,ranchu-devices=on */
++static bool virt_get_ranchu(Object *obj, Error **errp)
++{
++    VirtMachineState *vms = VIRT_MACHINE(obj);
++
++    return vms->ranchu_devices;
++}
++static void virt_set_ranchu(Object *obj, bool value, Error **errp)
++{
++    VirtMachineState *vms = VIRT_MACHINE(obj);
++
++    vms->ranchu_devices = value;
++}
++
++/* RanchuWoA: 三个钉槽磁盘属性（idx 0=system 1=metadata 2=data） */
++static void ranchu_disk_prop_set(Object *obj, const char *value, Error **errp,
++                                 int idx)
++{
++    VirtMachineState *vms = VIRT_MACHINE(obj);
++    g_free(vms->ranchu_disk_names[idx]);
++    vms->ranchu_disk_names[idx] = g_strdup(value);
++}
++
++static char *ranchu_disk_prop_get(Object *obj, Error **errp, int idx)
++{
++    VirtMachineState *vms = VIRT_MACHINE(obj);
++    return g_strdup(vms->ranchu_disk_names[idx] ?: "");
++}
++
++#define RANCHU_DISK_PROP(N, IDX)                                     \
++static char *virt_get_ranchu_d##N(Object *obj, Error **errp)         \
++{                                                                    \
++    return ranchu_disk_prop_get(obj, errp, IDX);                     \
++}                                                                    \
++static void virt_set_ranchu_d##N(Object *obj, const char *v, Error **errp) \
++{                                                                    \
++    ranchu_disk_prop_set(obj, v, errp, IDX);                         \
++}
++
++RANCHU_DISK_PROP(0, 0)   /* ranchu-system-disk */
++RANCHU_DISK_PROP(1, 1)   /* ranchu-metadata-disk */
++RANCHU_DISK_PROP(2, 2)   /* ranchu-data-disk */
++
+ static bool virt_get_virt(Object *obj, Error **errp)
+ {
+     VirtMachineState *vms = VIRT_MACHINE(obj);
+@@ -4226,6 +4379,26 @@
+                                           "guest CPU which implements the ARM "
+                                           "Virtualization Extensions");
+ 
++    /* RanchuWoA: -M virt,ranchu-devices=on */
++    object_class_property_add_bool(oc, "ranchu-devices", virt_get_ranchu,
++                                   virt_set_ranchu);
++    object_class_property_set_description(oc, "ranchu-devices",
++                                          "RanchuWoA: attach goldfish pipe/"
++                                          "battery devices and Android FDT nodes");
++
++    object_class_property_add_str(oc, "ranchu-system-disk",
++                                  virt_get_ranchu_d0, virt_set_ranchu_d0);
++    object_class_property_set_description(oc, "ranchu-system-disk",
++                                          "RanchuWoA: -drive id pinned to virtio slot 29 (vda, system.img)");
++    object_class_property_add_str(oc, "ranchu-metadata-disk",
++                                  virt_get_ranchu_d1, virt_set_ranchu_d1);
++    object_class_property_set_description(oc, "ranchu-metadata-disk",
++                                          "RanchuWoA: -drive id pinned to virtio slot 30 (by-name metadata)");
++    object_class_property_add_str(oc, "ranchu-data-disk",
++                                  virt_get_ranchu_d2, virt_set_ranchu_d2);
++    object_class_property_set_description(oc, "ranchu-data-disk",
++                                          "RanchuWoA: -drive id pinned to virtio slot 31 (vdc, /data)");
++
+     object_class_property_add_bool(oc, "highmem", virt_get_highmem,
+                                    virt_set_highmem);
+     object_class_property_set_description(oc, "highmem",
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -586,6 +586,26 @@
+         return;
+     }
+ 
++    /*
++     * RanchuWoA: Android 的 gralloc 用 VIRTGPU_RESOURCE_CREATE 建 2D 资源，CPU（SwiftShader）
++     * 直接写 guest backing；guest 内核只对 dumb BO 在 plane 更新时发 TRANSFER_TO_HOST_2D，
++     * 其余只发 RESOURCE_FLUSH。这里把 flush 视为 backing 已更新：先把该矩形拷进宿主图像。
++     * 对 dumb BO 只是多一次同内容拷贝。
++     */
++    if (g->ranchu_coherent_flush && !res->blob && res->iov && res->image &&
++        rf.r.width && rf.r.height) {
++        pixman_format_code_t format = pixman_image_get_format(res->image);
++        int bpp = DIV_ROUND_UP(PIXMAN_FORMAT_BPP(format), 8);
++        uint32_t stride = pixman_image_get_stride(res->image);
++        uint8_t *img_data = (uint8_t *)pixman_image_get_data(res->image);
++
++        for (i = 0; i < rf.r.height; i++) {
++            size_t off = (size_t)(rf.r.y + i) * stride + (size_t)rf.r.x * bpp;
++            iov_to_buf(res->iov, res->iov_cnt, off, img_data + off,
++                       (size_t)rf.r.width * bpp);
++        }
++    }
++
+     qemu_rect_init(&flush_rect, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+     for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
+         QemuRect rect;
+@@ -1854,6 +1874,7 @@
+                     VIRTIO_GPU_FLAG_BLOB_ENABLED, false),
+     DEFINE_PROP_SIZE("hostmem", VirtIOGPU, parent_obj.conf.hostmem, 0),
+     DEFINE_PROP_UINT8("x-scanout-vmstate-version", VirtIOGPU, scanout_vmstate_version, 2),
++    DEFINE_PROP_BOOL("ranchu-coherent-flush", VirtIOGPU, ranchu_coherent_flush, true),
+ };
+ 
+ static void virtio_gpu_class_init(ObjectClass *klass, const void *data)
+--- a/hw/input/virtio-input-hid.c
++++ b/hw/input/virtio-input-hid.c
+@@ -22,6 +22,7 @@
+ #define VIRTIO_ID_NAME_MOUSE        "QEMU Virtio Mouse"
+ #define VIRTIO_ID_NAME_TABLET       "QEMU Virtio Tablet"
+ #define VIRTIO_ID_NAME_MULTITOUCH   "QEMU Virtio MultiTouch"
++#define VIRTIO_ID_NAME_TOUCHSCREEN  "RanchuWoA Touchscreen"
+ 
+ /* ----------------------------------------------------------------- */
+ 
+@@ -531,6 +532,159 @@
+ 
+ /* ----------------------------------------------------------------- */
+ 
++/*
++ * RanchuWoA: virtio-touchscreen —— 把宿主窗口的绝对坐标鼠标变成 Android 触摸屏。
++ * Android EventHub 只把带 BTN_TOUCH + ABS_X/Y 的设备归为单点触摸，带 INPUT_PROP_DIRECT
++ * 的才算触摸屏（而不是触控板）；virtio-tablet 报的是 BTN_LEFT，会被 Android 忽略。
++ * 左键 = 触摸；右键/侧键后退 = BACK；中键 = HOME；侧键前进 = 最近任务（KEY_APPSELECT）。未按下时不上报坐标（避免 hover 事件），
++ * 按下瞬间补发最近一次坐标，不依赖 UI 送事件的先后顺序。
++ */
++static void virtio_touchscreen_send_pos(VirtIOInput *vinput, VirtIOInputHID *vhid)
++{
++    virtio_input_event event;
++
++    event.type  = cpu_to_le16(EV_ABS);
++    event.code  = cpu_to_le16(ABS_X);
++    event.value = cpu_to_le32(vhid->touch_x);
++    virtio_input_send(vinput, &event);
++    event.code  = cpu_to_le16(ABS_Y);
++    event.value = cpu_to_le32(vhid->touch_y);
++    virtio_input_send(vinput, &event);
++}
++
++static void virtio_touchscreen_handle_event(DeviceState *dev, QemuConsole *src,
++                                            QemuInputEvent *evt)
++{
++    VirtIOInput *vinput = VIRTIO_INPUT(dev);
++    VirtIOInputHID *vhid = VIRTIO_INPUT_HID(dev);
++    virtio_input_event event;
++
++    switch (evt->type) {
++    case INPUT_EVENT_KIND_ABS:
++        if (evt->abs.axis == INPUT_AXIS_X) {
++            vhid->touch_x = evt->abs.value;
++        } else if (evt->abs.axis == INPUT_AXIS_Y) {
++            vhid->touch_y = evt->abs.value;
++        } else {
++            break;
++        }
++        if (vhid->touch_down) {
++            event.type  = cpu_to_le16(EV_ABS);
++            event.code  = cpu_to_le16(axismap_abs[evt->abs.axis]);
++            event.value = cpu_to_le32(evt->abs.value);
++            virtio_input_send(vinput, &event);
++        }
++        break;
++    case INPUT_EVENT_KIND_BTN:
++        event.type  = cpu_to_le16(EV_KEY);
++        event.value = cpu_to_le32(evt->btn.down ? 1 : 0);
++        switch (evt->btn.button) {
++        case INPUT_BUTTON_LEFT:
++        case INPUT_BUTTON_TOUCH:
++            if (evt->btn.down == vhid->touch_down) {
++                break;
++            }
++            vhid->touch_down = evt->btn.down;
++            event.code = cpu_to_le16(BTN_TOUCH);
++            virtio_input_send(vinput, &event);
++            if (vhid->touch_down) {
++                virtio_touchscreen_send_pos(vinput, vhid);
++            }
++            break;
++        case INPUT_BUTTON_RIGHT:
++        case INPUT_BUTTON_SIDE:         /* 鼠标侧键"后退"（X1） */
++            event.code = cpu_to_le16(KEY_BACK);
++            virtio_input_send(vinput, &event);
++            break;
++        case INPUT_BUTTON_MIDDLE:
++            event.code = cpu_to_le16(KEY_HOMEPAGE);
++            virtio_input_send(vinput, &event);
++            break;
++        case INPUT_BUTTON_EXTRA:        /* 鼠标侧键"前进"（X2）= 最近任务；工具栏也经 QMP 用它 */
++            event.code = cpu_to_le16(KEY_APPSELECT);
++            virtio_input_send(vinput, &event);
++            break;
++        default:
++            break;
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static const QemuInputHandler virtio_touchscreen_handler = {
++    .name  = VIRTIO_ID_NAME_TOUCHSCREEN,
++    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
++    .event = virtio_touchscreen_handle_event,
++    .sync  = virtio_input_handle_sync,
++};
++
++static struct virtio_input_config virtio_touchscreen_config[] = {
++    {
++        .select    = VIRTIO_INPUT_CFG_ID_NAME,
++        .size      = sizeof(VIRTIO_ID_NAME_TOUCHSCREEN),
++        .u.string  = VIRTIO_ID_NAME_TOUCHSCREEN,
++    },{
++        .select    = VIRTIO_INPUT_CFG_ID_DEVIDS,
++        .size      = sizeof(struct virtio_input_devids),
++        .u.ids     = {
++            .bustype = const_le16(BUS_VIRTUAL),
++            .vendor  = const_le16(0x0627),
++            .product = const_le16(0x0004),
++            .version = const_le16(0x0001),
++        },
++    },{
++        .select    = VIRTIO_INPUT_CFG_EV_BITS,
++        .subsel    = EV_ABS,
++        .size      = 1,
++        .u.bitmap  = {
++            (1 << ABS_X) | (1 << ABS_Y),
++        },
++    },{
++        .select    = VIRTIO_INPUT_CFG_ABS_INFO,
++        .subsel    = ABS_X,
++        .size      = sizeof(virtio_input_absinfo),
++        .u.abs.min = const_le32(INPUT_EVENT_ABS_MIN),
++        .u.abs.max = const_le32(INPUT_EVENT_ABS_MAX),
++    },{
++        .select    = VIRTIO_INPUT_CFG_ABS_INFO,
++        .subsel    = ABS_Y,
++        .size      = sizeof(virtio_input_absinfo),
++        .u.abs.min = const_le32(INPUT_EVENT_ABS_MIN),
++        .u.abs.max = const_le32(INPUT_EVENT_ABS_MAX),
++    },
++    { /* end of list */ },
++};
++
++static void virtio_touchscreen_init(Object *obj)
++{
++    VirtIOInputHID *vhid = VIRTIO_INPUT_HID(obj);
++    VirtIOInput *vinput = VIRTIO_INPUT(obj);
++    static const unsigned short props[] = {
++        INPUT_PROP_DIRECT,
++    };
++    static const unsigned short keys[] = {
++        BTN_TOUCH, KEY_BACK, KEY_HOMEPAGE, KEY_APPSELECT,
++    };
++
++    vhid->handler = &virtio_touchscreen_handler;
++    virtio_input_init_config(vinput, virtio_touchscreen_config);
++    virtio_input_extend_config(vinput, keys, ARRAY_SIZE(keys),
++                               VIRTIO_INPUT_CFG_EV_BITS, EV_KEY);
++    virtio_input_extend_config(vinput, props, ARRAY_SIZE(props),
++                               VIRTIO_INPUT_CFG_PROP_BITS, 0);
++}
++
++static const TypeInfo virtio_touchscreen_info = {
++    .name          = TYPE_VIRTIO_TOUCHSCREEN,
++    .parent        = TYPE_VIRTIO_INPUT_HID,
++    .instance_size = sizeof(VirtIOInputHID),
++    .instance_init = virtio_touchscreen_init,
++};
++
++/* ----------------------------------------------------------------- */
++
+ static void virtio_register_types(void)
+ {
+     type_register_static(&virtio_input_hid_info);
+@@ -538,6 +692,7 @@
+     type_register_static(&virtio_mouse_info);
+     type_register_static(&virtio_tablet_info);
+     type_register_static(&virtio_multitouch_info);
++    type_register_static(&virtio_touchscreen_info);
+ }
+ 
+ type_init(virtio_register_types)
+--- a/hw/virtio/virtio-input-pci.c
++++ b/hw/virtio/virtio-input-pci.c
+@@ -30,6 +30,7 @@
+ #define TYPE_VIRTIO_MOUSE_PCI      "virtio-mouse-pci"
+ #define TYPE_VIRTIO_TABLET_PCI     "virtio-tablet-pci"
+ #define TYPE_VIRTIO_MULTITOUCH_PCI "virtio-multitouch-pci"
++#define TYPE_VIRTIO_TOUCHSCREEN_PCI "virtio-touchscreen-pci"   /* RanchuWoA */
+ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOInputHIDPCI, VIRTIO_INPUT_HID_PCI)
+ 
+ struct VirtIOInputHIDPCI {
+@@ -111,6 +112,14 @@
+                                 TYPE_VIRTIO_MULTITOUCH);
+ }
+ 
++static void virtio_touchscreen_initfn(Object *obj)
++{
++    VirtIOInputHIDPCI *dev = VIRTIO_INPUT_HID_PCI(obj);
++
++    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
++                                TYPE_VIRTIO_TOUCHSCREEN);
++}
++
+ static const TypeInfo virtio_input_pci_info = {
+     .name          = TYPE_VIRTIO_INPUT_PCI,
+     .parent        = TYPE_VIRTIO_PCI,
+@@ -156,6 +165,13 @@
+     .instance_init = virtio_multitouch_initfn,
+ };
+ 
++static const VirtioPCIDeviceTypeInfo virtio_touchscreen_pci_info = {
++    .generic_name  = TYPE_VIRTIO_TOUCHSCREEN_PCI,
++    .parent        = TYPE_VIRTIO_INPUT_HID_PCI,
++    .instance_size = sizeof(VirtIOInputHIDPCI),
++    .instance_init = virtio_touchscreen_initfn,
++};
++
+ static void virtio_pci_input_register(void)
+ {
+     /* Base types: */
+@@ -167,6 +183,7 @@
+     virtio_pci_types_register(&virtio_mouse_pci_info);
+     virtio_pci_types_register(&virtio_tablet_pci_info);
+     virtio_pci_types_register(&virtio_multitouch_pci_info);
++    virtio_pci_types_register(&virtio_touchscreen_pci_info);
+ }
+ 
+ type_init(virtio_pci_input_register)
+--- a/include/hw/arm/virt.h
++++ b/include/hw/arm/virt.h
+@@ -210,6 +210,9 @@
+     MemoryRegion *sysmem;
+     MemoryRegion *secure_sysmem;
+     bool pci_preserve_config;
++    bool ranchu_devices;   /* RanchuWoA: 挂载 goldfish 设备并注入 Android FDT 节点 */
++    DeviceState *mmio_transports[32];      /* RanchuWoA: virtio-mmio 槽位→transport */
++    char *ranchu_disk_names[3];            /* RanchuWoA: system/metadata/data 盘的 drive id */
+     GPtrArray *smmuv3_devices;
+ };
+ 
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -189,6 +189,8 @@
+ 
+     uint8_t scanout_vmstate_version;
+     uint64_t conf_max_hostmem;
++    /* RanchuWoA: RESOURCE_FLUSH 时先从 guest backing 刷新 2D 资源（见 virtio-gpu.c） */
++    bool ranchu_coherent_flush;
+ 
+     VirtQueue *ctrl_vq;
+     VirtQueue *cursor_vq;
+--- a/include/hw/virtio/virtio-input.h
++++ b/include/hw/virtio/virtio-input.h
+@@ -31,6 +31,8 @@
+ #define TYPE_VIRTIO_MOUSE      "virtio-mouse-device"
+ #define TYPE_VIRTIO_TABLET     "virtio-tablet-device"
+ #define TYPE_VIRTIO_MULTITOUCH "virtio-multitouch-device"
++/* RanchuWoA: Android 友好的单点触摸屏（BTN_TOUCH + ABS_X/Y + INPUT_PROP_DIRECT） */
++#define TYPE_VIRTIO_TOUCHSCREEN "virtio-touchscreen-device"
+ 
+ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOInputHID, VIRTIO_INPUT_HID)
+ #define VIRTIO_INPUT_HID_GET_PARENT_CLASS(obj) \
+@@ -89,6 +91,10 @@
+     const QemuInputHandler            *handler;
+     QemuInputHandlerState             *hs;
+     int                               ledstate;
++    /* RanchuWoA: virtio-touchscreen 的触摸状态（其余设备不用） */
++    int                               touch_x;
++    int                               touch_y;
++    bool                              touch_down;
+ };
+ 
+ struct VirtIOInputHost {
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -24,6 +24,7 @@
+ /* Ported SDL 1.2 code to 2.0 by Dave Airlie. */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/main-loop.h"
+ #include "qemu/module.h"
+ #include "qemu/cutils.h"
+ #include "ui/console.h"
+@@ -33,6 +34,9 @@
+ #include "system/runstate-action.h"
+ #include "system/system.h"
+ #include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++#include "standard-headers/linux/input-event-codes.h"
+ #include "qemu-main.h"
+ 
+ #ifdef CONFIG_X11
+@@ -57,6 +61,8 @@
+ static int guest_x, guest_y;
+ static SDL_Cursor *guest_sprite;
+ static Notifier mouse_mode_notifier;
++static int64_t sdl_close_requested_ms;  /* RanchuWoA: 关窗后正在等 guest 关机（请求时刻） */
++static QEMUTimer *sdl_close_timer;
+ 
+ #define SDL2_REFRESH_INTERVAL_BUSY 10
+ #define SDL2_MAX_IDLE_COUNT (2 * GUI_REFRESH_INTERVAL_DEFAULT \
+@@ -80,6 +86,93 @@
+     return NULL;
+ }
+ 
++/*
++ * RanchuWoA: 竖屏手机分辨率（如 720x1280、1080x1920）经常比桌面可用区域还高。
++ * 初始窗口按可用区域等比缩小（渲染器用 SDL_RenderSetLogicalSize 保持比例，鼠标坐标
++ * 按窗口尺寸换算，所以缩放对 guest 透明）；窗口仍可自由拉伸。
++ */
++static void sdl2_fit_to_screen(struct sdl2_console *scon, int *w, int *h)
++{
++    SDL_Rect usable;
++    int sw = surface_width(scon->surface);
++    int sh = surface_height(scon->surface);
++
++    *w = sw;
++    *h = sh;
++    if (SDL_GetDisplayUsableBounds(0, &usable) != 0 || usable.w <= 0 || usable.h <= 0) {
++        return;
++    }
++    double scale = MIN(1.0, MIN(usable.w * 0.92 / sw, usable.h * 0.92 / sh));
++    *w = MAX(1, (int)(sw * scale));
++    *h = MAX(1, (int)(sh * scale));
++}
++
++/*
++ * RanchuWoA: 关窗 = 先请求 guest 正常关机（system_powerdown，ranchu-vsock 经 adbd 执行 svc power shutdown），
++ * guest 关好后 QEMU 自然退出。guest 还没开机完成时照旧立即退出；20 秒内没关掉、或用户过一会儿
++ * 再点一次关闭，就强制退出。
++ */
++#define SDL_CLOSE_TIMEOUT_MS 20000
++
++static void sdl_force_quit(void *opaque)
++{
++    shutdown_action = SHUTDOWN_ACTION_POWEROFF;
++    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
++}
++
++/*
++ * RanchuWoA: Ctrl+Alt+P 的电源键。按下后 100 ms 再松开：瞬时的按下/松开（间隔几微秒）AOSP 照样处理，
++ * 但 ColorOS 的输入策略会当成抖动忽略。
++ */
++static QEMUTimer *sdl_power_timer;
++static QemuConsole *sdl_power_con;
++
++static void sdl_power_key_release(void *opaque)
++{
++    qemu_input_event_send_key_linux(sdl_power_con, KEY_POWER, false);
++    qemu_input_event_sync();
++}
++
++static void sdl_power_key_press(struct sdl2_console *scon)
++{
++    if (!sdl_power_timer) {
++        sdl_power_timer = timer_new_ms(QEMU_CLOCK_REALTIME, sdl_power_key_release, NULL);
++    }
++    if (timer_pending(sdl_power_timer)) {
++        return;                         /* 上一次还没松开 */
++    }
++    sdl_power_con = scon->dcl.con;
++    qemu_input_event_send_key_linux(sdl_power_con, KEY_POWER, true);
++    qemu_input_event_sync();
++    timer_mod(sdl_power_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
++}
++
++static void sdl_request_close(void)
++{
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    Object *rv;
++
++    if (sdl_close_requested_ms) {
++        /* 一次点击 SDL 会连发 WINDOWEVENT_CLOSE 和 QUIT；隔一会儿再点才算强制退出 */
++        if (now - sdl_close_requested_ms > 1000) {
++            sdl_force_quit(NULL);
++        }
++        return;
++    }
++    rv = object_resolve_path_type("", "ranchu-vsock-device", NULL);
++    if (!rv || !object_property_get_bool(rv, "poweroff-ready", NULL)) {
++        sdl_force_quit(NULL);
++        return;
++    }
++    sdl_close_requested_ms = now;
++    qemu_system_powerdown_request();
++    sdl_close_timer = timer_new_ms(QEMU_CLOCK_REALTIME, sdl_force_quit, NULL);
++    timer_mod(sdl_close_timer, now + SDL_CLOSE_TIMEOUT_MS);
++    for (int i = 0; i < sdl2_num_outputs; i++) {
++        sdl_update_caption(&sdl2_console[i]);
++    }
++}
++
+ void sdl2_window_create(struct sdl2_console *scon)
+ {
+     int flags = 0;
+@@ -103,11 +196,11 @@
+     }
+ #endif
+ 
+-    scon->real_window = SDL_CreateWindow("", SDL_WINDOWPOS_UNDEFINED,
+-                                         SDL_WINDOWPOS_UNDEFINED,
+-                                         surface_width(scon->surface),
+-                                         surface_height(scon->surface),
+-                                         flags);
++    int win_w, win_h;
++    sdl2_fit_to_screen(scon, &win_w, &win_h);
++    scon->real_window = SDL_CreateWindow("", SDL_WINDOWPOS_CENTERED,
++                                         SDL_WINDOWPOS_CENTERED,
++                                         win_w, win_h, flags);
+     if (scon->opengl) {
+         const char *driver = "opengl";
+ 
+@@ -158,9 +251,9 @@
+         return;
+     }
+ 
+-    SDL_SetWindowSize(scon->real_window,
+-                      surface_width(scon->surface),
+-                      surface_height(scon->surface));
++    int win_w, win_h;
++    sdl2_fit_to_screen(scon, &win_w, &win_h);
++    SDL_SetWindowSize(scon->real_window, win_w, win_h);
+ }
+ 
+ static void sdl2_redraw(struct sdl2_console *scon)
+@@ -180,7 +273,9 @@
+     char icon_title[1024];
+     const char *status = "";
+ 
+-    if (!runstate_is_running()) {
++    if (sdl_close_requested_ms) {
++        status = " - 正在关机…（再次关闭窗口可强制退出）";     /* RanchuWoA */
++    } else if (!runstate_is_running()) {
+         status = " [Stopped]";
+     } else if (gui_grab) {
+         if (alt_grab) {
+@@ -201,9 +296,9 @@
+     }
+ 
+     if (qemu_name) {
+-        snprintf(win_title, sizeof(win_title), "QEMU (%s-%d)%s", qemu_name,
+-                 scon->idx, status);
+-        snprintf(icon_title, sizeof(icon_title), "QEMU (%s)", qemu_name);
++        /* RanchuWoA: -name 就是 AVD 窗口标题 */
++        snprintf(win_title, sizeof(win_title), "%s%s", qemu_name, status);
++        snprintf(icon_title, sizeof(icon_title), "%s", qemu_name);
+     } else {
+         snprintf(win_title, sizeof(win_title), "QEMU%s", status);
+         snprintf(icon_title, sizeof(icon_title), "QEMU");
+@@ -284,7 +379,7 @@
+     sdl_update_caption(scon);
+ }
+ 
+-static void absolute_mouse_grab(struct sdl2_console *scon)
++static G_GNUC_UNUSED void absolute_mouse_grab(struct sdl2_console *scon)
+ {
+     int mouse_x, mouse_y;
+     int scr_w, scr_h;
+@@ -296,13 +391,21 @@
+     }
+ }
+ 
+-static void sdl_mouse_mode_change(Notifier *notify, void *data)
++/*
++ * RanchuWoA: 鼠标模式变化通知可能来自 vCPU 线程（guest 驱动激活 virtio 绝对坐标设备时）。
++ * Windows 上 SDL 的窗口操作（SetWindowGrab/SetWindowTitle…）会向 UI 线程 SendMessage，
++ * 而 UI（主）线程此刻正等着 vCPU 线程持有的 BQL —— 互相等待，整个 QEMU 卡死。
++ * 所以通知里只调度一个 BH，真正的 SDL 调用放到主循环线程里做。
++ */
++static QEMUBH *sdl_mouse_mode_bh;
++
++static void sdl_mouse_mode_change_bh(void *opaque)
+ {
+     if (qemu_input_is_absolute(sdl2_console[0].dcl.con)) {
+         if (!absolute_enabled) {
+             absolute_enabled = 1;
+             SDL_SetRelativeMouseMode(SDL_FALSE);
+-            absolute_mouse_grab(&sdl2_console[0]);
++            sdl_grab_end(&sdl2_console[0]);     /* RanchuWoA: 绝对坐标模式不 grab */
+         }
+     } else if (absolute_enabled) {
+         if (!gui_fullscreen) {
+@@ -312,6 +415,11 @@
+     }
+ }
+ 
++static void sdl_mouse_mode_change(Notifier *notify, void *data)
++{
++    qemu_bh_schedule(sdl_mouse_mode_bh);
++}
++
+ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
+                                  int x, int y, int state)
+ {
+@@ -432,6 +540,15 @@
+                 sdl_grab_end(scon);
+             }
+             break;
++        case SDL_SCANCODE_P:
++            /*
++             * RanchuWoA: Ctrl+Alt+P = 手机电源键（短按：亮屏/灭屏），经键盘设备送 KEY_POWER。
++             * 先在 guest 里松开 Ctrl/Alt，免得 Android 收到的是带修饰键的电源键
++             */
++            sdl2_release_modifiers(scon);
++            sdl_power_key_press(scon);
++            scon->gui_keysym = true;
++            break;
+         case SDL_SCANCODE_0:
+             sdl2_window_resize(scon);
+             if (!scon->opengl) {
+@@ -506,20 +623,13 @@
+     }
+ 
+     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
+-    if (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
+-        max_x = scr_w - 1;
+-        max_y = scr_h - 1;
+-        if (gui_grab && !gui_fullscreen
+-            && (ev->motion.x == 0 || ev->motion.y == 0 ||
+-                ev->motion.x == max_x || ev->motion.y == max_y)) {
+-            sdl_grab_end(scon);
+-        }
+-        if (!gui_grab &&
+-            (ev->motion.x > 0 && ev->motion.x < max_x &&
+-             ev->motion.y > 0 && ev->motion.y < max_y)) {
+-            sdl_grab_start(scon);
+-        }
+-    }
++    /*
++     * RanchuWoA: 原版在绝对坐标模式下光标一进窗口就 grab（锁定并隐藏宿主光标）。
++     * 对触摸屏模拟器来说这只会碍事：guest 不画指针，用户需要看见宿主光标点在哪。
++     * 所以这里不再自动 grab；键盘事件照样送给 guest（窗口有焦点即可）。
++     */
++    (void)max_x;
++    (void)max_y;
+     surf_w = surface_width(scon->surface);
+     surf_h = surface_height(scon->surface);
+     x = (int64_t)ev->motion.x * surf_w / scr_w;
+@@ -616,9 +726,7 @@
+     case SDL_WINDOWEVENT_FOCUS_GAINED:
+         /* fall through */
+     case SDL_WINDOWEVENT_ENTER:
+-        if (!gui_grab && (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled)) {
+-            absolute_mouse_grab(scon);
+-        }
++        /* RanchuWoA: 绝对坐标（触摸屏）模式不在获得焦点/鼠标进入时 grab，见 handle_mousemotion */
+         /* If a new console window opened using a hotkey receives the
+          * focus, SDL sends another KEYDOWN event to the new window,
+          * closing the console window immediately after.
+@@ -645,8 +753,7 @@
+                 allow_close = false;
+             }
+             if (allow_close) {
+-                shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+-                qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
++                sdl_request_close();    /* RanchuWoA: 先请 guest 正常关机 */
+             }
+         } else {
+             SDL_HideWindow(scon->real_window);
+@@ -692,8 +799,7 @@
+                 allow_close = false;
+             }
+             if (allow_close) {
+-                shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+-                qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
++                sdl_request_close();    /* RanchuWoA: 先请 guest 正常关机 */
+             }
+             break;
+         case SDL_MOUSEMOTION:
+@@ -912,6 +1018,8 @@
+         SDL_LogSetAllPriority(SDL_LOG_PRIORITY_VERBOSE);
+     }
+ 
++    /* RanchuWoA: 按显示器 DPI 感知，避免被 Windows 位图放大成模糊的大窗口 */
++    SDL_SetHint("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
+     if (SDL_Init(SDL_INIT_VIDEO)) {
+         fprintf(stderr, "Could not initialize SDL(%s) - exiting\n",
+                 SDL_GetError());
+@@ -1004,6 +1112,7 @@
+         SDL_SetWindowIcon(sdl2_console[0].real_window, icon);
+     }
+ 
++    sdl_mouse_mode_bh = qemu_bh_new(sdl_mouse_mode_change_bh, NULL);
+     mouse_mode_notifier.notify = sdl_mouse_mode_change;
+     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);
+ 
