@@ -6,6 +6,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p patches
+export LC_ALL=C     # 文件排序与区域设置无关，补丁里的文件顺序稳定
 
 # ---- QEMU ----
 TMP=$(mktemp -d)

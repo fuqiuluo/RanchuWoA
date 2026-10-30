@@ -505,10 +505,12 @@ def build_cmdline(name: str, d: Path, cfg: dict, headless: bool, verbose: bool =
         "-drive", f"file={d / 'data.qcow2'},if=none,id=datadisk,format=qcow2",
         "-object", "rng-builtin,id=rng0", "-device", "virtio-rng-device,rng=rng0",
         "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
+        # dpi：EDID 里的物理尺寸按屏幕密度报（与官方模拟器 xdpi = 密度一致）；不给时 QEMU 按 100 dpi，
+        # 手机屏成了十几英寸，HyperOS 的 AutoDensity 据此把应用缩到一半以下（RESEARCH §26）
         "-device", (
             f"virtio-gpu-rutabaga-pci,x-gfxstream-gles=on,wsi=surfaceless,hostmem=2G,"
-            f"xres={cfg['width']},yres={cfg['height']}" if gpu == "gfxstream"
-            else f"virtio-gpu-pci,xres={cfg['width']},yres={cfg['height']}"),
+            f"xres={cfg['width']},yres={cfg['height']},dpi={cfg['density']}" if gpu == "gfxstream"
+            else f"virtio-gpu-pci,xres={cfg['width']},yres={cfg['height']},dpi={cfg['density']}"),
         "-device", "virtio-touchscreen-pci", "-device", "virtio-keyboard-pci",
         *audio,
         "-device", "virtio-serial-pci,id=vser0",

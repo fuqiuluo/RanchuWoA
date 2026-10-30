@@ -10,6 +10,235 @@ index e3269ef..4c89846 100644
  #include <string>
  
  #include "gfxstream/files/PathUtils.h"
+diff --git a/guest/GLESv2_enc/GL2Encoder.cpp b/guest/GLESv2_enc/GL2Encoder.cpp
+index 786bff3..8774e24 100644
+--- a/guest/GLESv2_enc/GL2Encoder.cpp
++++ b/guest/GLESv2_enc/GL2Encoder.cpp
+@@ -23,6 +23,8 @@
+ #include <GLES3/gl31.h>
+ #include <assert.h>
+ #include <ctype.h>
++#include <stdio.h>
++#include <sys/system_properties.h>
+ 
+ #include <map>
+ #include <string>
+@@ -80,6 +82,28 @@ static GLubyte *gExtensionsString= (GLubyte *) "GL_OES_EGL_image_external ";
+         return ret; \
+     } \
+ 
++// RanchuWoA：按进程开启的 GL 调用跟踪（着色器/程序/计算相关），排查应用渲染失败用：
++//   setprop debug.gfxstream.gltrace <进程名子串>，之后启动的匹配进程把调用打进 logcat（tag GFXSTREAM，前缀 RW-trace）
++static bool rwTraceEnabled() {
++    static int enabled = -1;
++    if (enabled < 0) {
++        char want[PROP_VALUE_MAX] = {0};
++        __system_property_get("debug.gfxstream.gltrace", want);
++        char cmd[256] = {0};
++        FILE* f = fopen("/proc/self/cmdline", "re");
++        if (f) {
++            fread(cmd, 1, sizeof(cmd) - 1, f);
++            fclose(f);
++        }
++        enabled = (want[0] && strstr(cmd, want)) ? 1 : 0;
++    }
++    return enabled == 1;
++}
++#define RW_TRACE(fmt, ...)                                              \
++    do {                                                                \
++        if (rwTraceEnabled()) GFXSTREAM_ERROR("RW-trace " fmt, ##__VA_ARGS__); \
++    } while (0)
++
+ GL2Encoder::GL2Encoder(IOStream *stream, ChecksumCalculator *protocol)
+         : gl2_encoder_context_t(stream, protocol)
+ {
+@@ -624,6 +648,7 @@ void GL2Encoder::s_glFlush(void *self)
+ const GLubyte *GL2Encoder::s_glGetString(void *self, GLenum name)
+ {
+     GL2Encoder *ctx = (GL2Encoder *)self;
++    RW_TRACE("glGetString(%#x)", name);
+ 
+     GLubyte *retval =  (GLubyte *) "";
+     RET_AND_SET_ERROR_IF(
+@@ -784,6 +809,7 @@ void GL2Encoder::s_glVertexAttribPointer(void *self, GLuint indx, GLint size, GL
+ void GL2Encoder::s_glGetIntegerv(void *self, GLenum param, GLint *ptr)
+ {
+     GL2Encoder *ctx = (GL2Encoder *) self;
++    RW_TRACE("glGetIntegerv(%#x)", param);
+     GLClientState* state = ctx->m_state;
+ 
+     switch (param) {
+@@ -1894,6 +1920,8 @@ void GL2Encoder::s_glShaderBinary(void *self, GLsizei, const GLuint *, GLenum, c
+ void GL2Encoder::s_glShaderSource(void *self, GLuint shader, GLsizei count, const GLchar * const *string, const GLint *length)
+ {
+     GL2Encoder* ctx = (GL2Encoder*)self;
++    RW_TRACE("glShaderSource(%u) %d 段 开头：%.200s", shader, count,
++             (count > 0 && string && string[0]) ? string[0] : "(null)");
+     ShaderData* shaderData = ctx->m_shared->getShaderData(shader);
+     SET_ERROR_IF(!ctx->m_shared->isShaderOrProgramObject(shader), GL_INVALID_VALUE);
+     SET_ERROR_IF(!shaderData, GL_INVALID_OPERATION);
+@@ -1949,6 +1977,18 @@ void GL2Encoder::updateProgramInfoAfterLink(GLuint program) {
+     ctx->m_glGetProgramiv_enc(ctx, program, GL_LINK_STATUS, &linkStatus);
+     ctx->m_shared->setProgramLinkStatus(program, linkStatus);
+     if (!linkStatus) {
++        // RanchuWoA：链接失败时把宿主的链接日志、以及编译失败的着色器的日志与源码开头打进 logcat，
++        // 方便定位应用依赖而宿主不支持的 GLSL 特性（只在失败路径上多几次往返，正常路径零开销）。
++        char log[2048] = {0};
++        GLsizei len = 0;
++        ctx->m_glGetProgramInfoLog_enc(ctx, program, sizeof(log) - 1, &len, log);
++        GLuint shaders[4] = {0};
++        GLsizei count = 0;
++        ctx->m_glGetAttachedShaders_enc(ctx, program, 4, &count, shaders);
++        GFXSTREAM_ERROR("RanchuWoA: 程序 %u 链接失败（%d 个着色器）：%s", program, count, log);
++        for (GLsizei i = 0; i < count && i < 4; i++) {
++            ctx->logShaderCompileFailure(shaders[i], true);
++        }
+         return;
+     }
+ 
+@@ -1997,8 +2037,29 @@ void GL2Encoder::updateProgramInfoAfterLink(GLuint program) {
+     delete[] name;
+ }
+ 
++void GL2Encoder::logShaderCompileFailure(GLuint shader, bool always) {
++    GLint compiled = GL_TRUE;
++    m_glGetShaderiv_enc(this, shader, GL_COMPILE_STATUS, &compiled);
++    if (compiled && !always) {
++        return;
++    }
++    char log[2048] = {0};
++    GLsizei len = 0;
++    m_glGetShaderInfoLog_enc(this, shader, sizeof(log) - 1, &len, log);
++    std::string src;
++    ShaderData* shaderData = m_shared->getShaderData(shader);
++    if (shaderData) {
++        for (const auto& s : shaderData->sources) {
++            src += s;
++        }
++    }
++    GFXSTREAM_ERROR("RanchuWoA: 着色器 %u %s：%s\n源码开头：\n%.1500s", shader,
++                    compiled ? "编译成功" : "编译失败", log, src.c_str());
++}
++
+ void GL2Encoder::s_glLinkProgram(void* self, GLuint program) {
+     GL2Encoder* ctx = (GL2Encoder*)self;
++    RW_TRACE("glLinkProgram(%u)", program);
+     bool isProgram = ctx->m_shared->isProgram(program);
+     SET_ERROR_IF(!isProgram && !ctx->m_shared->isShader(program), GL_INVALID_VALUE);
+     SET_ERROR_IF(!isProgram, GL_INVALID_OPERATION);
+@@ -2075,14 +2136,17 @@ GLuint GL2Encoder::s_glCreateProgram(void * self)
+     GLuint program = ctx->m_glCreateProgram_enc(self);
+     if (program!=0)
+         ctx->m_shared->addProgramData(program);
++    RW_TRACE("glCreateProgram -> %u", program);
+     return program;
+ }
+ 
+ GLuint GL2Encoder::s_glCreateShader(void *self, GLenum shaderType)
+ {
+     GL2Encoder *ctx = (GL2Encoder*)self;
++    RW_TRACE("glCreateShader(%#x)", shaderType);
+     RET_AND_SET_ERROR_IF(!GLESv2Validation::shaderType(ctx, shaderType), GL_INVALID_ENUM, 0);
+     GLuint shader = ctx->m_glCreateShader_enc(self, shaderType);
++    RW_TRACE("  -> %u", shader);
+     if (shader != 0) {
+         if (!ctx->m_shared->addShaderData(shader, shaderType)) {
+             ctx->m_glDeleteShader_enc(self, shader);
+@@ -2164,6 +2228,7 @@ void GL2Encoder::s_glDeleteShader(void *self, GLenum shader)
+ void GL2Encoder::s_glAttachShader(void *self, GLuint program, GLuint shader)
+ {
+     GL2Encoder *ctx = (GL2Encoder*)self;
++    RW_TRACE("glAttachShader(%u, %u)", program, shader);
+     bool programIsShaderOrProgram = ctx->m_shared->isShaderOrProgramObject(program);
+     bool programIsProgram = ctx->m_shared->isProgram(program);
+     bool shaderIsShaderOrProgram = ctx->m_shared->isShaderOrProgramObject(shader);
+@@ -2279,6 +2344,7 @@ void GL2Encoder::updateHostTexture2DBindingsFromProgramData(GLuint program) {
+ void GL2Encoder::s_glUseProgram(void *self, GLuint program)
+ {
+     GL2Encoder *ctx = (GL2Encoder*)self;
++    RW_TRACE("glUseProgram(%u)", program);
+     GLSharedGroupPtr shared = ctx->m_shared;
+ 
+     SET_ERROR_IF(program && !shared->isShaderOrProgramObject(program), GL_INVALID_VALUE);
+@@ -2716,6 +2782,7 @@ bool GL2Encoder::validateAllowedEnablei(void* self, GLenum cap, GLuint index) {
+ void GL2Encoder::s_glEnableiEXT(void * self, GLenum cap, GLuint index)
+ {
+      GL2Encoder* ctx = (GL2Encoder*)self;
++     RW_TRACE("glEnablei(%#x, %u)", cap, index);
+      SET_ERROR_IF(!ctx->getExtensions().drawBuffersIndexedEXT, GL_INVALID_OPERATION);
+      if(!validateAllowedEnablei(ctx, cap, index)) return;
+      ctx->m_glEnableiEXT_enc(ctx, cap, index);
+@@ -5032,6 +5099,7 @@ void GL2Encoder::getProgramBinaryLength(GLuint program, GLint* outLength) {
+ 
+ void GL2Encoder::s_glGetProgramBinary(void* self, GLuint program, GLsizei bufSize, GLsizei* length, GLenum* binaryFormat, void* binary) {
+     GL2Encoder *ctx = (GL2Encoder *)self;
++    RW_TRACE("glGetProgramBinary(%u, bufSize=%d)", program, bufSize);
+ 
+     VALIDATE_PROGRAM_NAME(program);
+ 
+@@ -5055,6 +5123,7 @@ void GL2Encoder::s_glGetProgramBinary(void* self, GLuint program, GLsizei bufSiz
+ void GL2Encoder::s_glProgramBinary(void* self, GLuint program, GLenum binaryFormat,
+                                    const void* binary, GLsizei length) {
+     GL2Encoder* ctx = (GL2Encoder*)self;
++    RW_TRACE("glProgramBinary(%u, fmt=%#x, len=%d)", program, binaryFormat, length);
+ 
+     VALIDATE_PROGRAM_NAME(program);
+ 
+@@ -5156,6 +5225,7 @@ GL_INVALID_OPERATION is generated if the readbuffer of the currently bound frame
+ // - Primitive restart
+ void GL2Encoder::s_glEnable(void* self, GLenum what) {
+     GL2Encoder *ctx = (GL2Encoder *)self;
++    RW_TRACE("glEnable(%#x)", what);
+ 
+ 	SET_ERROR_IF(!GLESv2Validation::allowedEnable(ctx->majorVersion(), ctx->minorVersion(), what), GL_INVALID_ENUM);
+     if (!ctx->m_state) return;
+@@ -5619,6 +5689,10 @@ void GL2Encoder::s_glGetShaderiv(void* self, GLuint shader, GLenum pname, GLint*
+     SET_ERROR_IF(!GLESv2Validation::allowedGetShader(pname), GL_INVALID_ENUM);
+     VALIDATE_SHADER_NAME(shader);
+ 
++    if (pname == GL_COMPILE_STATUS && !*params) {
++        ctx->logShaderCompileFailure(shader);    // RanchuWoA：见 updateProgramInfoAfterLink
++    }
++
+     if (pname == GL_SHADER_SOURCE_LENGTH) {
+         ShaderData* shaderData = ctx->m_shared->getShaderData(shader);
+         if (shaderData) {
+@@ -5652,6 +5726,7 @@ GLuint GL2Encoder::s_glCreateShaderProgramv(void* self, GLenum shaderType, GLsiz
+ 
+     GLint* length = NULL;
+     GL2Encoder* ctx = (GL2Encoder*)self;
++    RW_TRACE("glCreateShaderProgramv(%#x)", shaderType);
+ 
+     int len = glUtilsCalcShaderSourceLen((char**)strings, length, count);
+     char *str = new char[len + 1];
+@@ -6280,6 +6355,7 @@ void GL2Encoder::s_glInvalidateSubFramebuffer(void* self, GLenum target, GLsizei
+ 
+ void GL2Encoder::s_glDispatchCompute(void* self, GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z) {
+     GL2Encoder *ctx = (GL2Encoder*)self;
++    RW_TRACE("glDispatchCompute(%u, %u, %u)", num_groups_x, num_groups_y, num_groups_z);
+     ctx->m_glDispatchCompute_enc(ctx, num_groups_x, num_groups_y, num_groups_z);
+     ctx->m_state->postDispatchCompute();
+ }
+@@ -6447,6 +6523,7 @@ void GL2Encoder::s_glCopyTexSubImage3D(void *self , GLenum target, GLint level,
+ 
+ void GL2Encoder::s_glCompileShader(void* self, GLuint shader) {
+     GL2Encoder *ctx = (GL2Encoder*)self;
++    RW_TRACE("glCompileShader(%u)", shader);
+     bool isShaderOrProgramObject =
+         ctx->m_shared->isShaderOrProgramObject(shader);
+     bool isShader =
+diff --git a/guest/GLESv2_enc/GL2Encoder.h b/guest/GLESv2_enc/GL2Encoder.h
+index f6aa37a..b2bdd00 100644
+--- a/guest/GLESv2_enc/GL2Encoder.h
++++ b/guest/GLESv2_enc/GL2Encoder.h
+@@ -196,6 +196,7 @@ public:
+     bool texture2DNeedsOverride(GLenum target) const;
+ 
+     void updateProgramInfoAfterLink(GLuint program);
++    void logShaderCompileFailure(GLuint shader, bool always = false);   // RanchuWoA
+ 
+     // Utility classes for safe queries that
+     // need access to private class members
 diff --git a/guest/egl/egl.cpp b/guest/egl/egl.cpp
 index 3909b95..f052188 100644
 --- a/guest/egl/egl.cpp
@@ -45,6 +274,26 @@ index 3909b95..f052188 100644
          refcountPipeFd = qemu_pipe_open("refcount");
          //Send color buffer handle in case RefCountPipe feature is turned on.
          if (qemu_pipe_valid(refcountPipeFd)) {
+diff --git a/host/frame_buffer.cpp b/host/frame_buffer.cpp
+index f42ff05..60fcdcd 100644
+--- a/host/frame_buffer.cpp
++++ b/host/frame_buffer.cpp
+@@ -2453,9 +2453,12 @@ void FrameBuffer::Impl::cleanupGuestProcess(uint64_t puid,
+         renderThreadWithThisPuidExists = false;
+         RenderThreadInfo::forAllRenderThreadInfos(
+             [puid, guestProcessResources, &renderThreadWithThisPuidExists](RenderThreadInfo* i) {
+-                if ((guestProcessResources && i->m_processResources)
+-                        ? (i->m_processResources.get() == guestProcessResources)
+-                        : (i->m_puid == puid)) {
++                // RanchuWoA：virtio-gpu-pipe 传输下 guest 每个线程一个上下文，同一进程的 render
++                // 线程经 rcSetPuid 共用进程管道的上下文 id 作 puid（见 VirtioGpuProcessPipe::Create）；
++                // 清理进程对象前也要等这些线程退出，不能只看线程自己上下文的 ProcessResources。
++                if (i->m_puid == puid ||
++                    (guestProcessResources &&
++                     i->m_processResources.get() == guestProcessResources)) {
+                     renderThreadWithThisPuidExists = true;
+                 }
+             });
 diff --git a/host/gl/OpenGLESDispatch/EGLDispatch.cpp b/host/gl/OpenGLESDispatch/EGLDispatch.cpp
 index 16ad40f..b6fa1ec 100644
 --- a/host/gl/OpenGLESDispatch/EGLDispatch.cpp
@@ -172,7 +421,7 @@ index 959a401..f8c74e2 100644
  namespace translator {
  namespace gles2 {
 diff --git a/host/gl/emulation_gl.cpp b/host/gl/emulation_gl.cpp
-index feb719a..d822a30 100644
+index feb719a..e3e81e6 100644
 --- a/host/gl/emulation_gl.cpp
 +++ b/host/gl/emulation_gl.cpp
 @@ -438,6 +438,17 @@ std::unique_ptr<EmulationGl> EmulationGl::create(uint32_t width, uint32_t height
@@ -208,6 +457,28 @@ index feb719a..d822a30 100644
          return false;
      }
      colorBuffer->touch();
+@@ -1346,6 +1363,21 @@ std::vector<HandleType> EmulationGl::cleanupProcGLObjects(uint64_t puid) {
+     {
+         RecursiveScopedContextBind bind(getColorBufferContextHelper());
+ 
++        // RanchuWoA：记录每次按 puid 清理掉多少对象（GFXSTREAM_LOG_LEVEL=debug 可见；排查
++        // “window handle not found” 类问题时看是否在进程还活着时就被清理）
++        {
++            auto w = mProcOwnedEmulatedEglWindowSurfaces.find(puid);
++            auto c = mProcOwnedEmulatedEglContexts.find(puid);
++            auto i = mProcOwnedEmulatedEglImages.find(puid);
++            size_t nw = w == mProcOwnedEmulatedEglWindowSurfaces.end() ? 0 : w->second.size();
++            size_t nc = c == mProcOwnedEmulatedEglContexts.end() ? 0 : c->second.size();
++            size_t ni = i == mProcOwnedEmulatedEglImages.end() ? 0 : i->second.size();
++            if (nw || nc || ni) {
++                GFXSTREAM_DEBUG("RanchuWoA: 清理 puid %llu：窗口 %zu、上下文 %zu、EGLImage %zu",
++                                (unsigned long long)puid, nw, nc, ni);
++            }
++        }
++
+         // Clean up window surfaces
+         auto procWindowsIt = mProcOwnedEmulatedEglWindowSurfaces.find(puid);
+         if (procWindowsIt != mProcOwnedEmulatedEglWindowSurfaces.end()) {
 diff --git a/host/gl/glestranslator/common/gl_dispatch.cpp b/host/gl/glestranslator/common/gl_dispatch.cpp
 index f2b9f42..87798d3 100644
 --- a/host/gl/glestranslator/common/gl_dispatch.cpp
@@ -316,7 +587,7 @@ index 0bc1db3..1c5f9ff 100644
  #include "core_profile_configs.h"
  #include "common/gl_library.h"
 diff --git a/host/virtio_gpu_gfxstream_renderer.cpp b/host/virtio_gpu_gfxstream_renderer.cpp
-index d6315ea..bef618f 100644
+index d6315ea..ed53ec8 100644
 --- a/host/virtio_gpu_gfxstream_renderer.cpp
 +++ b/host/virtio_gpu_gfxstream_renderer.cpp
 @@ -21,6 +21,10 @@ extern "C" {
@@ -330,7 +601,20 @@ index d6315ea..bef618f 100644
  #include "frame_buffer.h"
  #include "gfxstream/strings.h"
  #include "gfxstream/common/build_info.h"
-@@ -869,6 +873,87 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
+@@ -80,6 +84,12 @@ ParseGfxstreamFeatures(const int rendererFlags,
+         &features, GlDma, false);
+     GFXSTREAM_SET_BOOL_FEATURE_ON_CONDITION(
+         &features, GlesDynamicVersion, true);
++    // RanchuWoA：glProgramBinary() 载入的程序如实报告链接状态。默认关闭时宿主对这类程序的
++    // GL_LINK_STATUS 一律返回 false（只为兼容没有 aosp/3151743 的旧 guest 编码器；我们的 guest
++    // 编码器与宿主同源，已带该修复）。HyperOS 的 libmigl 先在一个上下文里编译并 glGetProgramBinary，
++    // 再在渲染上下文里 glProgramBinary，失败后不回退到源码编译——壁纸因此全黑。
++    GFXSTREAM_SET_BOOL_FEATURE_ON_CONDITION(
++        &features, GlProgramBinaryLinkStatus, true);
+     GFXSTREAM_SET_BOOL_FEATURE_ON_CONDITION(
+         &features, GlPipeChecksum, false);
+     GFXSTREAM_SET_BOOL_FEATURE_ON_CONDITION(
+@@ -869,6 +879,87 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
  
      GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_STREAM_RENDERER_CATEGORY, "stream_renderer_init()");
  
@@ -418,6 +702,27 @@ index d6315ea..bef618f 100644
      auto renderer = GetRenderer(display_width, display_height, renderer_flags, features,
                                  rendererInitializedExternally);
      if (!renderer) {
+diff --git a/host/virtio_gpu_pipe.cpp b/host/virtio_gpu_pipe.cpp
+index 67a1e72..3b4d9aa 100644
+--- a/host/virtio_gpu_pipe.cpp
++++ b/host/virtio_gpu_pipe.cpp
+@@ -25,8 +25,14 @@ namespace host {
+ 
+ /*static*/
+ std::unique_ptr<VirtioGpuPipeImpl> VirtioGpuProcessPipe::Create(VirtioGpuContextId id) {
+-    static std::atomic<uint64_t> sNextUniqueId{1};
+-    const uint64_t uniqueId = sNextUniqueId++;
++    // RanchuWoA：puid 用进程管道自己的 virtio-gpu 上下文 id，而不是另起一个计数器。
++    // guest 每个线程的 render 连接随后都 rcSetPuid(这个值)，EGL 窗口表面/上下文/EGLImage 按它归属；
++    // 而清理是按“被销毁的上下文 id”进行的（VirtioGpuContext::Destroy → cleanupProcGLObjects）。
++    // 原来的计数器（1、2、3…）与上下文 id 是两套编号：某个线程的上下文 N 退出时会把 puid 恰好
++    // 为 N 的另一个进程的窗口表面和上下文整个删掉（实测开机时 SystemUI 的状态栏、通知栏因此
++    // 不显示，宿主刷 "window handle not found"）。改成进程管道的上下文 id 后：id 在它存活期间唯一，
++    // 只有进程退出（进程管道的 fd 关闭）时才会按它清理，正好是 EGL 对象应有的进程级生命周期。
++    const uint64_t uniqueId = id;
+     GFXSTREAM_DEBUG("Creating VirtioGpuProcessPipe:%" PRIu64, uniqueId);
+ 
+     // NOTE: historically, the process pipe would have done a
 diff --git a/host/virtio_gpu_resource.cpp b/host/virtio_gpu_resource.cpp
 index 4531a51..c405257 100644
 --- a/host/virtio_gpu_resource.cpp

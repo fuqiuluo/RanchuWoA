@@ -3572,7 +3572,7 @@
      object_class_property_set_description(oc, "highmem",
 --- a/hw/display/virtio-gpu-base.c
 +++ b/hw/display/virtio-gpu-base.c
-@@ -64,7 +64,12 @@
+@@ -64,9 +64,25 @@
          .height_mm = g->req_state[scanout].height_mm,
          .prefx = g->req_state[scanout].width,
          .prefy = g->req_state[scanout].height,
@@ -3585,7 +3585,20 @@
 +                        g->req_state[scanout].refresh_rate : 60000,
      };
  
++    /*
++     * RanchuWoA：物理尺寸按 dpi 属性（AVD 的屏幕密度）生成。不给时 QEMU 按 100 dpi 算，
++     * 600x1335 的手机屏成了 14.6 英寸的“显示器”：Android 的 xdpi/ydpi 取自这里（hwc3 读 EDID
++     * 详细时序里的毫米数），HyperOS 的 miuix AutoDensity 又按物理 PPI 重算应用密度（≈PPI×1.14），
++     * 结果所有 MIUI 应用只有 114 dpi，界面缩到一半以下。
++     */
++    if ((!info.width_mm || !info.height_mm) && g->conf.dpi) {
++        info.width_mm = (info.prefx * 254 + g->conf.dpi * 5) / (g->conf.dpi * 10);
++        info.height_mm = (info.prefy * 254 + g->conf.dpi * 5) / (g->conf.dpi * 10);
++    }
++
      for (output_idx = 0, node = g->conf.outputs;
+          output_idx <= scanout && node; output_idx++, node = node->next) {
+         if (output_idx == scanout && node->value->name) {
 --- a/hw/display/virtio-gpu-rutabaga.c
 +++ b/hw/display/virtio-gpu-rutabaga.c
 @@ -257,9 +257,10 @@
@@ -4025,7 +4038,25 @@
  
 --- a/include/hw/virtio/virtio-gpu.h
 +++ b/include/hw/virtio/virtio-gpu.h
-@@ -189,6 +189,8 @@
+@@ -131,6 +131,7 @@
+     uint32_t flags;
+     uint32_t xres;
+     uint32_t yres;
++    uint32_t dpi;       /* RanchuWoA: EDID 报告的物理像素密度（0 = QEMU 默认 100 dpi） */
+     uint64_t hostmem;
+     VirtIOGPUOutputList *outputs;
+ };
+@@ -176,7 +177,8 @@
+     DEFINE_PROP_BIT("edid", _state, _conf.flags, \
+                     VIRTIO_GPU_FLAG_EDID_ENABLED, true), \
+     DEFINE_PROP_UINT32("xres", _state, _conf.xres, 1280), \
+-    DEFINE_PROP_UINT32("yres", _state, _conf.yres, 800)
++    DEFINE_PROP_UINT32("yres", _state, _conf.yres, 800), \
++    DEFINE_PROP_UINT32("dpi", _state, _conf.dpi, 0)
+ 
+ typedef struct VGPUDMABuf {
+     QemuDmaBuf *buf;
+@@ -189,6 +191,8 @@
  
      uint8_t scanout_vmstate_version;
      uint64_t conf_max_hostmem;
@@ -4353,7 +4384,7 @@
      if (scon->opengl) {
          const char *driver = "opengl";
  
-@@ -158,9 +251,9 @@
+@@ -158,9 +251,23 @@
          return;
      }
  
@@ -4363,10 +4394,24 @@
 +    int win_w, win_h;
 +    sdl2_fit_to_screen(scon, &win_w, &win_h);
 +    SDL_SetWindowSize(scon->real_window, win_w, win_h);
++    /*
++     * RanchuWoA: 窗口是按启动时 640x480 的占位画面居中创建的，guest 设好分辨率后原版只改尺寸、
++     * 左上角不动，竖屏分辨率下窗口下半截跑到屏幕外。改尺寸后在所在显示器的可用区域里重新居中
++     * （连同标题栏、边框）。
++     */
++    SDL_Rect usable;
++    int idx = SDL_GetWindowDisplayIndex(scon->real_window);
++    if (idx >= 0 && SDL_GetDisplayUsableBounds(idx, &usable) == 0) {
++        int top = 0, left = 0, bottom = 0, right = 0;
++        SDL_GetWindowBordersSize(scon->real_window, &top, &left, &bottom, &right);
++        int x = usable.x + (usable.w - (win_w + left + right)) / 2 + left;
++        int y = usable.y + (usable.h - (win_h + top + bottom)) / 2 + top;
++        SDL_SetWindowPosition(scon->real_window, MAX(x, usable.x + left), MAX(y, usable.y + top));
++    }
  }
  
  static void sdl2_redraw(struct sdl2_console *scon)
-@@ -180,7 +273,9 @@
+@@ -180,7 +287,9 @@
      char icon_title[1024];
      const char *status = "";
  
@@ -4377,7 +4422,7 @@
          status = " [Stopped]";
      } else if (gui_grab) {
          if (alt_grab) {
-@@ -201,9 +296,9 @@
+@@ -201,9 +310,9 @@
      }
  
      if (qemu_name) {
@@ -4390,7 +4435,7 @@
      } else {
          snprintf(win_title, sizeof(win_title), "QEMU%s", status);
          snprintf(icon_title, sizeof(icon_title), "QEMU");
-@@ -284,7 +379,7 @@
+@@ -284,7 +393,7 @@
      sdl_update_caption(scon);
  }
  
@@ -4399,7 +4444,7 @@
  {
      int mouse_x, mouse_y;
      int scr_w, scr_h;
-@@ -296,13 +391,21 @@
+@@ -296,13 +405,21 @@
      }
  }
  
@@ -4423,7 +4468,7 @@
          }
      } else if (absolute_enabled) {
          if (!gui_fullscreen) {
-@@ -312,6 +415,11 @@
+@@ -312,6 +429,11 @@
      }
  }
  
@@ -4435,7 +4480,7 @@
  static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
                                   int x, int y, int state)
  {
-@@ -432,6 +540,15 @@
+@@ -432,6 +554,15 @@
                  sdl_grab_end(scon);
              }
              break;
@@ -4451,7 +4496,7 @@
          case SDL_SCANCODE_0:
              sdl2_window_resize(scon);
              if (!scon->opengl) {
-@@ -506,20 +623,13 @@
+@@ -506,20 +637,13 @@
      }
  
      SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
@@ -4479,7 +4524,28 @@
      surf_w = surface_width(scon->surface);
      surf_h = surface_height(scon->surface);
      x = (int64_t)ev->motion.x * surf_w / scr_w;
-@@ -616,9 +726,7 @@
+@@ -601,13 +725,13 @@
+ 
+     switch (ev->window.event) {
+     case SDL_WINDOWEVENT_RESIZED:
+-        {
+-            QemuUIInfo info = {
+-                .width = ev->window.data1,
+-                .height = ev->window.data2,
+-            };
+-            qemu_console_set_ui_info(scon->dcl.con, &info, true);
+-        }
++        /*
++         * RanchuWoA: 窗口尺寸不上报给 guest（原版经 qemu_console_set_ui_info 把它当作首选分辨率
++         * 发给 virtio-gpu）。AVD 的分辨率固定为 xres/yres，窗口只是等比缩放显示（SDL 逻辑尺寸）；
++         * Android 的 hwc3 开机后不理会显示热插拔，但新的首选模式会留在 virtio-gpu 里，下次 guest
++         * 重启或 hwc3 重新读取连接器时就以窗口尺寸开机（实测：缩放窗口后 DRM 首选模式跟着变；
++         * 还出现过 guest 以 640x480——启动时占位画面的尺寸——开机）。
++         */
+         sdl2_redraw(scon);
+         break;
+     case SDL_WINDOWEVENT_EXPOSED:
+@@ -616,9 +740,7 @@
      case SDL_WINDOWEVENT_FOCUS_GAINED:
          /* fall through */
      case SDL_WINDOWEVENT_ENTER:
@@ -4490,7 +4556,7 @@
          /* If a new console window opened using a hotkey receives the
           * focus, SDL sends another KEYDOWN event to the new window,
           * closing the console window immediately after.
-@@ -645,8 +753,7 @@
+@@ -645,8 +767,7 @@
                  allow_close = false;
              }
              if (allow_close) {
@@ -4500,7 +4566,7 @@
              }
          } else {
              SDL_HideWindow(scon->real_window);
-@@ -692,8 +799,7 @@
+@@ -692,8 +813,7 @@
                  allow_close = false;
              }
              if (allow_close) {
@@ -4510,7 +4576,7 @@
              }
              break;
          case SDL_MOUSEMOTION:
-@@ -912,6 +1018,8 @@
+@@ -912,6 +1032,8 @@
          SDL_LogSetAllPriority(SDL_LOG_PRIORITY_VERBOSE);
      }
  
@@ -4519,7 +4585,7 @@
      if (SDL_Init(SDL_INIT_VIDEO)) {
          fprintf(stderr, "Could not initialize SDL(%s) - exiting\n",
                  SDL_GetError());
-@@ -1004,6 +1112,7 @@
+@@ -1004,6 +1126,7 @@
          SDL_SetWindowIcon(sdl2_console[0].real_window, icon);
      }
  

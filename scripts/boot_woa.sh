@@ -31,7 +31,7 @@ exec ./qemu-ranchu/build/qemu-system-aarch64.exe -name "RanchuWoA m$N" \
   -drive file=$IMG/data.img,if=none,id=datadisk,format=raw \
   -object rng-builtin,id=rng0 -device virtio-rng-device,rng=rng0 \
   -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
-  -device virtio-gpu-pci,xres=720,yres=1280 \
+  -device virtio-gpu-pci,xres=720,yres=1280,dpi=320 \
   -device virtio-touchscreen-pci -device virtio-keyboard-pci \
   -audiodev dsound,id=snd0 -device virtio-sound-pci,audiodev=snd0,streams=1 \
   -device virtio-serial-pci,id=vser0 \
