@@ -170,7 +170,7 @@ bool planeDescsFor(int32_t f, PlaneDesc* planes, int* numPlanes) {
 }
 
 bool computeLayout(int32_t format, uint32_t width, uint32_t height, uint32_t layerCount,
-                   uint64_t usage, Layout* out) {
+                   uint64_t usage, Layout* out, bool hostGpu) {
     if (width == 0 || height == 0 || width > 16384 || height > 16384) return false;
     if (layerCount == 0) layerCount = 1;
     if (layerCount > 16) return false;
@@ -199,6 +199,26 @@ bool computeLayout(int32_t format, uint32_t width, uint32_t height, uint32_t lay
     }
 
     const bool yuv = l.planes[0].components[0].type == kCompY && l.num_planes > 1;
+    if (hostGpu) {
+        // 宿主 gfxstream 的 virgl 格式（host/virtio_gpu_format_utils.h）。YUV 的色度平面宿主按
+        // height/2 取整、stride 按 width 推算，奇数尺寸对不上，退回普通 dma-heap 缓冲。
+        uint32_t vf = 0;
+        switch (l.resolved_format) {
+            case RGB_888: vf = 66; break;        // VIRGL_FORMAT_R8G8B8_UNORM
+            case RGB_565: vf = 7; break;         // VIRGL_FORMAT_B5G6R5_UNORM
+            case RGBA_FP16: vf = 94; break;      // VIRGL_FORMAT_R16G16B16A16_FLOAT
+            case RGBA_1010102: vf = 8; break;    // VIRGL_FORMAT_R10G10B10A2_UNORM（gfxstream 的编号）
+            case R_8: vf = 64; break;            // VIRGL_FORMAT_R8_UNORM
+            case YCBCR_420_888: vf = 166; break; // VIRGL_FORMAT_NV12
+            case YV12: vf = 163; break;          // VIRGL_FORMAT_YV12
+            case YCBCR_P010: vf = 314; break;    // VIRGL_FORMAT_P010
+            default: break;
+        }
+        if (vf && (!yuv || ((width | height) & 1) == 0)) {
+            l.virtio_format = vf;
+            l.host_layout = true;
+        }
+    }
     uint64_t offset = 0;
     for (int i = 0; i < l.num_planes; i++) {
         const PlaneDesc& p = l.planes[i];
@@ -206,7 +226,13 @@ bool computeLayout(int32_t format, uint32_t width, uint32_t height, uint32_t lay
         const uint32_t h = (height + p.v_subsampling - 1) / p.v_subsampling;
         const uint64_t bitsPerSample = static_cast<uint64_t>(p.sample_increment_bits);
         uint64_t stride = (static_cast<uint64_t>(w) * bitsPerSample + 7) / 8;
-        if (l.resolved_format == YV12) {
+        if (l.host_layout && yuv) {
+            // 宿主布局：YV12 的 y_stride = ALIGN(width, 32)、c_stride = y_stride / 2（仍满足 Android
+            // 对 YV12 的 16 对齐约定）；NV12/P010 紧排
+            if (l.resolved_format == YV12) {
+                stride = i == 0 ? alignUp(width, 32) : l.plane_stride[0] / 2;
+            }
+        } else if (l.resolved_format == YV12) {
             // YV12 约定：y_stride = ALIGN(width, 16)，c_stride = ALIGN(y_stride / 2, 16)
             stride = i == 0 ? alignUp(width, 16) : alignUp(l.plane_stride[0] / 2, 16);
         } else if (yuv) {

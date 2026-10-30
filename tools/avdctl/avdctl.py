@@ -33,6 +33,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -68,8 +69,9 @@ MSYS_BIN = Path("C:/msys64/clangarm64/bin")
 DIST = ROOT / "dist" / "qemu"
 DEV_QEMU = ROOT / "qemu-ranchu" / "build" / "qemu-system-aarch64.exe"
 
+# gpu：新实例默认宿主 GPU（gfxstream）；没有这一项的旧实例按 swiftshader 运行（build_cmdline）
 DEFAULTS = {"width": 720, "height": 1280, "density": 320, "ram": 4096, "cores": 4,
-            "data_size": "8G"}
+            "data_size": "8G", "gpu": "gfxstream"}
 
 # 每次开机完成后由 QEMU（ranchu-vsock 的 boot-cmd）经 adbd 执行。正常是开机向导走完时写这两个标志
 # （官方镜像由 googlesdksetup 代劳）；没有开机向导的 GSI（如 ColorOS 移植包）永远是 0，而这时 Android
@@ -90,6 +92,16 @@ def qemu_exe() -> tuple[Path, dict]:
     跑旧的 dist），环境变量 RANCHU_QEMU=dist|dev 可强制指定。
     """
     env = dict(os.environ)
+    # gfxstream 宿主渲染器：rutabaga_gfx_ffi.dll → libgfxstream_backend-0.dll → ANGLE(D3D)。
+    # dist 模式下这些 DLL 都拷在 exe 旁边，开发模式还依赖 hostgfx/bin 与 clangarm64（PATH）。
+    env["PATH"] = str(ROOT / "hostgfx" / "bin") + os.pathsep + env.get("PATH", "")
+    env.setdefault("ANDROID_EGL_ON_EGL", "1")  # gfxstream GLES 走宿主 EGL（ANGLE→D3D）
+    # 目前只用 GLES：禁掉 gfxstream 的宿主 Vulkan 枚举（Windows ARM 的 vulkan-1.dll/ICD
+    # 组合在 QEMU 进程内初始化即崩，指向不存在的 loader 路径可让其优雅降级）
+    env.setdefault("ANDROID_EMU_VK_LOADER_PATH", "C:\\ranchuwoa-no-vulkan.dll")
+    # 调试用：宿主 gfxstream 日志级别（error|warning|info|debug|verbose）
+    if "GFXSTREAM_LOG_LEVEL" in os.environ:
+        env["GFXSTREAM_LOG_LEVEL"] = os.environ["GFXSTREAM_LOG_LEVEL"]
     dist = DIST / "qemu-system-aarch64.exe"
     want = os.environ.get("RANCHU_QEMU", "")
     use_dist = dist.exists() and (want == "dist" or (
@@ -99,6 +111,11 @@ def qemu_exe() -> tuple[Path, dict]:
     if not DEV_QEMU.exists():
         sys.exit("找不到补丁版 QEMU：先构建 qemu-ranchu（见 README）或使用打包好的 dist/qemu")
     env["PATH"] = str(MSYS_BIN) + os.pathsep + env.get("PATH", "")
+    # 可选：hostgfx/angle/（或环境变量 RANCHU_ANGLE 指向的目录）放自选的 ANGLE（如 Electron 的 ARM64 版），
+    # 排在 clangarm64 前面优先加载；默认用 MSYS2 的 angleproject
+    angle = Path(os.environ.get("RANCHU_ANGLE", ROOT / "hostgfx" / "angle"))
+    if (angle / "libGLESv2.dll").exists():
+        env["PATH"] = str(angle) + os.pathsep + env["PATH"]
     return DEV_QEMU, env
 
 
@@ -293,6 +310,9 @@ def do_prepare(args) -> None:
         if not cfg.get("system_base"):
             make_system_overlay(d, cfg)
             log(f"已重建 {d.name} 的系统盘（userdata 保留）")
+        else:
+            log(f"注意：{d.name} 用自定义系统盘 {Path(cfg['system_base']).name}（基础盘的拷贝），"
+                f"其中的 vendor 还是旧的：用 scripts/gsi_disk.py 重新生成，再 avdctl edit {d.name} --system <盘>")
     log("基础镜像完成。下一步：avdctl create <名字>")
 
 
@@ -340,7 +360,7 @@ def do_create(args) -> None:
     used = {load_cfg(p)["index"] for p in all_avds()}
     index = next(i for i in range(64) if i not in used)
     cfg = dict(DEFAULTS)
-    for k in ("width", "height", "density", "ram", "cores", "data_size", "audio"):
+    for k in ("width", "height", "density", "ram", "cores", "data_size", "audio", "gpu"):
         v = getattr(args, k)
         if v is not None:
             cfg[k] = v
@@ -370,11 +390,12 @@ def do_create(args) -> None:
     log(f"已创建 {d}；启动：avdctl start {args.name}")
 
 
-EDITABLE = ("width", "height", "density", "ram", "cores", "audio")
+EDITABLE = ("width", "height", "density", "ram", "cores", "audio", "gpu")
 
 
 def do_edit(args) -> None:
-    """改实例的硬件配置（分辨率/密度/内存/核数/声音），下次启动生效。userdata 大小改不了（要重建）。"""
+    """改实例的硬件配置（分辨率/密度/内存/核数/声音/GPU），下次启动生效。userdata 大小改不了（要重建）。
+    --system：换（或在原路径重新生成后重新挂上）自定义系统盘，只重建写时复制层，userdata 保留。"""
     d = avd_dir(args.name)
     if run_info(d):
         sys.exit("AVD 正在运行，先 stop")
@@ -382,12 +403,19 @@ def do_edit(args) -> None:
     changed = {k: getattr(args, k) for k in EDITABLE if getattr(args, k) is not None}
     if args.mic is not None:
         changed["mic"] = args.mic
+    if args.system:
+        if not Path(args.system).exists():
+            sys.exit(f"找不到系统盘 {args.system}")
+        changed["system_base"] = str(Path(args.system).resolve())
     if not changed:
-        sys.exit("没有要改的项（--width/--height/--density/--ram/--cores/--audio/--mic/--no-mic）")
+        sys.exit("没有要改的项（--width/--height/--density/--ram/--cores/--audio/--gpu/--mic/--no-mic/--system）")
     for k, v in changed.items():
         log(f"{k}: {cfg.get(k)} → {v}")
     cfg.update(changed)
     save_cfg(d, cfg)
+    if args.system:
+        make_system_overlay(d, cfg)
+        log("已按新系统盘重建写时复制层（userdata 保留）")
     log(f"已保存；{args.name} 现在是 {cfg['width']}x{cfg['height']}@{cfg['density']}dpi，"
         f"{cfg['ram']}MB，{cfg['cores']} 核")
 
@@ -433,12 +461,19 @@ def do_list(args) -> None:
 def build_cmdline(name: str, d: Path, cfg: dict, headless: bool, verbose: bool = False) -> list[str]:
     """verbose：内核/init 日志全部打到串口控制台（logs/console.log），排查开机问题用。"""
     p = ports_of(cfg)
+    # GPU：gfxstream = 宿主 GPU（virtio-gpu rutabaga 设备，新实例默认），swiftshader = guest 内 CPU 渲染
+    # （没有 gpu 配置项的旧实例按它运行）。gfxstream 下
+    # guest 的 EGL/GLES 编码后经 x-gfxstream-gles capset 转发给宿主 gfxstream → ANGLE → D3D
+    gpu = cfg.get("gpu", "swiftshader")
+    egl_flags = ("androidboot.hardwareegl=emulation androidboot.hardware.gralloc=minigbm "
+                 "androidboot.hardware.gltransport=virtio-gpu-pipe") if gpu == "gfxstream" \
+        else "androidboot.hardwareegl=swiftshader"
     append = " ".join([
         "console=ttyAMA0",
         "loglevel=7 printk.devkmsg=on" if verbose else "loglevel=3",
         "qemu=1 androidboot.qemu=1 androidboot.hardware=ranchu",
         "androidboot.boot_devices=a003a00.virtio_mmio,a003c00.virtio_mmio rootwait init=/init",
-        "8250.nr_uarts=1 androidboot.hardwareegl=swiftshader",
+        f"8250.nr_uarts=1 {egl_flags}",
         # SELinux 默认 enforcing（与官方模拟器相同）；permissive 只在 userdebug 镜像上生效，
         # GSI 等 user 版本总是 enforcing
         f"androidboot.selinux={cfg.get('selinux', 'enforcing')}",
@@ -470,7 +505,10 @@ def build_cmdline(name: str, d: Path, cfg: dict, headless: bool, verbose: bool =
         "-drive", f"file={d / 'data.qcow2'},if=none,id=datadisk,format=qcow2",
         "-object", "rng-builtin,id=rng0", "-device", "virtio-rng-device,rng=rng0",
         "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
-        "-device", f"virtio-gpu-pci,xres={cfg['width']},yres={cfg['height']}",
+        "-device", (
+            f"virtio-gpu-rutabaga-pci,x-gfxstream-gles=on,wsi=surfaceless,hostmem=2G,"
+            f"xres={cfg['width']},yres={cfg['height']}" if gpu == "gfxstream"
+            else f"virtio-gpu-pci,xres={cfg['width']},yres={cfg['height']}"),
         "-device", "virtio-touchscreen-pci", "-device", "virtio-keyboard-pci",
         *audio,
         "-device", "virtio-serial-pci,id=vser0",
@@ -727,9 +765,13 @@ def do_geo(args) -> None:
 def do_dist(args) -> None:
     if not DEV_QEMU.exists():
         sys.exit("先构建 qemu-ranchu")
+    if any(run_info(d) for d in all_avds()):
+        sys.exit("有 AVD 在运行（可能正占用 dist 里的 DLL），先 stop")
+    shutil.rmtree(DIST, ignore_errors=True)     # 重新打包，免得旧版本遗留的 DLL 混在里面
     DIST.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    env["PATH"] = f"{MSYS_BIN};C:\\msys64\\usr\\bin;" + env.get("PATH", "")
+    # hostgfx/bin 也要在 PATH 里：ldd 找不到 rutabaga_gfx_ffi.dll 时整棵依赖树都解析不全
+    env["PATH"] = f"{ROOT / 'hostgfx' / 'bin'};{MSYS_BIN};C:\\msys64\\usr\\bin;" + env.get("PATH", "")
     exes = [DEV_QEMU, MSYS_BIN / "qemu-img.exe"]
     dlls = set()
     for exe in exes:
@@ -743,7 +785,42 @@ def do_dist(args) -> None:
     for dll in sorted(dlls):
         src = Path("C:/msys64" + dll)
         shutil.copy2(src, DIST / src.name)
-    log(f"已打包 {len(exes)} 个程序 + {len(dlls)} 个 DLL → {DIST}")
+    dist_gfxstream()
+    n = len(list(DIST.glob("*.dll")))
+    log(f"已打包 {len(exes)} 个程序 + {n} 个 DLL → {DIST}")
+
+
+def dist_gfxstream() -> None:
+    """gfxstream 链路：rutabaga_gfx_ffi → libgfxstream_backend → ANGLE（按名 LoadLibrary，ldd 看不到），
+    连同它们在 clangarm64 里的依赖一起放到 exe 旁边。"""
+    hostbin = ROOT / "hostgfx" / "bin"
+    if not (hostbin / "rutabaga_gfx_ffi.dll").exists():
+        log("没有 hostgfx（gfx/build_gfxstream_host.sh 未构建），dist 不含 gfxstream 模式")
+        return
+    angle = Path(os.environ.get("RANCHU_ANGLE", ROOT / "hostgfx" / "angle"))
+    if not (angle / "libGLESv2.dll").exists():
+        angle = MSYS_BIN
+    todo = [hostbin / "rutabaga_gfx_ffi.dll", hostbin / "libgfxstream_backend-0.dll",
+            angle / "libEGL.dll", angle / "libGLESv2.dll"]
+    readobj = MSYS_BIN / "llvm-readobj.exe"
+    strip = MSYS_BIN / "llvm-strip.exe"
+    done: set[str] = set()
+    while todo:
+        src = todo.pop()
+        if src.name.lower() in done:
+            continue
+        done.add(src.name.lower())
+        dst = DIST / src.name
+        if src.name.startswith("libgfxstream_backend"):
+            # 开发构建是 debugoptimized（带调试信息 78 MB），dist 里去掉调试段
+            subprocess.run([str(strip), "--strip-debug", "-o", str(dst), str(src)], check=True)
+        else:
+            shutil.copy2(src, dst)
+        out = subprocess.run([str(readobj), "--coff-imports", str(src)], capture_output=True,
+                             text=True).stdout
+        for name in re.findall(r"^\s*Name: (\S+\.dll)\s*$", out, re.M | re.I):
+            if name.lower() not in done and (MSYS_BIN / name).exists():
+                todo.append(MSYS_BIN / name)
 
 
 # ---------------------------------------------------------------- main
@@ -764,6 +841,8 @@ def main() -> None:
         p.add_argument(f"--{k}", type=t)
     p.add_argument("--data-size", dest="data_size")
     p.add_argument("--audio", choices=["dsound", "sdl", "none"])
+    p.add_argument("--gpu", choices=["swiftshader", "gfxstream"],
+                   help="gfxstream＝宿主 GPU 加速（默认）；swiftshader＝guest 内 CPU 渲染")
     p.add_argument("--mic", action="store_true")
     p.add_argument("--system", help="自定义系统盘（GPT：vbmeta+super，如 scripts/gsi_disk.py 的产物）")
     p.add_argument("--no-firstboot", action="store_true")
@@ -773,7 +852,10 @@ def main() -> None:
     for k, t in (("width", int), ("height", int), ("density", int), ("ram", int), ("cores", int)):
         p.add_argument(f"--{k}", type=t)
     p.add_argument("--audio", choices=["dsound", "sdl", "none"])
+    p.add_argument("--gpu", choices=["swiftshader", "gfxstream"],
+                   help="切换渲染后端，下次启动生效")
     p.add_argument("--mic", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--system", help="自定义系统盘（gsi_disk.py 重新生成后用它重新挂上）")
     p = sub.add_parser("start")
     p.add_argument("name")
     p.add_argument("--headless", action="store_true")

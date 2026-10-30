@@ -3570,36 +3570,168 @@
      object_class_property_add_bool(oc, "highmem", virt_get_highmem,
                                     virt_set_highmem);
      object_class_property_set_description(oc, "highmem",
---- a/hw/display/virtio-gpu.c
-+++ b/hw/display/virtio-gpu.c
-@@ -586,6 +586,26 @@
+--- a/hw/display/virtio-gpu-base.c
++++ b/hw/display/virtio-gpu-base.c
+@@ -64,7 +64,12 @@
+         .height_mm = g->req_state[scanout].height_mm,
+         .prefx = g->req_state[scanout].width,
+         .prefy = g->req_state[scanout].height,
+-        .refresh_rate = g->req_state[scanout].refresh_rate,
++        /*
++         * RanchuWoA：UI（SDL）不上报刷新率时 EDID 默认是 75 Hz，而 Android 的渲染帧率上限是
++         * 60 fps，框架只能取 75 的约数 37.5 fps。没有上报时按 60 Hz 生成。
++         */
++        .refresh_rate = g->req_state[scanout].refresh_rate ?
++                        g->req_state[scanout].refresh_rate : 60000,
+     };
+ 
+     for (output_idx = 0, node = g->conf.outputs;
+--- a/hw/display/virtio-gpu-rutabaga.c
++++ b/hw/display/virtio-gpu-rutabaga.c
+@@ -257,9 +257,10 @@
+     res = virtio_gpu_find_resource(g, rf.resource_id);
+     CHECK(res, cmd);
+ 
++    /* RanchuWoA：按 set_scanout 记下的资源找扫描输出（见 rutabaga_cmd_set_scanout） */
+     for (i = 0; i < vb->conf.max_outputs; i++) {
+         scanout = &vb->scanout[i];
+-        if (i == res->scanout_bitmask) {
++        if (scanout->ds && scanout->resource_id == rf.resource_id) {
+             found = true;
+             break;
+         }
+@@ -276,7 +277,7 @@
+     transfer.h = res->height;
+     transfer.d = 1;
+ 
+-    transfer_iovec.iov_base = pixman_image_get_data(res->image);
++    transfer_iovec.iov_base = surface_data(scanout->ds);
+     transfer_iovec.iov_len = res->width * res->height * 4;
+ 
+     result = rutabaga_resource_transfer_read(vr->rutabaga, 0,
+@@ -309,6 +310,8 @@
+     if (ss.resource_id == 0) {
+         qemu_console_set_surface(scanout->con, NULL);
+         qemu_console_gl_scanout_disable(scanout->con);
++        scanout->ds = NULL;             /* RanchuWoA：控制台已释放旧 surface */
++        scanout->resource_id = 0;
          return;
      }
  
+@@ -321,25 +324,32 @@
+         return;
+     }
+ 
+-    if (!res->image) {
+-        pixman_format_code_t pformat;
+-        pformat = virtio_gpu_get_pixman_format(res->format);
+-        CHECK(pformat, cmd);
+-
+-        res->image = pixman_image_create_bits(pformat,
+-                                              res->width,
+-                                              res->height,
+-                                              NULL, 0);
+-        CHECK(res->image, cmd);
+-        pixman_image_ref(res->image);
+-    }
 +    /*
-+     * RanchuWoA: Android 的 gralloc 用 VIRTGPU_RESOURCE_CREATE 建 2D 资源，CPU（SwiftShader）
-+     * 直接写 guest backing；guest 内核只对 dumb BO 在 plane 更新时发 TRANSFER_TO_HOST_2D，
-+     * 其余只发 RESOURCE_FLUSH。这里把 flush 视为 backing 已更新：先把该矩形拷进宿主图像。
-+     * 对 dumb BO 只是多一次同内容拷贝。
++     * RanchuWoA：扫描输出用一张常驻图像，每次 RESOURCE_FLUSH 把当前资源读回到这里。
++     * 原实现每次 SET_SCANOUT 都先换成空 surface 再换成该资源自己的图像——Android 的
++     * 客户端目标在约 3 个缓冲间轮换，那张图像停在几帧前的读回内容，SDL 在换 surface 时
++     * 立即呈现，紧随的 flush 才更新：滚动等连续翻页时画面来回跳（闪烁）。
++     * 只有尺寸/格式变化才换 surface。
 +     */
-+    if (g->ranchu_coherent_flush && !res->blob && res->iov && res->image &&
-+        rf.r.width && rf.r.height) {
-+        pixman_format_code_t format = pixman_image_get_format(res->image);
-+        int bpp = DIV_ROUND_UP(PIXMAN_FORMAT_BPP(format), 8);
-+        uint32_t stride = pixman_image_get_stride(res->image);
-+        uint8_t *img_data = (uint8_t *)pixman_image_get_data(res->image);
-+
-+        for (i = 0; i < rf.r.height; i++) {
-+            size_t off = (size_t)(rf.r.y + i) * stride + (size_t)rf.r.x * bpp;
-+            iov_to_buf(res->iov, res->iov_cnt, off, img_data + off,
-+                       (size_t)rf.r.width * bpp);
-+        }
++    pixman_format_code_t pformat = virtio_gpu_get_pixman_format(res->format);
++    CHECK(pformat, cmd);
+ 
+     vb->enable = 1;
+ 
+-    /* realloc the surface ptr */
+-    scanout->ds = qemu_create_displaysurface_pixman(res->image);
+-    qemu_console_set_surface(scanout->con, NULL);
+-    qemu_console_set_surface(scanout->con, scanout->ds);
++    if (!scanout->ds ||
++        surface_width(scanout->ds) != res->width ||
++        surface_height(scanout->ds) != res->height ||
++        surface_format(scanout->ds) != pformat) {
++        pixman_image_t *image = pixman_image_create_bits(pformat, res->width,
++                                                         res->height, NULL, 0);
++        CHECK(image, cmd);
++        scanout->ds = qemu_create_displaysurface_pixman(image);
++        pixman_image_unref(image);
++        qemu_console_set_surface(scanout->con, scanout->ds);
 +    }
++    scanout->resource_id = ss.resource_id;
++    scanout->width = res->width;
++    scanout->height = res->height;
+     res->scanout_bitmask = ss.scanout_id;
+ }
+ 
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -518,6 +518,37 @@
+     }
+ }
+ 
++/*
++ * RanchuWoA: Android 的 gralloc 用 VIRTGPU_RESOURCE_CREATE 建 2D 资源，CPU（SwiftShader）
++ * 直接写 guest backing；guest 内核只对 dumb BO 在 plane 更新时发 TRANSFER_TO_HOST_2D，
++ * 其余只发 RESOURCE_FLUSH。ranchu-coherent-flush 打开时，把 backing 的这块矩形视为已更新，
++ * 拷进宿主图像（对 dumb BO 只是多一次同内容拷贝）。
++ */
++static void ranchu_sync_backing(VirtIOGPU *g,
++                                struct virtio_gpu_simple_resource *res,
++                                uint32_t x, uint32_t y,
++                                uint32_t width, uint32_t height)
++{
++    pixman_format_code_t format;
++    uint8_t *img_data;
++    uint32_t stride, i;
++    int bpp;
++
++    if (!g->ranchu_coherent_flush || res->blob || !res->iov || !res->image ||
++        !width || !height) {
++        return;
++    }
++    format = pixman_image_get_format(res->image);
++    bpp = DIV_ROUND_UP(PIXMAN_FORMAT_BPP(format), 8);
++    stride = pixman_image_get_stride(res->image);
++    img_data = (uint8_t *)pixman_image_get_data(res->image);
++    for (i = 0; i < height; i++) {
++        size_t off = (size_t)(y + i) * stride + (size_t)x * bpp;
++        iov_to_buf(res->iov, res->iov_cnt, off, img_data + off,
++                   (size_t)width * bpp);
++    }
++}
++
+ static void virtio_gpu_resource_flush(VirtIOGPU *g,
+                                       struct virtio_gpu_ctrl_command *cmd)
+ {
+@@ -586,6 +617,8 @@
+         return;
+     }
+ 
++    ranchu_sync_backing(g, res, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
 +
      qemu_rect_init(&flush_rect, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
      for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
          QemuRect rect;
-@@ -1854,6 +1874,7 @@
+@@ -711,6 +744,14 @@
+         data = res->blob;
+     } else {
+         data = (uint8_t *)pixman_image_get_data(res->image);
++        /*
++         * RanchuWoA：翻页到另一个资源时，它的宿主图像还停在上次 flush（几帧前）的内容，
++         * 而下面换 surface 时 SDL 会立即呈现——紧随的 RESOURCE_FLUSH 才更新，连续翻页
++         * （滚动）时画面来回跳。plane 更新已等过栅栏，backing 此刻就是新帧：先同步。
++         */
++        if (scanout->resource_id != res->resource_id) {
++            ranchu_sync_backing(g, res, r->x, r->y, r->width, r->height);
++        }
+     }
+ 
+     /* create a surface for this scanout */
+@@ -1854,6 +1895,7 @@
                      VIRTIO_GPU_FLAG_BLOB_ENABLED, false),
      DEFINE_PROP_SIZE("hostmem", VirtIOGPU, parent_obj.conf.hostmem, 0),
      DEFINE_PROP_UINT8("x-scanout-vmstate-version", VirtIOGPU, scanout_vmstate_version, 2),

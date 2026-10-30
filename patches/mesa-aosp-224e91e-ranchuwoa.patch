@@ -1,0 +1,29 @@
+diff --git a/src/gfxstream/guest/android/GfxStreamGralloc.cpp b/src/gfxstream/guest/android/GfxStreamGralloc.cpp
+index 1a70a9d..ec7518b 100644
+--- a/src/gfxstream/guest/android/GfxStreamGralloc.cpp
++++ b/src/gfxstream/guest/android/GfxStreamGralloc.cpp
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "gfxstream/guest/GfxStreamGralloc.h"
++#include "util/log.h"
+ #include "util/detect_os.h"
+ 
+ #if DETECT_OS_ANDROID
+@@ -17,8 +18,15 @@
+ namespace gfxstream {
+ 
+ Gralloc* createPlatformGralloc(int32_t descriptor) {
++    // RanchuWoA: the image vendor's init has already set ro.hardware.gralloc=ranchu (goldfish gralloc),
++    // while the gfxstream mode selection goes through the kernel command line (→ ro.boot.hardware.gralloc).
++    // If either of the two properties is minigbm, use the minigbm handle parsing (the woa gralloc layout
++    // matches cros_gralloc).
+     const std::string value = android::base::GetProperty("ro.hardware.gralloc", "");
+-    if (value == "minigbm") {
++    const std::string bootValue = android::base::GetProperty("ro.boot.hardware.gralloc", "");
++    mesa_logi("RanchuWoA: createPlatformGralloc ro=[%s] ro.boot=[%s] descriptor=%d",
++              value.c_str(), bootValue.c_str(), descriptor);
++    if (value == "minigbm" || bootValue == "minigbm") {
+         auto gralloc = new MinigbmGralloc(descriptor);
+         return gralloc;
+     }

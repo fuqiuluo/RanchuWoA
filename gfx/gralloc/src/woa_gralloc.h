@@ -114,7 +114,8 @@ struct PlaneDesc {
 struct Layout {
     int32_t resolved_format;  // IMPLEMENTATION_DEFINED / YCbCr_420_888 解析后的 HAL 格式
     uint32_t drm_fourcc;
-    uint32_t virtio_format;   // 0 = 不能作为 virtio-gpu 2D 资源
+    uint32_t virtio_format;   // 0 = 不能作为 virtio-gpu 资源（2D 模式只有 32bpp；3D 见 host_layout）
+    bool host_layout;         // 按宿主 gfxstream 的线性布局排的非 32bpp 格式（只在 virtio-gpu 有 3D 时）
     uint32_t pixel_stride;    // AllocationResult.stride / STRIDE 元数据（像素）
     int num_planes;
     PlaneDesc planes[kMaxPlanes];
@@ -127,8 +128,10 @@ struct Layout {
 };
 
 // 计算布局；不支持的组合返回 false
+// hostGpu：virtio-gpu 带 3D（gfxstream 模式）。此时宿主能建 ColorBuffer 的其余格式（YUV、565、FP16…）
+// 也给出 virgl 格式，并按宿主 transfer 的线性布局排平面（与宿主逐字节一致，CPU 读写才能经 transfer 同步）。
 bool computeLayout(int32_t format, uint32_t width, uint32_t height, uint32_t layerCount,
-                   uint64_t usage, Layout* out);
+                   uint64_t usage, Layout* out, bool hostGpu = false);
 
 // 按句柄重建平面描述（mapper 用）
 bool planeDescsFor(int32_t resolvedFormat, PlaneDesc* planes, int* numPlanes);

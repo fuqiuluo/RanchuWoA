@@ -1,5 +1,7 @@
-# RanchuWoA：无宿主渲染器的图形栈（woa gralloc + guest SwiftShader + hwc3 client/DRM 模式）
-# GLES 驱动由内核命令行 androidboot.hardwareegl=swiftshader 选择（init.ranchu.rc 读取）。
+# RanchuWoA 图形栈（woa gralloc + guest SwiftShader / 宿主 gfxstream 二选一 + hwc3 client/DRM 模式）
+# GLES 驱动由内核命令行 androidboot.hardwareegl=swiftshader|emulation 选择（init.ranchu.rc 读取）。
+# gfxstream 模式另传 androidboot.hardware.gralloc=minigbm / androidboot.hardware.gltransport=virtio-gpu-pipe，
+# 由 guest 图形栈（libOpenglSystemCommon）直接读 ro.boot.* 属性。
 on early-init
     # hwc3：所有图层由 SurfaceFlinger 用 RenderEngine 合成（client），客户端目标经 virtio-gpu KMS 扫描输出
     setprop ro.vendor.hwcomposer.mode client

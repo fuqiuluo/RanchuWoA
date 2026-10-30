@@ -1,8 +1,10 @@
 // allocator.cpp — android.hardware.graphics.allocator.IAllocator/default（AIDL V2）服务。
 //
-// 合成器客户端目标（COMPOSER_CLIENT_TARGET）且为 RGBA/RGBX/BGRA 时，缓冲区是 virtio-gpu 2D 资源
-// 导出的 dma-buf，ranchu hwc3 可直接 drmModeAddFB2 扫描输出；其余缓冲区来自 DMA-BUF system heap
-// （与常规 Android gralloc 相同，各进程映射无需额外 SELinux 规则），heap 不可用时才退回 memfd。
+// 无 CPU 读写用途且为 RGBA/RGBX/BGRA 的 GPU 缓冲（合成器目标、采样纹理、渲染目标）是
+// virtio-gpu 2D 资源导出的 dma-buf：宿主 gfxstream 在资源创建时以 res_handle 为键建好
+// ColorBuffer，消费端同设备回导后即可零拷贝纹理化，ranchu hwc3 也可直接 drmModeAddFB2
+// 扫描输出；带 CPU 用途的缓冲来自 DMA-BUF system heap（与常规 Android gralloc 相同，各进程
+// 映射无需额外 SELinux 规则），heap 不可用时才退回 memfd。
 // 所有后备都可被 mapper 直接 mmap（CPU 渲染的 SwiftShader 依赖这一点）。
 #include <aidl/android/hardware/graphics/allocator/AllocationError.h>
 #include <aidl/android/hardware/graphics/allocator/BnAllocator.h>
@@ -42,7 +44,7 @@ using aidl::android::hardware::graphics::allocator::BufferDescriptorInfo;
 namespace woa {
 namespace {
 
-constexpr uint64_t kUsageClientTarget = 1ull << 12;  // BufferUsage::COMPOSER_CLIENT_TARGET
+constexpr uint64_t kUsageClientTarget __attribute__((unused)) = 1ull << 12;  // BufferUsage::COMPOSER_CLIENT_TARGET
 
 ndk::ScopedAStatus allocError(AllocationError e) {
     return ndk::ScopedAStatus::fromServiceSpecificError(static_cast<int32_t>(e));
@@ -84,6 +86,21 @@ class VirtioGpu {
         return fd;
     }
 
+    // virtio-gpu 是否带 3D（gfxstream 模式）：决定非 32bpp 格式能否建成宿主 ColorBuffer
+    bool has3d() {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!openLocked()) return false;
+        if (m3d < 0) {
+            int v = 0;
+            drm_virtgpu_getparam gp{};
+            gp.param = VIRTGPU_PARAM_3D_FEATURES;
+            gp.value = reinterpret_cast<uintptr_t>(&v);
+            m3d = (ioctl(mFd, DRM_IOCTL_VIRTGPU_GETPARAM, &gp) == 0 && v) ? 1 : 0;
+            ALOGI("virtio-gpu 3D：%s", m3d ? "有（宿主 gfxstream）" : "无（2D）");
+        }
+        return m3d == 1;
+    }
+
   private:
     bool openLocked() {
         if (mFd >= 0) return true;
@@ -111,6 +128,7 @@ class VirtioGpu {
     std::mutex mMutex;
     int mFd = -1;
     bool mTried = false;
+    int m3d = -1;  // -1 未查询
 };
 
 // 返回 dma-buf fd；heap 不存在或分配失败返回 -1
@@ -161,7 +179,7 @@ class Allocator : public BnAllocator {
         const auto format = static_cast<int32_t>(d.format);
         const auto usage = static_cast<uint64_t>(d.usage);
         Layout layout;
-        if (!computeLayout(format, d.width, d.height, d.layerCount, usage, &layout)) {
+        if (!computeLayout(format, d.width, d.height, d.layerCount, usage, &layout, mGpu.has3d())) {
             ALOGW("不支持: %dx%d fmt=%#x usage=%#llx layers=%d", d.width, d.height, format,
                   (unsigned long long)usage, d.layerCount);
             return allocError(AllocationError::UNSUPPORTED);
@@ -208,8 +226,17 @@ class Allocator : public BnAllocator {
 
         uint32_t backing = kBackingMemfd;
         int fd = -1;
-        if ((usage & kUsageClientTarget) && layout.virtio_format != 0 &&
-            layout.pixel_stride == static_cast<uint32_t>(d.width)) {
+        // 32bpp 颜色缓冲一律走 virtio-gpu 2D 资源：资源创建时宿主 gfxstream 即以 res_handle
+        // 为键建好 ColorBuffer，消费端（SF Skia 的 glEGLImageTargetTexture2DOES）经
+        // drmPrimeFDToHandle 同设备回导拿到 res_handle，rcBindTexture 即可零拷贝纹理化。
+        // 内核 6.6 的 virtio-gpu 不支持导入外来 dma-buf（import_sg_table 返回 ENODEV），因此
+        // dma-heap 缓冲在宿主侧必然导入失败——而 SF 的 Skia RenderEngine 在开机阶段探测到
+        // 任一导入失败就会永久回退 CPU 合成（内容只写 guest 内存），宿主读回永远全零、黑屏。
+        // 所以连 CPU 用途的缓冲也必须走 virtio-gpu；CPU 读写由 mapper 在 lock/unlock 时用
+        // TRANSFER_FROM/TO_HOST 与宿主同步。gfxstream 模式下 YUV/565/FP16 等格式也按宿主布局
+        // 建成 ColorBuffer（host_layout），否则视频帧之类在宿主侧没有对应物、显示为黑。
+        if (layout.virtio_format != 0 &&
+            (layout.host_layout || layout.pixel_stride == static_cast<uint32_t>(d.width))) {
             fd = mGpu.createDmabuf(layout.virtio_format, d.width, d.height, total);
             if (fd >= 0) backing = kBackingVirtioGpu;
         }
@@ -272,14 +299,14 @@ class Allocator : public BnAllocator {
     }
 
     static bool initSharedMeta(int fd, const Handle& h, const std::string& name) {
-        void* p = mmap(nullptr, kMetaPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
-                       static_cast<off_t>(h.meta_offset));
+        // 从偏移 0 整体映射：virtio-gpu 导出的 dma-buf 带偏移 mmap 时内核忽略偏移（见 mapper.cpp）
+        void* p = mmap(nullptr, h.total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (p == MAP_FAILED) {
-            ALOGE("映射元数据页失败（backing=%u off=%llu）: %s", h.backing,
-                  (unsigned long long)h.meta_offset, strerror(errno));
+            ALOGE("映射缓冲区失败（backing=%u size=%llu）: %s", h.backing,
+                  (unsigned long long)h.total_size, strerror(errno));
             return false;
         }
-        auto* m = static_cast<SharedMeta*>(p);
+        auto* m = reinterpret_cast<SharedMeta*>(static_cast<uint8_t*>(p) + h.meta_offset);
         memset(m, 0, sizeof(*m));
         m->magic = kMetaMagic;
         m->version = 1;
@@ -289,7 +316,7 @@ class Allocator : public BnAllocator {
             m->crop[i][3] = static_cast<int32_t>(h.height);
         }
         strncpy(m->name, name.c_str(), sizeof(m->name) - 1);
-        munmap(p, kMetaPageSize);
+        munmap(p, h.total_size);
         return true;
     }
 

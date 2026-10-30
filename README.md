@@ -1,7 +1,8 @@
 # RanchuWoA — Windows on ARM 原生 Android 模拟器
 
 在 Windows on ARM（骁龙 X Elite 等）上用 **QEMU + WHPX 硬件虚拟化** 原生运行 Google 官方 Android 15 系统镜像
-（android-35 google_apis arm64-v8a），用法类似 Android Studio 的 AVD。不依赖 WSL，也不依赖宿主 GPU。
+（android-35 google_apis arm64-v8a），用法类似 Android Studio 的 AVD。不依赖 WSL；图形可以走宿主 GPU（gfxstream →
+ANGLE → Direct3D 11），也可以完全在 guest 里用 CPU 渲染（SwiftShader）。
 
 <p>
 <img src="docs/img/window.png" width="300" alt="模拟器窗口与侧边工具栏">
@@ -36,16 +37,16 @@ avdctl stop pixel       :: 正常关机
 | 命令 | 说明 |
 |---|---|
 | `prepare [--force]` | 生成/重建基础镜像 `images/base/android-35`。`--force` 重建后会自动重建所有实例的系统盘（userdata 保留） |
-| `create <名字> [选项]` | 选项：`--width 720 --height 1280 --density 320 --ram 4096 --cores 4 --data-size 8G`、`--audio dsound\|sdl\|none`、`--mic`、`--no-firstboot`、`--system <盘>`（自定义系统盘，见「运行 GSI」） |
+| `create <名字> [选项]` | 选项：`--width 720 --height 1280 --density 320 --ram 4096 --cores 4 --data-size 8G`、`--gpu gfxstream\|swiftshader`（见「图形后端」）、`--audio dsound\|sdl\|none`、`--mic`、`--no-firstboot`、`--system <盘>`（自定义系统盘，见「运行 GSI」） |
 | `list` | 列出实例、adb 序列号、运行状态 |
-| `edit <名字> [选项]` | 修改已有实例（需先 stop）：`--width --height --density --ram --cores --audio --mic/--no-mic`，下次启动生效 |
+| `edit <名字> [选项]` | 修改已有实例（需先 stop）：`--width --height --density --ram --cores --gpu --audio --mic/--no-mic`，下次启动生效；`--system <盘>` 换/重新挂上自定义系统盘（只重建写时复制层，userdata 保留） |
 | `start <名字> [--wait] [--headless] [--foreground] [--no-toolbar]` | 启动（同时打开侧边工具栏）；`--foreground` 在当前终端前台运行 QEMU；排查用：`--verbose-boot`（内核/init 日志全部进 `logs/console.log`）、`--selinux permissive\|enforcing`（只影响这次） |
 | `toolbar <名字>` | 给运行中的实例重新打开侧边工具栏（已开着时不会重复打开） |
 | `stop <名字> [--force]` | 正常关机（与关窗口相同：QMP `system_powerdown` → 经 adbd `svc power shutdown`），不行再试串口控制台和 adb，超时后强制退出；`--force` 直接退出 |
 | `wipe <名字> [--no-firstboot]` | 恢复出厂（重建 userdata） |
 | `delete <名字>` | 删除实例 |
 | `geo <名字> <纬度> <经度> [海拔]` | 设置 GPS 位置；运行中立即生效，并记入实例配置 |
-| `dist` | 把 QEMU 和 qemu-img 连同 66 个 DLL 打包到 `dist/qemu`，之后不再需要 MSYS2 |
+| `dist` | 把 QEMU 和 qemu-img 连同所需 DLL（含 gfxstream、rutabaga 与 ANGLE，共约 70 个）打包到 `dist/qemu`，之后不再需要 MSYS2 |
 
 ### 实例文件与端口
 
@@ -66,6 +67,16 @@ avdctl stop pixel       :: 正常关机
   QEMU 的 Windows TCP 串口不适合反复重连，尽量保持一条连接。
 - 截屏：工具栏的相机按钮（存到「图片\屏幕截图」），或 `py scripts/hmp.py --port 25401 --shot out.png`。
   输入自动化：`scripts/qmp_input.py`（tap/swipe/key/text）。
+
+## 图形后端
+
+| `--gpu` | 渲染 | 说明 |
+|---|---|---|
+| `gfxstream` | 宿主 GPU：guest 的 GLES 调用编码后经 virtio-gpu 转给 QEMU 里的 gfxstream，再由 ANGLE 转成 Direct3D 11 | 单帧耗时约为 SwiftShader 的一半以下、不占 guest CPU；OpenGL ES 3.0 |
+| `swiftshader` | guest 内 CPU 渲染（SwiftShader） | 不依赖宿主图形驱动，兼容性兜底；OpenGL ES 3.0 |
+
+`avdctl edit <名字> --gpu swiftshader|gfxstream` 随时切换（下次启动生效，两种后端都已装在基础镜像里）。
+两种模式都没有 Vulkan。gfxstream 模式下宿主出问题时，`logs/qemu.log` 里会有 `RanchuWoA-VEH` 开头的崩溃记录。
 
 ## 运行 GSI（实验性）
 
@@ -100,22 +111,29 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
   找出来补到 `gfx/vendor-overlay/gsi/gsi_sepolicy.cil`。
 - 没有开机向导的 GSI（如这个 ColorOS 移植包）不会写 `device_provisioned`/`user_setup_complete`，Android 会一直不响应
   主屏幕键和最近任务；QEMU 在每次开机完成后经 adbd 把它们补成 1（无需手动处理）。
-- 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要重新生成。
+- 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要用 `gsi_disk.py`（ColorOS 再加 `coloros_gsi_fixes.py`）重新生成，
+  再 `avdctl edit <名字> --system <盘>` 重新挂上（只重建写时复制层，userdata 保留）。
 
 ## 工作原理
 
 ```
-App / hwui ─────┐                                   ┌ ranchu hwc3（client 合成 + DRM 显示器）
-SurfaceFlinger ─┼→ SwiftShader GLES（guest，CPU）──→ │  AddFB2 + atomic commit
-bootanimation ──┘   经 AHardwareBuffer 锁 gralloc    └→ virtio-gpu 2D → QEMU SDL 窗口
-                woa gralloc：AIDL IAllocator v2 + stable-C IMapper v5
+                 ┌ swiftshader：SwiftShader GLES（guest，CPU）── 经 AHardwareBuffer 锁 gralloc ─┐
+App / hwui ─────┤                                                                              │
+SurfaceFlinger ─┤                                                                              ├→ ranchu hwc3（client 合成，
+bootanimation ──┤                                                                              │   AddFB2 + atomic commit）
+                 └ gfxstream：GLES 编码器（guest）→ virtio-gpu → QEMU rutabaga → gfxstream ────┘   → virtio-gpu → SDL 窗口
+                                                    → ANGLE → Direct3D 11（宿主 GPU）
+                woa gralloc：AIDL IAllocator v2 + stable-C IMapper v5（gfxstream 模式下缓冲就是宿主 ColorBuffer）
 ```
 
 - **机器**：WHPX 只支持 `virt` 板，ranchu 兼容层是 `virt` 上的开关 `-M virt,ranchu-devices=on`：注入 Android 固件
   节点和 goldfish 设备（pipe/sync/battery），并把 system/metadata/userdata 三块盘钉到 ranchu 约定的 virtio-mmio 槽位。
-- **图形**：官方镜像的 gralloc、composer、EGL 都要连宿主渲染器（gfxstream），这里全部换成 guest 内的软件实现：
-  自研 gralloc（`gfx/gralloc`）+ Android 平台版 SwiftShader（`gfx/swiftshader`）+ 原镜像的 hwc3（client 模式直接扫描输出到
-  virtio-gpu）。改动写进 super 里的 vendor 分区（`scripts/vendor_install.py`，在 Alpine 辅助 VM 里用 e2fsprogs 完成）。
+- **图形**：官方镜像的 gralloc、composer、EGL 原本连官方模拟器的宿主渲染器（goldfish 管道 + gfxstream），这里换成：
+  自研 gralloc（`gfx/gralloc`）+ 原镜像的 hwc3（client 模式直接扫描输出到 virtio-gpu）+ 二选一的 GLES 实现——
+  Android 平台版 SwiftShader（`gfx/swiftshader`），或自编译的 gfxstream guest 编码器（`gfx/gfxstream-guest`，走 virtio-gpu
+  而不是 goldfish 管道）配宿主的 gfxstream + rutabaga + ANGLE。gfxstream 模式下 gralloc 的缓冲是 virtio-gpu 资源、即宿主
+  ColorBuffer，CPU 读写由 mapper 经 virtio-gpu transfer 与宿主同步。改动写进 super 里的 vendor 分区
+  （`scripts/vendor_install.py`，在 Alpine 辅助 VM 里用 e2fsprogs 完成）。
 - **qemud 服务**：Android 15 的模拟器服务（传感器、开机属性、剪贴板、GPS、摄像头列表…）走 virtio-vsock，Windows 没有
   vhost-vsock，`ranchu-vsock-device` 在 QEMU 里实现了用户态 virtio-vsock 及这些服务，并把宿主端口转发给 guest 的 adbd；
   关窗口/`system_powerdown` 时它还会自己当 adb 客户端让 guest 执行 `svc power shutdown`（与电源菜单的"关机"同一流程），
@@ -126,23 +144,26 @@ bootanimation ──┘   经 AHardwareBuffer 锁 gralloc    └→ virtio-gpu 2
   SDL UI 修了 Windows 上的死锁并支持高 DPI。
 - **声音**：`virtio-sound-pci` + 官方镜像的 goldfish 音频 HAL（tinyalsa）。
 
-完整的调研与实验记录见 [docs/RESEARCH.md](docs/RESEARCH.md)（§19–§20 是当前架构）。
+完整的调研与实验记录见 [docs/RESEARCH.md](docs/RESEARCH.md)（§19–§20 是当前架构，§24 是 gfxstream）。
 
 ## 从源码构建
 
 项目目录里已有构建产物（`gfx/gralloc/out`、`gfx/egl-out`、`gfx/device-libs`），只改 QEMU 时不必重建 guest 组件。
-改了 `qemu-ranchu` 或 `gfx/swiftshader` 的源码后，用 `bash scripts/make_patches.sh` 重新生成 `patches/`。
+改了 `qemu-ranchu`、`gfx/swiftshader`、`gfxstream`、`mesa-aosp` 的源码后，用 `bash scripts/make_patches.sh` 重新生成 `patches/`。
 
 ### 依赖
 
 - [MSYS2](https://www.msys2.org/) 装在 `C:\msys64`，CLANGARM64 环境，参考包：
   ```sh
   pacman -S --needed git patch diffutils \
-    mingw-w64-clang-aarch64-{toolchain,cmake,ninja,python,pkgconf,glib2,pixman,SDL2,libslirp,dtc,capstone,zstd,qemu}
+    mingw-w64-clang-aarch64-{toolchain,cmake,ninja,python,pkgconf,glib2,pixman,SDL2,libslirp,dtc,capstone,zstd,qemu} \
+    mingw-w64-clang-aarch64-{meson,rust,angleproject}
   ```
-  `mingw-w64-clang-aarch64-qemu` 提供 qemu-img，也会带齐 QEMU 的运行时依赖。
+  `mingw-w64-clang-aarch64-qemu` 提供 qemu-img，也会带齐 QEMU 的运行时依赖；meson/rust/angleproject 用于 gfxstream 模式
+  （ANGLE 是运行期依赖）。
 - Android NDK r27c，解压到 `gfx/android-ndk-r27c`（x86_64 版，在 ARM64 Windows 上经仿真运行）。
 - Python 包：`py -m pip install ext4 pillow`。
+- gfxstream guest 构建还要 protoc 21.12（解压到 `downloads/protoc21`）。
 - 只在修改 AIDL 时需要：Android SDK build-tools 34（`aidl.exe`）。
 
 ### QEMU（补丁版 11.1.2）
@@ -151,10 +172,13 @@ bootanimation ──┘   经 AHardwareBuffer 锁 gralloc    └→ virtio-gpu 2
 tar -xf downloads/qemu-11.1.2.tar.xz && mv qemu-11.1.2 qemu-ranchu   # https://download.qemu.org/qemu-11.1.2.tar.xz
 cd qemu-ranchu && patch -p1 < ../patches/qemu-11.1.2-ranchuwoa.patch
 mkdir build && cd build
+PKG_CONFIG_PATH="$(cygpath -m "$PWD/../../hostgfx/lib/pkgconfig")" \
 PATH="/c/msys64/clangarm64/bin:/c/msys64/usr/bin:$PATH" ../configure --target-list=aarch64-softmmu \
-  --disable-docs --enable-sdl --disable-sdl-image --disable-gtk --disable-curses --disable-tools
+  --disable-docs --enable-sdl --disable-sdl-image --disable-gtk --disable-curses --disable-tools --enable-rutabaga-gfx
 PATH="/c/msys64/clangarm64/bin:/c/msys64/usr/bin:$PATH" ninja qemu-system-aarch64.exe
 ```
+
+`--enable-rutabaga-gfx` 需要先构建下面的 gfxstream 宿主部分（`hostgfx/`）。
 
 然后 `avdctl dist` 打包（可选）。补丁点在源码里都有 `RanchuWoA` 注释。
 
@@ -173,6 +197,21 @@ bash gfx/build_swiftshader.sh          # → gfx/egl-out
 bash gfx/gralloc/build.sh              # → gfx/gralloc/out（AIDL 生成代码已在 gen/，改 AIDL 才需 gen_aidl.sh）
 ```
 
+### gfxstream（宿主 + guest）
+
+```sh
+git clone https://github.com/google/gfxstream.git && git -C gfxstream checkout 0ab696d
+git -C gfxstream apply ../patches/gfxstream-0ab696d-ranchuwoa.patch
+git clone --filter=blob:none --sparse https://android.googlesource.com/platform/external/mesa3d mesa-aosp
+git -C mesa-aosp sparse-checkout set include/drm-uapi src/gfxstream src/util && git -C mesa-aosp checkout 224e91e
+git -C mesa-aosp apply ../patches/mesa-aosp-224e91e-ranchuwoa.patch
+git clone https://github.com/magma-gpu/rutabaga_gfx.git && git -C rutabaga_gfx checkout 5bcb95f
+git clone https://gitlab.freedesktop.org/mesa/drm.git libdrm && git -C libdrm checkout 33fab8c
+
+bash gfx/build_gfxstream_host.sh       # → hostgfx/（libgfxstream_backend、rutabaga_gfx_ffi），之后再配置 QEMU
+bash gfx/build_gfxstream_guest.sh      # → gfx/gs-out（guest 的 EGL/GLES 与 libOpenglSystemCommon）
+```
+
 基础镜像还没有时，`fetch_device_libs.py` 需要的 system.img 可以先跑一次 `avdctl prepare` 得到：它在装 vendor 组件前
 发现产物缺失会停下，此时解出的 system.img 还是原版。改完 guest 组件或 `gfx/vendor-overlay` 后运行
 `avdctl prepare --force` 重建基础镜像。
@@ -184,7 +223,10 @@ bash gfx/gralloc/build.sh              # → gfx/gralloc/out（AIDL 生成代码
 | `tools/avdctl/avdctl.py`、`avdctl.cmd` | AVD 管理工具 |
 | `tools/avdctl/toolbar.py` | 侧边工具栏（start 时自动打开） |
 | `qemu-ranchu/` | 补丁版 QEMU 源码与构建目录（`hw/android/` 是新增设备） |
-| `patches/` | QEMU 与 SwiftShader 的补丁（对原版源码） |
+| `patches/` | QEMU、SwiftShader、gfxstream、mesa-aosp 的补丁（对原版源码） |
+| `gfxstream/`、`mesa-aosp/`、`rutabaga_gfx/`、`libdrm/` | gfxstream 相关上游源码（宿主渲染器、guest 编码器、rutabaga FFI、DRM 头） |
+| `hostgfx/` | 宿主 gfxstream 链路的安装前缀（`bin/` 下两个 DLL；可选 `angle/` 放自选的 ANGLE） |
+| `gfx/gfxstream-guest/`、`gfx/gs-out/` | guest 侧 gfxstream 的 CMake 构建（含 Android 头文件垫片）与产物 |
 | `gfx/gralloc/` | woa gralloc（allocator 服务 + IMapper v5） |
 | `gfx/swiftshader/`、`gfx/ss-build/`、`gfx/egl-out/` | SwiftShader 源码、构建目录、剥符号后的产物 |
 | `gfx/vendor-overlay/` | 装进 vendor 分区的配置（init rc、VINTF、fstab、特性开关、SELinux 补充；`gsi/` 是 GSI 实验专用） |
@@ -203,6 +245,9 @@ bash gfx/gralloc/build.sh              # → gfx/gralloc/out（AIDL 生成代码
   工具栏需要 Python 自带的 Tk（官方安装包默认带）。
 - **卡在开机动画/起不来**：看 `images/avds/<名字>/logs/logcat.txt`；logcat 起来之前就出问题时用
   `avdctl start <名字> --verbose-boot`，看 `logs/console.log` 里的内核与 init 日志。仍不行就 `wipe`。
+- **gfxstream 模式异常（黑屏、花屏、QEMU 退出）**：先 `avdctl edit <名字> --gpu swiftshader` 确认是否与宿主渲染有关；
+  `logs/qemu.log` 搜 `RanchuWoA-VEH`。想试别的 ANGLE（Electron/Chromium 自带的 ARM64 版 `libEGL.dll`+`libGLESv2.dll`）
+  就放进 `hostgfx/angle/`，或用环境变量 `RANCHU_ANGLE` 指向所在目录。
 - **adb 显示 offline**：`adb reconnect offline`，或 `adb kill-server` 后等半分钟。
 - **Git Bash 里中文乱码**：用 `py -X utf8 ...`（avdctl 自己已处理）；adb 的 guest 路径被改写时 `export MSYS_NO_PATHCONV=1`。
 
@@ -213,4 +258,5 @@ bash gfx/gralloc/build.sh              # → gfx/gralloc/out（AIDL 生成代码
 - `docs/reference/` 的源码摘录仅供对照阅读、不参与编译，以各文件自身的许可头为准（多数 Apache-2.0，两个 goldfish sync 驱动为 GPL-2.0），来源见 [docs/reference/README.md](docs/reference/README.md)。
 - `gfx/gralloc/aidl/`、`gfx/gralloc/include/` 的 AIDL 与头文件来自 AOSP（Apache-2.0）。
 - `gfx/legacy/nullgfx/platform-libs/libbinder_ndk.so` 取自官方 Android 15 模拟器镜像中的同名系统库（源码为 AOSP libbinder_ndk，Apache-2.0）。
-- 运行所需的 QEMU、SwiftShader 与 Android 系统镜像由脚本从各自官方渠道下载，本项目不分发；`patches/` 下的补丁分别适用于其上游源码（QEMU 为 GPL-2.0，SwiftShader 为 Apache-2.0）。
+- 运行所需的 QEMU、SwiftShader 与 Android 系统镜像由脚本从各自官方渠道下载，本项目不分发；`patches/` 下的补丁分别适用于其上游源码（QEMU 为 GPL-2.0，SwiftShader、gfxstream 为 Apache-2.0，Mesa 为 MIT）。
+  `avdctl dist` 打出的目录会带上 MSYS2 的运行库与 ANGLE（BSD-3-Clause）、rutabaga_gfx（BSD-3-Clause）等第三方 DLL。

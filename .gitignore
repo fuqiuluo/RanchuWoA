@@ -13,6 +13,11 @@
 # 可由上游源码 + patches/ 复原的源码树
 /qemu-ranchu/
 /gfx/swiftshader/
+/gfxstream/
+/mesa-aosp/
+/rutabaga_gfx/
+/libdrm/
+/mesa/
 
 # 构建环境与构建产物
 /gfx/android-ndk-r27c/
@@ -22,6 +27,10 @@
 /gfx/gralloc/out/
 /gfx/gralloc/gen/
 /gfx/legacy/nullgfx/out/
+/gfx/gsg-build/
+/gfx/gs-out/
+/gfx/gfxstream-guest/gen/
+/hostgfx/
 
 __pycache__/
 *.pyc

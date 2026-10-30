@@ -39,3 +39,17 @@ git -C gfx/swiftshader ls-files --others --exclude-standard | while read -r f; d
     git -C gfx/swiftshader -c core.autocrlf=false diff --no-index -- /dev/null "$f"
 done >> "$OUT"
 echo "$OUT：$(grep -c '^diff --git' "$OUT") 个文件"
+
+# ---- gfxstream（宿主渲染器 + guest GLES 编码器）、mesa-aosp（guest 的 gralloc 适配）----
+# 这两个仓库在 Windows 上按 autocrlf 检出，diff 时用 autocrlf=true 归一成 LF，补丁可直接
+# git apply 到上游对应提交的干净检出上。
+gitpatch() {   # <仓库目录> <输出>
+    git -C "$1" -c core.autocrlf=true diff > "$2"
+    git -C "$1" ls-files --others --exclude-standard | grep -v -E '^(host-build|guest-build)/' |
+        while read -r f; do
+            git -C "$1" -c core.autocrlf=true diff --no-index -- /dev/null "$f"
+        done >> "$2"
+    echo "$2：$(grep -c '^diff --git' "$2") 个文件"
+}
+gitpatch gfxstream "patches/gfxstream-$(git -C gfxstream rev-parse --short=7 HEAD)-ranchuwoa.patch"
+gitpatch mesa-aosp "patches/mesa-aosp-$(git -C mesa-aosp rev-parse --short=7 HEAD)-ranchuwoa.patch"

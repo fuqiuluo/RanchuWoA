@@ -33,6 +33,17 @@ INSTALL = [
      "same_process_hal_file"),
     ("lib64/egl/libGLESv1_CM_swiftshader.so", GFX / "egl-out/libGLESv1_CM_swiftshader.so", 0o644, 0, 0,
      "same_process_hal_file"),
+    # gfxstream（宿主 GPU 加速；virtio-gpu-pipe 传输，androidboot.hardwareegl=emulation 启用）。
+    # 用 _emulation 命名覆盖镜像里原有的 goldfish-pipe 版（eglDisplay.cpp 按该名加载）；
+    # 公共层是共享库（HostConnection/ThreadInfo 的 TLS 三个 HAL 必须共用一份）。
+    ("lib64/egl/libEGL_emulation.so", GFX / "gs-out/libEGL_emulation.so", 0o644, 0, 0,
+     "same_process_hal_file"),
+    ("lib64/egl/libGLESv2_emulation.so", GFX / "gs-out/libGLESv2_emulation.so", 0o644, 0, 0,
+     "same_process_hal_file"),
+    ("lib64/egl/libGLESv1_CM_emulation.so", GFX / "gs-out/libGLESv1_CM_emulation.so", 0o644, 0, 0,
+     "same_process_hal_file"),
+    ("lib64/libOpenglSystemCommon.so", GFX / "gs-out/libOpenglSystemCommon.so", 0o644, 0, 0,
+     "same_process_hal_file"),
     ("etc/init/android.hardware.graphics.allocator-service.woa.rc",
      GFX / "vendor-overlay/etc/init/android.hardware.graphics.allocator-service.woa.rc", 0o644, 0, 0,
      "vendor_configs_file"),

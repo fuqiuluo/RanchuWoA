@@ -1,0 +1,724 @@
+diff --git a/common/base/SharedMemory_win32.cpp b/common/base/SharedMemory_win32.cpp
+index e3269ef..4c89846 100644
+--- a/common/base/SharedMemory_win32.cpp
++++ b/common/base/SharedMemory_win32.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <shlwapi.h>
+ #include <cassert>
++#include <cerrno>
+ #include <string>
+ 
+ #include "gfxstream/files/PathUtils.h"
+diff --git a/guest/egl/egl.cpp b/guest/egl/egl.cpp
+index 3909b95..f052188 100644
+--- a/guest/egl/egl.cpp
++++ b/guest/egl/egl.cpp
+@@ -515,7 +515,8 @@ EGLBoolean egl_window_surface_t::init()
+     }
+ 
+     const int hostHandle = anwHelper->getHostHandle(buffer, grallocHelper);
+-    rcEnc->rcSetWindowColorBuffer(rcEnc, rcSurface, hostHandle);
++    // RanchuWoA：无宿主 ColorBuffer 的缓冲（dma-heap 后备）不能挂到窗口上
++    if (hostHandle) rcEnc->rcSetWindowColorBuffer(rcEnc, rcSurface, hostHandle);
+ 
+     return EGL_TRUE;
+ }
+@@ -781,7 +782,8 @@ EGLBoolean egl_window_surface_t::swapBuffers()
+     }
+ 
+     const int hostHandle = anwHelper->getHostHandle(buffer, grallocHelper);
+-    rcEnc->rcSetWindowColorBuffer(rcEnc, rcSurface, hostHandle);
++    // RanchuWoA：无宿主 ColorBuffer 的缓冲（dma-heap 后备）不能挂到窗口上
++    if (hostHandle) rcEnc->rcSetWindowColorBuffer(rcEnc, rcSurface, hostHandle);
+ 
+     setWidth(anwHelper->getWidth(buffer));
+     setHeight(anwHelper->getHeight(buffer));
+@@ -890,7 +892,9 @@ EGLBoolean egl_pbuffer_surface_t::init(GLenum pixelFormat)
+     if (!rcColorBuffer) {
+         GFXSTREAM_ERROR("rcCreateColorBuffer returned 0");
+         return EGL_FALSE;
+-    } else {
++    } else if (grallocHelper->getGrallocType() == gfxstream::GRALLOC_TYPE_GOLDFISH) {
++        // RanchuWoA：refcount 管道只服务 goldfish gralloc（rcCreateColorBuffer 建的缓冲）；
++        // virtio-gpu 下 ColorBuffer 生命周期跟资源走，不必再开 goldfish 管道。
+         refcountPipeFd = qemu_pipe_open("refcount");
+         //Send color buffer handle in case RefCountPipe feature is turned on.
+         if (qemu_pipe_valid(refcountPipeFd)) {
+diff --git a/host/gl/OpenGLESDispatch/EGLDispatch.cpp b/host/gl/OpenGLESDispatch/EGLDispatch.cpp
+index 16ad40f..b6fa1ec 100644
+--- a/host/gl/OpenGLESDispatch/EGLDispatch.cpp
++++ b/host/gl/OpenGLESDispatch/EGLDispatch.cpp
+@@ -13,6 +13,12 @@
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
++// RanchuWoA：MinGW 下 translator::egl:: 符号静态链入本 DLL（无导入库），这里去掉
++// egl.h 默认的 dllimport，静态填充才能解析（MSVC 不受影响，行为一致）
++#ifdef _WIN32
++#undef EGLAPI
++#define EGLAPI
++#endif
+ #include "OpenGLESDispatch/EGLDispatch.h"
+ 
+ #include <stdio.h>
+@@ -40,14 +46,14 @@ EGLDispatch s_egl;
+ bool init_egl_dispatch() {
+     if (s_egl.initialized) return true;
+ 
+-#if !defined(__MINGW64__)
++#if 1  // RanchuWoA: MinGW 也走静态填充（否则动态填充缺 eglGetProcAddress 引导，整表为 NULL）
+     LIST_RENDER_EGL_FUNCTIONS(RENDER_EGL_LOAD_FIELD_STATIC)
+-#endif // !defined(__MINGW64__)
++#endif
+     LIST_RENDER_EGL_FUNCTIONS(RENDER_EGL_LOAD_FIELD_WITH_EGL)
+-#if !defined(__MINGW64__)
++#if 1  // RanchuWoA: MinGW 也走静态填充（否则动态填充缺 eglGetProcAddress 引导，整表为 NULL）
+     LIST_RENDER_EGL_EXTENSIONS_FUNCTIONS(RENDER_EGL_LOAD_OPTIONAL_FIELD_STATIC)
+     LIST_RENDER_EGL_SNAPSHOT_FUNCTIONS(RENDER_EGL_LOAD_FIELD_STATIC)
+-#endif // !defined(__MINGW64__)
++#endif
+ 
+     s_egl.initialized = true;
+     return true;
+diff --git a/host/gl/OpenGLESDispatch/GLESv1Dispatch.cpp b/host/gl/OpenGLESDispatch/GLESv1Dispatch.cpp
+index c037a7b..7268929 100644
+--- a/host/gl/OpenGLESDispatch/GLESv1Dispatch.cpp
++++ b/host/gl/OpenGLESDispatch/GLESv1Dispatch.cpp
+@@ -13,6 +13,14 @@
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
++// RanchuWoA: on MinGW, translator::gles{1,2}:: symbols are statically linked into this DLL; remove
++// the default dllimport so that static filling can resolve (consistent behavior on MSVC).
++#ifdef _WIN32
++#undef GL_APICALL
++#define GL_APICALL
++#undef KHRONOS_APICALL
++#define KHRONOS_APICALL
++#endif
+ #include "OpenGLESDispatch/GLESv1Dispatch.h"
+ 
+ #include "OpenGLESDispatch/EGLDispatch.h"
+@@ -102,10 +110,10 @@ static return_type gles1_dummy_##func_name signature { \
+ bool gles1_dispatch_init(GLESv1Dispatch* dispatch_table) {
+     if (dispatch_table->initialized) return true;
+ 
+-#if !defined(__MINGW64__)
++#if 1  // RanchuWoA: MinGW also uses static filling (same as above)
+ //link error
+     LIST_GLES1_FUNCTIONS(ASSIGN_GLES1_STATIC, ASSIGN_GLES1_STATIC);
+-#endif // !defined(__MINGW64__)
++#endif
+ 
+     dispatch_table->initialized = true;
+     return true;
+diff --git a/host/gl/OpenGLESDispatch/GLESv2Dispatch.cpp b/host/gl/OpenGLESDispatch/GLESv2Dispatch.cpp
+index b54444a..c5ae555 100644
+--- a/host/gl/OpenGLESDispatch/GLESv2Dispatch.cpp
++++ b/host/gl/OpenGLESDispatch/GLESv2Dispatch.cpp
+@@ -13,6 +13,14 @@
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
++// RanchuWoA: on MinGW, translator::gles{1,2}:: symbols are statically linked into this DLL; remove
++// the default dllimport so that static filling can resolve (consistent behavior on MSVC).
++#ifdef _WIN32
++#undef GL_APICALL
++#define GL_APICALL
++#undef KHRONOS_APICALL
++#define KHRONOS_APICALL
++#endif
+ #include "OpenGLESDispatch/GLESv2Dispatch.h"
+ 
+ #include "OpenGLESDispatch/EGLDispatch.h"
+@@ -46,10 +54,10 @@ void gles2_unimplemented() {
+ bool gles2_dispatch_init(GLESv2Dispatch* dispatch_table) {
+     if (dispatch_table->initialized) return true;
+ 
+-#if !defined(__MINGW64__)
++#if 1  // RanchuWoA: MinGW also uses static filling (same as above)
+ //link error
+     LIST_GLES2_FUNCTIONS(LOOKUP_SYMBOL_STATIC,LOOKUP_SYMBOL_STATIC)
+-#endif // !defined(__MINGW64__)
++#endif
+ 
+     dispatch_table->initialized = true;
+     return true;
+diff --git a/host/gl/OpenGLESDispatch/gles1_stubbed_in_translator_namespace.cpp b/host/gl/OpenGLESDispatch/gles1_stubbed_in_translator_namespace.cpp
+index 897b582..8f146b4 100644
+--- a/host/gl/OpenGLESDispatch/gles1_stubbed_in_translator_namespace.cpp
++++ b/host/gl/OpenGLESDispatch/gles1_stubbed_in_translator_namespace.cpp
+@@ -19,7 +19,7 @@
+ #include <GL/GLcorearb.h>
+ #ifdef __MINGW64__
+ #include <GLES/glplatform.h>
+-#define GL_APICALL KHRONOS_APICALL inline
++#define GL_APICALL  // RanchuWoA: MinGW 下不引入 dllimport/inline，保持外部链接的桩定义
+ #else
+ #define GL_APICALL KHRONOS_APICALL
+ #endif // __MINGW64__
+diff --git a/host/gl/OpenGLESDispatch/gles2_stubbed_in_translator_namespace.cpp b/host/gl/OpenGLESDispatch/gles2_stubbed_in_translator_namespace.cpp
+index 959a401..f8c74e2 100644
+--- a/host/gl/OpenGLESDispatch/gles2_stubbed_in_translator_namespace.cpp
++++ b/host/gl/OpenGLESDispatch/gles2_stubbed_in_translator_namespace.cpp
+@@ -19,7 +19,7 @@
+ #include <GL/GLcorearb.h>
+ #ifdef __MINGW64__
+ #include <GLES2/gl2platform.h>
+-#define GL_APICALL KHRONOS_APICALL inline
++#define GL_APICALL
+ #endif // __MINGW64__
+ namespace translator {
+ namespace gles2 {
+diff --git a/host/gl/emulation_gl.cpp b/host/gl/emulation_gl.cpp
+index feb719a..d822a30 100644
+--- a/host/gl/emulation_gl.cpp
++++ b/host/gl/emulation_gl.cpp
+@@ -438,6 +438,17 @@ std::unique_ptr<EmulationGl> EmulationGl::create(uint32_t width, uint32_t height
+                 return nullptr;
+             }
+         }
++#ifdef _WIN32
++        // RanchuWoA: the EGL-on-EGL translator always creates ES 3.0 host contexts
++        // (egl_os_api_egl.cpp, upstream "TODO: support GLES3.1"), so advertising 3.1
++        // makes Skia emit "#version 310 es" shaders that all fail to compile and the
++        // composited output stays black. Cap the advertised version at 3.0 to match.
++        // (The ANGLE faults once blamed on 3.1 were the cross-thread race fixed by
++        // glestranslator/common/angle_lock.)
++        if (!ChooseGlesVersionAndPopulateDispatch(GLES_DISPATCH_MAX_VERSION_3_0)) {
++            return nullptr;
++        }
++#endif
+     }
+ 
+     // TODO (b/207426737): Remove the Imagination-specific workaround.
+@@ -1095,7 +1106,13 @@ EmulatedEglWindowSurfacePtr EmulationGl::getWindowSurface(HandleType surfaceHand
+ 
+ bool EmulationGl::bindColorBufferToTexture(IColorBuffer* colorBuffer) {
+     if (!colorBuffer) {
+-        GFXSTREAM_ERROR("Failed to bind to texture: invalid color buffer.");
++        // RanchuWoA: dma-heap backed buffers (formats without a virtio-gpu 2D
++        // resource) have no host ColorBuffer. Leaving the guest texture without
++        // storage makes the next draw fault inside ANGLE (null SRV); give the
++        // currently bound texture 1x1 storage instead.
++        static const uint32_t kBlack[1] = {0};
++        s_gles2.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA,
++                             GL_UNSIGNED_BYTE, kBlack);
+         return false;
+     }
+     colorBuffer->touch();
+diff --git a/host/gl/glestranslator/common/gl_dispatch.cpp b/host/gl/glestranslator/common/gl_dispatch.cpp
+index f2b9f42..87798d3 100644
+--- a/host/gl/glestranslator/common/gl_dispatch.cpp
++++ b/host/gl/glestranslator/common/gl_dispatch.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "common/gl_dispatch.h"
+ 
++#include "common/angle_lock.h"
+ #include "common/gl_library.h"
+ #include "gfxstream/shared_library.h"
+ #include "gfxstream/synchronization/Lock.h"
+@@ -258,6 +259,22 @@ void GLDispatch::dispatchFuncs(GLESVersion version, GlLibrary* glLib, EGLGetProc
+         }
+     }
+ 
++    // RanchuWoA：宿主是 ANGLE 时所有调用经全局锁串行化（见 common/angle_lock.h）。
++    // glClientWaitSync 先换成轮询版（等待期间放锁），后面的通用包装会跳过已登记的 thunk。
++    glClientWaitSync = gfxstream::angle_lock::wrapClientWaitSync(glClientWaitSync);
++#define WRAP_ANGLE_LOCK(return_type, func_name, signature, args) \
++    func_name = gfxstream::angle_lock::wrap<true, __COUNTER__>(func_name);
++    LIST_GLES_COMMON_FUNCTIONS(WRAP_ANGLE_LOCK)
++    LIST_GLES_EXTENSIONS_FUNCTIONS(WRAP_ANGLE_LOCK)
++    LIST_GLES1_ONLY_FUNCTIONS(WRAP_ANGLE_LOCK)
++    LIST_GLES1_EXTENSIONS_FUNCTIONS(WRAP_ANGLE_LOCK)
++    LIST_GLES2_ONLY_FUNCTIONS(WRAP_ANGLE_LOCK)
++    LIST_GLES2_EXTENSIONS_FUNCTIONS(WRAP_ANGLE_LOCK)
++    LIST_GLES3_ONLY_FUNCTIONS(WRAP_ANGLE_LOCK)
++    LIST_GLES3_EXTENSIONS_FUNCTIONS(WRAP_ANGLE_LOCK)
++    LIST_GLES31_ONLY_FUNCTIONS(WRAP_ANGLE_LOCK)
++#undef WRAP_ANGLE_LOCK
++
+     m_isLoaded = true;
+     m_version = version;
+ }
+diff --git a/host/gl/glestranslator/common/meson.build b/host/gl/glestranslator/common/meson.build
+index c838d6e..328c757 100644
+--- a/host/gl/glestranslator/common/meson.build
++++ b/host/gl/glestranslator/common/meson.build
+@@ -5,6 +5,7 @@ files_lib_gl_common = files(
+   'rgtc.cpp',
+   'framebuffer_data.cpp',
+   'gl_background_loader.cpp',
++  'angle_lock.cpp',
+   'gl_dispatch.cpp',
+   'gles_buffer.cpp',
+   'gles_context.cpp',
+diff --git a/host/gl/glestranslator/egl/egl_os_api_egl.cpp b/host/gl/glestranslator/egl/egl_os_api_egl.cpp
+index 9a9038d..0b0d530 100644
+--- a/host/gl/glestranslator/egl/egl_os_api_egl.cpp
++++ b/host/gl/glestranslator/egl/egl_os_api_egl.cpp
+@@ -20,6 +20,7 @@
+ #include <memory>
+ #include <vector>
+ 
++#include "common/angle_lock.h"
+ #include "common/gl_library.h"
+ #include "shader_cache.h"
+ #include "gfxstream/shared_library.h"
+@@ -185,6 +186,19 @@ public:
+     }
+ 
+         LIST_EGL_FUNCTIONS(LOAD_EGL_POINTER);
++
++#ifdef _WIN32
++        // RanchuWoA：Windows 上宿主 EGL 就是 ANGLE，所有调用经全局锁串行化（见
++        // common/angle_lock.h）；eglMakeCurrent 另需维护线程/全局的 current 记录。
++        gfxstream::angle_lock::enable(this->eglMakeCurrent);
++#define WRAP_EGL_POINTER(return_type, function_name, signature) \
++        this->function_name = gfxstream::angle_lock::wrap<false, __COUNTER__>(this->function_name);
++        LIST_EGL_FUNCTIONS(WRAP_EGL_POINTER);
++#undef WRAP_EGL_POINTER
++        if (gfxstream::angle_lock::enabled()) {
++            this->eglMakeCurrent = gfxstream::angle_lock::makeCurrent;
++        }
++#endif
+     }
+     ~EglOsEglDispatcher() = default;
+ 
+@@ -254,6 +268,7 @@ public:
+         if (!mDispatcher->eglDestroyContext(mDisplay, mNativeCtx)) {
+             // TODO: print a better error message
+         }
++        gfxstream::angle_lock::onContextDestroyed();
+     }
+ 
+     EGLContext context() const {
+@@ -754,6 +769,7 @@ void EglOsEglDisplay::swapBuffers(Surface* surface) {
+ 
+ EGLBoolean EglOsEglDisplay::releaseThread() {
+     D("%s\n", __FUNCTION__);
++    gfxstream::angle_lock::onThreadReleased();
+     return mDispatcher.eglReleaseThread();
+ }
+ 
+diff --git a/host/gl/glestranslator/egl/egl_os_api_wgl.cpp b/host/gl/glestranslator/egl/egl_os_api_wgl.cpp
+index 0bc1db3..1c5f9ff 100644
+--- a/host/gl/glestranslator/egl/egl_os_api_wgl.cpp
++++ b/host/gl/glestranslator/egl/egl_os_api_wgl.cpp
+@@ -31,6 +31,7 @@
+ #include <memory>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <vector>
+ 
+ #include "core_profile_configs.h"
+ #include "common/gl_library.h"
+diff --git a/host/virtio_gpu_gfxstream_renderer.cpp b/host/virtio_gpu_gfxstream_renderer.cpp
+index d6315ea..bef618f 100644
+--- a/host/virtio_gpu_gfxstream_renderer.cpp
++++ b/host/virtio_gpu_gfxstream_renderer.cpp
+@@ -21,6 +21,10 @@ extern "C" {
+ #include <optional>
+ #include <string_view>
+ 
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
+ #include "frame_buffer.h"
+ #include "gfxstream/strings.h"
+ #include "gfxstream/common/build_info.h"
+@@ -869,6 +873,87 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
+ 
+     GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_STREAM_RENDERER_CATEGORY, "stream_renderer_init()");
+ 
++#ifdef _WIN32
++    // RanchuWoA：宿主渲染器崩溃诊断。QEMU 在 Windows 上因访问违例等退出时 WER 多半不留痕，
++    // VEH 在异常分发前打印故障地址、寄存器和栈上的返回地址（按模块+偏移，可用
++    // llvm-symbolizer 符号化；KiRaiseUserExceptionDispatcher 会挡住常规 unwind）。
++    {
++        static PVOID sVeh = nullptr;
++        if (!sVeh) {
++            sVeh = AddVectoredExceptionHandler(
++                1, [](PEXCEPTION_POINTERS ep) -> LONG {
++                    if (ep->ExceptionRecord->ExceptionCode != 0xC0000235 &&
++                        ep->ExceptionRecord->ExceptionCode != 0xC0000008 &&
++                        ep->ExceptionRecord->ExceptionCode != 0xC0000005) {
++                        return EXCEPTION_CONTINUE_SEARCH;
++                    }
++                    void* frames[16];
++                    USHORT n = CaptureStackBackTrace(0, 16, frames, nullptr);
++                    fprintf(stderr,
++                            "[RanchuWoA-VEH] handle exception %08lx at rip=%p, backtrace:\n",
++                            ep->ExceptionRecord->ExceptionCode,
++                            (void*)((::_CONTEXT*)ep->ContextRecord)->Pc);
++                    if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 &&
++                        ep->ExceptionRecord->NumberParameters >= 2) {
++                        fprintf(stderr, "  fault: %s %p\n",
++                                ep->ExceptionRecord->ExceptionInformation[0] == 0   ? "read"
++                                : ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write"
++                                                                                     : "exec",
++                                (void*)ep->ExceptionRecord->ExceptionInformation[1]);
++                    }
++                    {
++                        const ::_CONTEXT* c = (const ::_CONTEXT*)ep->ContextRecord;
++                        for (int r = 0; r < 31; r++) {
++                            fprintf(stderr, "  x%-2d=%016llx%s", r,
++                                    (unsigned long long)c->X[r], (r % 4 == 3) ? "\n" : "");
++                        }
++                        fprintf(stderr, "\n  sp=%016llx\n", (unsigned long long)c->Sp);
++                    }
++                    // RanchuWoA：故障点 RIP 模块解析 + 手动栈扫描（VEH 回溯走不过异常
++                    // 分发器，只能扫 Sp 往上的返回地址）。
++                    {
++                        uint64_t rip = (uint64_t)((::_CONTEXT*)ep->ContextRecord)->Pc;
++                        HMODULE rh = nullptr;
++                        if (rip > 0x10000 &&
++                            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                               (LPCSTR)rip, &rh)) {
++                            char rm[MAX_PATH] = "?";
++                            GetModuleFileNameA(rh, rm, sizeof(rm));
++                            fprintf(stderr, "  rip-module: %s+%llX\n", rm,
++                                    (unsigned long long)(rip - (uint64_t)rh));
++                        }
++                        uint64_t spv = (uint64_t)((::_CONTEXT*)ep->ContextRecord)->Sp;
++                        MEMORY_BASIC_INFORMATION mbi;
++                        for (int off = 0; off < 0x600; off += 8) {
++                            uint64_t addr = spv + off;
++                            if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi)) ||
++                                mbi.State != MEM_COMMIT ||
++                                (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
++                                break;
++                            }
++                            uint64_t v = *(uint64_t*)addr;
++                            HMODULE mh = nullptr;
++                            if (v > 0x10000 &&
++                                GetModuleHandleExA(
++                                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                    (LPCSTR)v, &mh)) {
++                                char mn[MAX_PATH] = "?";
++                                GetModuleFileNameA(mh, mn, sizeof(mn));
++                                fprintf(stderr, "  sp+%03x %llx (%s+%llX)\n", off,
++                                        (unsigned long long)v, mn,
++                                        (unsigned long long)(v - (uint64_t)mh));
++                            }
++                        }
++                    }
++                    fflush(stderr);
++                    return EXCEPTION_CONTINUE_SEARCH;
++                });
++        }
++    }
++#endif
++
+     auto renderer = GetRenderer(display_width, display_height, renderer_flags, features,
+                                 rendererInitializedExternally);
+     if (!renderer) {
+diff --git a/host/virtio_gpu_resource.cpp b/host/virtio_gpu_resource.cpp
+index 4531a51..c405257 100644
+--- a/host/virtio_gpu_resource.cpp
++++ b/host/virtio_gpu_resource.cpp
+@@ -700,11 +700,22 @@ int VirtioGpuResource::ReadFromColorBufferToLinear(uint64_t offset, stream_rende
+     const size_t requiredSize = GetTransferSize(mCreateArgs->format, mCreateArgs->width,
+                                                 mCreateArgs->height, 0, 0,
+                                                 mCreateArgs->width, mCreateArgs->height);
+-    if (requiredSize == 0 || mLinear.size() < requiredSize) {
+-        GFXSTREAM_ERROR("mLinear is too small! size: %zu, required: %zu", mLinear.size(),
+-                        requiredSize);
++    if (requiredSize == 0) {
++        GFXSTREAM_ERROR("Failed to transfer: required size is 0 for resource %d.", mId);
+         return -EINVAL;
+     }
++    if (mLinear.size() < requiredSize) {
++        // RanchuWoA: the guest kernel never attaches backing for host3d 2D resources
++        // (gralloc-allocated scanout ColorBuffers), so mLinear stays empty and every
++        // display RESOURCE_FLUSH would fail here. Without a guest backing to mirror,
++        // mLinear is pure read staging and can be sized on demand.
++        if (!mIovs.empty()) {
++            GFXSTREAM_ERROR("mLinear is too small! size: %zu, required: %zu", mLinear.size(),
++                            requiredSize);
++            return -EINVAL;
++        }
++        mLinear.resize(requiredSize, 0);
++    }
+ 
+     // We always xfer the whole thing again from GL
+     // since it's fiddly to calc / copy-out subregions
+diff --git a/host/vulkan/vk_common_operations.cpp b/host/vulkan/vk_common_operations.cpp
+index 2916067..083c4bd 100644
+--- a/host/vulkan/vk_common_operations.cpp
++++ b/host/vulkan/vk_common_operations.cpp
+@@ -1906,7 +1906,7 @@ void VkEmulation::setFeatures(const gfxstream::host::FeatureSet& features) {
+                 "Ensure host allocations are aligned to "
+                 "avoid VMM errors when mapping.");
+             GFXSTREAM_INFO("Enabling VulkanAllocateHostMemory: %s",
+-                           mFeatures.VulkanAllocateHostMemory.getReason());
++                           mFeatures.VulkanAllocateHostMemory.getReason().c_str());
+         }
+     }
+ #endif
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index eaa340b..40ac824 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -15,6 +15,15 @@
+ 
+ #ifndef _WIN32
+ #include <unistd.h>
++#else
++#include <process.h>
++#endif
++
++#ifdef getpid
++#undef getpid
++#endif
++#ifdef _WIN32
++#define getpid _getpid
+ #endif
+ 
+ #ifdef __ANDROID__
+diff --git a/host/gl/glestranslator/common/angle_lock.cpp b/host/gl/glestranslator/common/angle_lock.cpp
+new file mode 100644
+index 0000000..3fc202c
+--- /dev/null
++++ b/host/gl/glestranslator/common/angle_lock.cpp
+@@ -0,0 +1,120 @@
++// RanchuWoA：宿主 ANGLE 调用串行化，原理见 angle_lock.h。
++#include "common/angle_lock.h"
++
++#include <chrono>
++#include <mutex>
++#include <thread>
++#include <unordered_set>
++
++#include "gfxstream/common/logging.h"
++#include "gfxstream/system/System.h"
++
++namespace gfxstream {
++namespace angle_lock {
++namespace {
++
++bool sEnabled = false;
++MakeCurrentFn sRealMakeCurrent = nullptr;
++std::recursive_mutex sLock;
++// ANGLE 后端（StateManager11）最后一次按哪个 context 重置过；nullptr 表示未知，下次必重绑。
++EGLContext sLastContext = EGL_NO_CONTEXT;
++
++struct ThreadCurrent {
++    EGLDisplay dpy = EGL_NO_DISPLAY;
++    EGLSurface draw = EGL_NO_SURFACE;
++    EGLSurface read = EGL_NO_SURFACE;
++    EGLContext ctx = EGL_NO_CONTEXT;
++};
++thread_local ThreadCurrent tCurrent;
++
++std::unordered_set<void*>& thunks() {
++    static std::unordered_set<void*> s;
++    return s;
++}
++
++// 调用方已持锁。
++void ensureCurrentLocked() {
++    const ThreadCurrent& t = tCurrent;
++    if (t.ctx == EGL_NO_CONTEXT || t.ctx == sLastContext) return;
++    // 同一 context 的 eglMakeCurrent 会被 ANGLE 短路，先解绑才能触发 onMakeCurrent。
++    sRealMakeCurrent(t.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    sRealMakeCurrent(t.dpy, t.draw, t.read, t.ctx);
++    sLastContext = t.ctx;
++}
++
++}  // namespace
++
++void enable(MakeCurrentFn realMakeCurrent) {
++    if (gfxstream::base::getEnvironmentVariable("GFXSTREAM_ANGLE_SERIALIZE") == "0") {
++        GFXSTREAM_INFO("ANGLE 调用串行化已关闭（GFXSTREAM_ANGLE_SERIALIZE=0）");
++        return;
++    }
++    sRealMakeCurrent = realMakeCurrent;
++    sEnabled = realMakeCurrent != nullptr;
++    GFXSTREAM_INFO("ANGLE 调用串行化：%s", sEnabled ? "开启" : "失败（缺 eglMakeCurrent）");
++}
++
++bool enabled() { return sEnabled; }
++
++bool isThunk(void* f) {
++    std::lock_guard<std::recursive_mutex> lock(sLock);
++    return thunks().count(f) != 0;
++}
++
++void registerThunk(void* f) {
++    std::lock_guard<std::recursive_mutex> lock(sLock);
++    thunks().insert(f);
++}
++
++Scope::Scope(bool checkContext) {
++    sLock.lock();
++    if (checkContext) ensureCurrentLocked();
++}
++
++Scope::~Scope() { sLock.unlock(); }
++
++EGLBoolean makeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
++    std::lock_guard<std::recursive_mutex> lock(sLock);
++    ThreadCurrent& t = tCurrent;
++    if (ctx != EGL_NO_CONTEXT && ctx == t.ctx && draw == t.draw && read == t.read &&
++        dpy == t.dpy) {
++        // ANGLE 会短路这次调用；只需保证后端状态属于本线程。
++        ensureCurrentLocked();
++        return EGL_TRUE;
++    }
++    EGLBoolean ok = sRealMakeCurrent(dpy, draw, read, ctx);
++    if (ok) {
++        t = ThreadCurrent{dpy, draw, read, ctx};
++        if (ctx != EGL_NO_CONTEXT) sLastContext = ctx;
++    }
++    return ok;
++}
++
++void onContextDestroyed() {
++    // ANGLE 销毁非 current 的 context 时会临时切过去再切回；后端此刻属于谁不好说，强制下次重绑。
++    std::lock_guard<std::recursive_mutex> lock(sLock);
++    sLastContext = EGL_NO_CONTEXT;
++}
++
++void onThreadReleased() {
++    std::lock_guard<std::recursive_mutex> lock(sLock);
++    tCurrent = ThreadCurrent{};
++}
++
++unsigned long long nowNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
++void backoff(int iteration) {
++    // GPU 栅栏一般几毫秒内就绪：先让出时间片，久等再睡。
++    if (iteration < 200) {
++        std::this_thread::yield();
++    } else {
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++}
++
++}  // namespace angle_lock
++}  // namespace gfxstream
+diff --git a/host/gl/glestranslator/common/include/common/angle_lock.h b/host/gl/glestranslator/common/include/common/angle_lock.h
+new file mode 100644
+index 0000000..59abc3b
+--- /dev/null
++++ b/host/gl/glestranslator/common/include/common/angle_lock.h
+@@ -0,0 +1,109 @@
++// RanchuWoA：宿主 ANGLE 调用串行化。
++//
++// ANGLE 的 D3D11 后端里，StateManager11（连同 D3D11 immediate context）属于整个 EGLDisplay，
++// 所有 context 共用；它只在 eglMakeCurrent 时按新 context 重置缓存（onMakeCurrent 把
++// mFramebuffer11 等清成 nullptr，再由“全部脏位”重新同步）。而 gfxstream 每个 guest 连接一个
++// 渲染线程、各自 context 同时 current，ANGLE 默认只按 share group 加锁——别的线程一次
++// eglMakeCurrent 就会让本线程下一次绘制拿着空的 mFramebuffer11 崩溃（Framebuffer11::
++// markAttachmentsDirty 读 nullptr+8，RESEARCH §24.4），即便不崩也会画到别人的状态上。
++//
++// 这里在 gfxstream 侧复刻 ANGLE 的 ANGLE_FORCE_CONTEXT_CHECK_EVERY_CALL 编译选项：所有进入
++// ANGLE 的 EGL/GL 调用持同一把全局锁；GL 调用前若后端最后见到的 context 不是本线程的，先
++// 解绑再绑回本线程 context（ANGLE 对同一 context 的 eglMakeCurrent 直接短路，必须先解绑），
++// 让 ANGLE 重置共享状态并把本 context 的状态全部标脏。
++#pragma once
++
++#include <EGL/egl.h>
++
++namespace gfxstream {
++namespace angle_lock {
++
++using MakeCurrentFn = EGLBoolean (*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
++
++// 由 EGL-on-EGL 后端在加载完宿主 libEGL 后调用（传入未包装的 eglMakeCurrent）。
++// 环境变量 GFXSTREAM_ANGLE_SERIALIZE=0 可关闭（调试用）。
++void enable(MakeCurrentFn realMakeCurrent);
++bool enabled();
++
++// 持全局锁的作用域；checkContext=true 时还保证 ANGLE 后端当前就是本线程的 context。
++class Scope {
++   public:
++    explicit Scope(bool checkContext);
++    ~Scope();
++    Scope(const Scope&) = delete;
++    Scope& operator=(const Scope&) = delete;
++};
++
++// eglMakeCurrent / eglDestroyContext / eglReleaseThread 的串行化版本（维护线程与全局记录）。
++EGLBoolean makeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx);
++void onContextDestroyed();
++void onThreadReleased();
++
++// 每个被包装的函数指针一份静态存储：N 由 __COUNTER__ 保证唯一。
++template <bool CheckContext, int N, typename F>
++struct Thunk;
++
++template <bool CheckContext, int N, typename R, typename... A>
++struct Thunk<CheckContext, N, R (*)(A...)> {
++    static inline R (*real)(A...) = nullptr;
++    static R call(A... a) {
++        Scope scope(CheckContext);
++        return real(a...);
++    }
++};
++
++// 已发出的 thunk 登记表：同一函数指针会被多个 dispatcher 实例、多个函数列表重复处理，
++// 已是 thunk 的不能再包一层（否则 real 可能互相指向，无限递归）。
++bool isThunk(void* f);
++void registerThunk(void* f);
++
++template <bool CheckContext, int N, typename F>
++F wrap(F f) {
++    using T = Thunk<CheckContext, N, F>;
++    if (!f || !enabled() || isThunk((void*)f)) return f;
++    T::real = f;
++    registerThunk((void*)&T::call);
++    return &T::call;
++}
++
++// 轮询辅助：单调时钟（纳秒）与第 n 次轮询后的退让。
++unsigned long long nowNs();
++void backoff(int iteration);
++
++// glClientWaitSync 的替身：零超时轮询，两次轮询之间放开全局锁，避免一个线程等 GPU 时
++// 卡住所有线程。
++template <typename F>
++struct WaitThunk;
++
++template <typename R, typename S, typename B, typename T>
++struct WaitThunk<R (*)(S, B, T)> {
++    static constexpr R kTimeoutExpired = 0x911B;  // GL_TIMEOUT_EXPIRED
++    static constexpr B kFlushBit = 0x1;           // GL_SYNC_FLUSH_COMMANDS_BIT
++    static inline R (*real)(S, B, T) = nullptr;
++    static R call(S sync, B flags, T timeout) {
++        const unsigned long long start = nowNs();
++        for (int i = 0;; i++) {
++            R r;
++            {
++                Scope scope(true);
++                r = real(sync, flags, 0);
++            }
++            if (r != kTimeoutExpired || timeout == 0) return r;
++            flags &= ~kFlushBit;  // 首次轮询已经 flush 过
++            if (nowNs() - start >= timeout) return r;
++            backoff(i);
++        }
++    }
++};
++
++template <typename F>
++F wrapClientWaitSync(F f) {
++    using T = WaitThunk<F>;
++    if (!f || !enabled() || isThunk((void*)f)) return f;
++    T::real = f;
++    registerThunk((void*)&T::call);
++    return &T::call;
++}
++
++}  // namespace angle_lock
++}  // namespace gfxstream

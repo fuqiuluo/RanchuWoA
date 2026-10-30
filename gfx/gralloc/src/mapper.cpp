@@ -1,18 +1,23 @@
 // mapper.cpp — stable-C AIMapper v5 实现（mapper.woa.so，由 libui 经 sphal 命名空间加载）。
 //
 // 所有不可变信息都在句柄里；可变元数据（dataspace/blend/crop/HDR）在 fd 的共享元数据页里，
-// 因此任何导入同一缓冲区的进程看到的是同一份。CPU 映射在首次 lock 时建立，freeBuffer 时释放。
+// 因此任何导入同一缓冲区的进程看到的是同一份。整个 fd（像素区 + 元数据页 + 保留区）按需从偏移 0
+// 映射一次，freeBuffer 时释放——guest 内核（android15-6.6）对 virtio-gpu 导出的 dma-buf 做带偏移的
+// mmap 时忽略偏移、总是映射到第 0 页，元数据页不能单独按 meta_offset 映射。
 #include <aidl/android/hardware/graphics/common/ChromaSiting.h>
 #include <aidl/android/hardware/graphics/common/Compression.h>
 #include <aidl/android/hardware/graphics/common/Interlaced.h>
 #include <android/hardware/graphics/mapper/IMapper.h>
 #include <android/hardware/graphics/mapper/utils/IMapperMetadataTypes.h>
 #include <android/log.h>
+#include <drm/drm.h>
+#include <drm/virtgpu_drm.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -27,6 +32,7 @@
 #define LOG_TAG "woa-mapper"
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 using namespace ::android::hardware::graphics::mapper;
 using ::aidl::android::hardware::graphics::common::ChromaSiting;
@@ -40,14 +46,113 @@ constexpr const char* kStandardName = "android.hardware.graphics.common.Standard
 
 struct Imported {
     Handle* handle = nullptr;  // 本进程的克隆（fds[0] 已 dup）
+    uint8_t* base = nullptr;   // 整个 fd 的映射（total_size 字节）；data/meta/reserved 都指向其中
     void* data = nullptr;
     SharedMeta* meta = nullptr;
     void* reserved = nullptr;
     int lockCount = 0;
+    uint32_t gem = 0;         // 本进程 virtio-gpu render 节点上的 GEM 句柄（按需导入）
+    bool cpuWritten = false;  // 当前这轮 lock 带写用途：最后一次 unlock 时上传宿主
 };
 
-std::mutex gMutex;
-std::unordered_map<const native_handle_t*, std::unique_ptr<Imported>> gBuffers;
+// 全局状态故意不析构：进程退出时静态析构会和 binder 线程上的 freeBuffer 赛跑（screencap
+// 退出时 ScreenCaptureResults 在 binder 线程析构 → freeBuffer 锁已销毁的 mutex → FORTIFY abort）。
+std::mutex& gMutex = *new std::mutex;
+std::unordered_map<const native_handle_t*, std::unique_ptr<Imported>>& gBuffers =
+        *new std::unordered_map<const native_handle_t*, std::unique_ptr<Imported>>;
+
+// gfxstream 模式（virtio-gpu 带 3D）下 virtio-gpu 缓冲的真身是宿主 ColorBuffer，guest 页只是
+// backing：CPU 读之前 TRANSFER_FROM_HOST，CPU 写完 TRANSFER_TO_HOST（与 minigbm 的 virgl 后端
+// 相同）。否则 screencap、ImageReader、lockCanvas 等 CPU 路径读到/写进的都是与屏幕无关的 guest 页。
+// 2D 模式（SwiftShader）没有 transfer 3D，也不需要：宿主图像由 RESOURCE_FLUSH 从 backing 拷。
+class Xfer {
+  public:
+    static Xfer& get() {
+        static Xfer& x = *new Xfer;  // 不析构，理由同 gMutex
+        return x;
+    }
+
+    // 导入 dma-buf 得到 GEM 句柄（同一 dma-buf 在本进程只有一个句柄，按引用计数关闭）
+    uint32_t acquire(int dmabuf) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!openLocked()) return 0;
+        drm_prime_handle prime{};
+        prime.fd = dmabuf;
+        if (ioctl(mFd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime) != 0) {
+            ALOGW("PRIME_FD_TO_HANDLE 失败: %s", strerror(errno));
+            return 0;
+        }
+        mRefs[prime.handle]++;
+        return prime.handle;
+    }
+
+    void release(uint32_t gem) {
+        if (!gem) return;
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto it = mRefs.find(gem);
+        if (it == mRefs.end() || --it->second > 0) return;
+        mRefs.erase(it);
+        drm_gem_close req{};
+        req.handle = gem;
+        ioctl(mFd, DRM_IOCTL_GEM_CLOSE, &req);
+    }
+
+    // 整个 2D 资源双向传输并等待完成
+    void transfer(uint32_t gem, const Handle* h, bool toHost) {
+        if (!gem) return;
+        drm_virtgpu_3d_transfer_to_host t{};  // 与 transfer_from_host 布局相同
+        t.bo_handle = gem;
+        t.box.w = h->width;
+        t.box.h = h->height;
+        t.box.d = 1;
+        // 非 blob 资源内核要求 stride/layer_stride 为 0（布局由资源本身决定）
+        const unsigned long req =
+                toHost ? DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST : DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST;
+        if (ioctl(mFd, req, &t) != 0) {
+            ALOGW("TRANSFER_%s_HOST 失败: %s", toHost ? "TO" : "FROM", strerror(errno));
+            return;
+        }
+        drm_virtgpu_3d_wait w{};
+        w.handle = gem;
+        while (ioctl(mFd, DRM_IOCTL_VIRTGPU_WAIT, &w) != 0 && (errno == EINTR || errno == EBUSY)) {
+        }
+    }
+
+  private:
+    bool openLocked() {
+        if (mTried) return mFd >= 0;
+        mTried = true;
+        for (int i = 128; i < 192; i++) {
+            std::string path = "/dev/dri/renderD" + std::to_string(i);
+            int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+            if (fd < 0) continue;
+            char name[64] = {};
+            drm_version v{};
+            v.name = name;
+            v.name_len = sizeof(name) - 1;
+            int has3d = 0;
+            drm_virtgpu_getparam gp{};
+            gp.param = VIRTGPU_PARAM_3D_FEATURES;
+            gp.value = reinterpret_cast<uintptr_t>(&has3d);
+            if (ioctl(fd, DRM_IOCTL_VERSION, &v) == 0 && strcmp(name, "virtio_gpu") == 0 &&
+                ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &gp) == 0 && has3d) {
+                mFd = fd;
+                return true;
+            }
+            close(fd);
+            break;  // 只有一块 virtio-gpu；没有 3D 就是 2D 模式
+        }
+        return false;
+    }
+
+    std::mutex mMutex;
+    int mFd = -1;
+    bool mTried = false;
+    std::unordered_map<uint32_t, int> mRefs;
+};
+
+constexpr uint64_t kCpuReadMask = 0xf;    // BufferUsage::CPU_READ_MASK
+constexpr uint64_t kCpuWriteMask = 0xf0;  // BufferUsage::CPU_WRITE_MASK
 
 Imported* findLocked(buffer_handle_t b) {
     auto it = gBuffers.find(b);
@@ -72,10 +177,18 @@ void* mapRange(int fd, uint64_t offset, uint64_t size) {
     return p;
 }
 
+// 调用方持 gMutex
+uint8_t* baseOf(Imported* b) {
+    if (!b->base) b->base = static_cast<uint8_t*>(mapRange(b->handle->fds[0], 0, b->handle->total_size));
+    return b->base;
+}
+
 SharedMeta* metaOf(Imported* b) {
     if (!b->meta) {
-        b->meta = static_cast<SharedMeta*>(mapRange(b->handle->fds[0], b->handle->meta_offset, kMetaPageSize));
-        if (b->meta && b->meta->magic != kMetaMagic) {
+        uint8_t* base = baseOf(b);
+        if (!base) return nullptr;
+        b->meta = reinterpret_cast<SharedMeta*>(base + b->handle->meta_offset);
+        if (b->meta->magic != kMetaMagic) {
             ALOGW("缓冲区 %llu 的元数据页 magic 不对", (unsigned long long)b->handle->buffer_id);
         }
     }
@@ -381,9 +494,8 @@ AIMapper_Error freeBuffer(buffer_handle_t buffer) {
         b = std::move(it->second);
         gBuffers.erase(it);
     }
-    if (b->data) munmap(b->data, b->handle->data_size);
-    if (b->meta) munmap(b->meta, kMetaPageSize);
-    if (b->reserved) munmap(b->reserved, b->handle->reserved_region_size);
+    Xfer::get().release(b->gem);
+    if (b->base) munmap(b->base, b->handle->total_size);
     close(b->handle->fds[0]);
     free(b->handle);
     return AIMAPPER_ERROR_NONE;
@@ -399,7 +511,7 @@ AIMapper_Error getTransportSize(buffer_handle_t buffer, uint32_t* outNumFds, uin
 
 AIMapper_Error lockBuffer(buffer_handle_t buffer, uint64_t cpuUsage, ARect region, int acquireFence,
                           void** outData) {
-    (void)cpuUsage;  // CPU 渲染（SwiftShader）会锁住未声明 CPU usage 的缓冲区，一律放行
+    // 不按分配时的 usage 校验：CPU 渲染（SwiftShader）会锁住未声明 CPU usage 的缓冲区，一律放行
     Imported* b;
     {
         std::lock_guard<std::mutex> lock(gMutex);
@@ -415,21 +527,40 @@ AIMapper_Error lockBuffer(buffer_handle_t buffer, uint64_t cpuUsage, ARect regio
         return AIMAPPER_ERROR_BAD_VALUE;
     }
     waitFence(acquireFence);
-    std::lock_guard<std::mutex> lock(gMutex);
-    if (!b->data) {
-        b->data = mapRange(b->handle->fds[0], 0, b->handle->data_size);
-        if (!b->data) return AIMAPPER_ERROR_NO_RESOURCES;
+    bool fromHost = false;
+    uint32_t gem = 0;
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        if (!b->data) {
+            b->data = baseOf(b);
+            if (!b->data) return AIMAPPER_ERROR_NO_RESOURCES;
+        }
+        if (b->handle->backing == kBackingVirtioGpu && (cpuUsage & (kCpuReadMask | kCpuWriteMask))) {
+            if (!b->gem) b->gem = Xfer::get().acquire(b->handle->fds[0]);
+            gem = b->gem;
+            fromHost = (cpuUsage & kCpuReadMask) != 0;
+            if (cpuUsage & kCpuWriteMask) b->cpuWritten = true;
+        }
+        b->lockCount++;
+        *outData = b->data;
     }
-    b->lockCount++;
-    *outData = b->data;
+    if (fromHost) Xfer::get().transfer(gem, b->handle, false);
     return AIMAPPER_ERROR_NONE;
 }
 
 AIMapper_Error unlockBuffer(buffer_handle_t buffer, int* releaseFence) {
-    std::lock_guard<std::mutex> lock(gMutex);
-    Imported* b = findLocked(buffer);
-    if (!b || b->lockCount <= 0) return AIMAPPER_ERROR_BAD_BUFFER;
-    b->lockCount--;
+    Imported* b;
+    bool toHost = false;
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        b = findLocked(buffer);
+        if (!b || b->lockCount <= 0) return AIMAPPER_ERROR_BAD_BUFFER;
+        if (--b->lockCount == 0 && b->cpuWritten) {
+            toHost = true;
+            b->cpuWritten = false;
+        }
+    }
+    if (toHost) Xfer::get().transfer(b->gem, b->handle, true);
     *releaseFence = -1;
     return AIMAPPER_ERROR_NONE;
 }
@@ -500,8 +631,9 @@ AIMapper_Error getReservedRegion(buffer_handle_t buffer, void** outRegion, uint6
         return AIMAPPER_ERROR_NONE;
     }
     if (!b->reserved) {
-        b->reserved = mapRange(b->handle->fds[0], b->handle->meta_offset + kMetaPageSize, size);
-        if (!b->reserved) return AIMAPPER_ERROR_NO_RESOURCES;
+        uint8_t* base = baseOf(b);
+        if (!base) return AIMAPPER_ERROR_NO_RESOURCES;
+        b->reserved = base + b->handle->meta_offset + kMetaPageSize;
     }
     *outRegion = b->reserved;
     *outSize = size;
