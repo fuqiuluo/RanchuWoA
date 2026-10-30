@@ -5,7 +5,8 @@
 README「运行 GSI」。
 
 > 原则：所有修改只作用于本地自持的镜像副本（实验盘），补丁以脚本形式提供（`scripts/gsi_disk.py`、
-> `scripts/coloros_gsi_fixes.py`、`scripts/hyperos_fixes.py`、`scripts/coloros14_fixes.py`），对镜像版本有校验、
+> `scripts/coloros_gsi_fixes.py`、`scripts/hyperos_fixes.py`、`scripts/coloros14_fixes.py`、
+> `scripts/coloros16_fixes.py`，以及基础内核的 `scripts/kernel_fixes.py`），对镜像版本有校验、
 > 可重复运行。
 
 ## 1. 工具
@@ -14,6 +15,7 @@ README「运行 GSI」。
 |---|---|
 | `scripts/gsi_disk.py <基础system.img> <GSI> <输出盘>` | 生成实验盘。GSI 往往比原 system 大得多（super 放不下）：复制基础盘后在末尾追加空间，重写 GPT（主/备份 GPT、CRC、保护性 MBR）与 liblp 的 4 份元数据（块设备大小、分区组上限、system 的唯一 extent 指向新区域），再写入 GSI（支持 sparse，DONT_CARE/零填充直接跳过）。最后自动跑 `vendor_install --gsi` |
 | `scripts/gsi_undef_types.py <盘>` | 找出 GSI 的 contexts 文件引用了、但最终策略里没定义的 SELinux 类型（**离线提前跑**，别等开机失败再查） |
+| `scripts/kernel_fixes.py [内核文件]` | 基础内核（gzip 的 arm64 Image）指令级补丁：lpm_trie 的 UBSAN 越界分支改跳 -ENOSPC 错误返回（Android 16 的 connectivity 调 BPF 更新 LPM trie 会踩中 trap 模式直接炸内核，§2.7）。对所有 GSI 生效；`avdctl prepare --force` 重建基础镜像后要重跑 |
 | `scripts/coloros_gsi_fixes.py` / `hyperos_fixes.py` | 各自的厂商框架适配补丁，见 §3 |
 | `scripts/coloros14_fixes.py` | Android 14 的 ColorOS GSI 跑在我们 Android 15 vendor 上的全部适配（§2.6），在 coloros_gsi_fixes 之后运行 |
 | `avdctl create <名字> --system <盘>` | 用实验盘建实例（写时复制层以它为后备，`prepare --force` 不会重建）；`start --verbose-boot` 把内核/init 全量日志记进 `logs/console.log` |
@@ -125,6 +127,23 @@ system 配旧 vendor，反过来要逐项降级。ColorOS 14 实测需要（全�
 
 外加 ColorOS 自身的几处（§2.3 的平台判断、32 位 mediaserver，§2.5 的 adb 与权限监控）。
 
+## 2.7 跨大版本（向上）：Android 16 的 GSI
+
+A16 system 配 A15 vendor 是真机 OTA 升级的方向，Treble 原生支持（GSI 自带 vendor 策略版本的映射、
+libvintf 认旧清单与内核等级），M8 那些降级补丁全都不需要。ColorOS 16（M9）实测只需要：
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| zygote 每 5 秒被杀、system_server 无声死亡 | netd 崩溃（dlopen 被移植包掏空的 oplusex 模块，错误分支 `strlen(dlerror()=NULL)`），netd.rc 的 onrestart 连坐杀 zygote | `liboplusNetd.so` 的 `initNetd` 改立即返回 0（按 .dynsym 定位） |
+| 开机即 Kernel panic，还连带 QEMU 崩 | A16 connectivity 从 ConnectivityService 调 `bpf(BPF_MAP_UPDATE_ELEM)` 更新 LPM trie，android15-6.6 GKI 的 `-fsanitize-trap` 边界检查（brk）+ panic-on-oops 直接炸；brk 只能被跳进，NOP 它会掉进后面的非指令数据 | `kernel_fixes.py`：把 3 条越界 `b.hs` 改跳现成的 -ENOSPC 错误路径（等同上游后来的显式校验） |
+| 画面横躺（显示变成竖屏尺寸） | C16 移植包把 OPLUS 的 `my_product` 打进了 system 分区，`/my_product/build.prop` 在 vendor 之后加载，420 密度与 SF 270° 转向抢跑（C15 时代的包不含它，只注释 system/build.prop 不够） | `my_product/build.prop` 里同样注释那几行 |
+| 没有串口 logcat | A16 平台策略删了 logd→串口 allow（同 A14） | vendor 策略补 4 条 allow（类型走 GSI 自带 mapping） |
+
+另外两条工具教训：dex「首条指令换 return-void」必须把**剩余指令单元全部清成 nop**（A16 的
+`calcAffinityExcludeSuperBigCore` 签名变了且首指令 3 个代码单元，只换单元 0 会 VerifyError 杀
+system_server）；运行时 grep 与镜像事实矛盾时先怀疑自己的 adb 引号转义（`\|` 会被吃掉输出假阴性），
+prop 来源排查直接对镜像裸数据 grep 最快。
+
 ## 3. 实测记录
 
 | GSI | 源机型 | 实例参数 | 结果 |
@@ -133,6 +152,7 @@ system 配旧 vendor，反过来要逐项降级。ColorOS 14 实测需要（全�
 | ColorOS 15（Mystic GSI 移植包） | 一加 Ace 2V（PHP110，1240x2772@560） | `--width 620 --height 1386 --density 280 --ram 6144 --cores 6` | 跑 coloros_gsi_fixes.py 后 50–125 秒开机到桌面，触摸/设置/滚动正常；两种图形后端都可用 |
 | HyperOS 2.0（Mystic GSI 移植包） | 小米 15（dada，1200x2670@520） | `--width 600 --height 1335 --density 260 --ram 6144 --cores 6` | 跑 hyperos_fixes.py 后约 2 分钟开机到桌面；壁纸、状态栏、通知栏/控制中心、触摸、联网、设置正常 |
 | ColorOS 14（Mystic GSI 移植包，Android 14） | 一加 Pad Pro（OPD2404，平板，3000x2120@420） | `--width 1500 --height 1060 --density 210 --ram 6144 --cores 6` | 跑 coloros_gsi_fixes.py 与 coloros14_fixes.py 后首次开机约 95 秒、之后 35–60 秒；锁屏、桌面、设置（平板双栏）、触摸、联网正常；蓝牙不可用，几个 OPLUS 应用会周期性 NPE 重启 |
+| ColorOS 16（Mystic GSI 移植包，Android 16） | 一加 Pad Pro（OPD2404，平板，3000x2120@420） | `--width 1500 --height 1060 --density 210 --ram 6144 --cores 6` | 跑 kernel_fixes.py、coloros_gsi_fixes.py 与 coloros16_fixes.py 后约 46 秒亮屏、1 分钟进桌面；横屏平板布局、应用库/文件管理可打开、联网正常；向上跨版本（A16 system + A15 vendor），详见 §2.7 |
 
 复现（以 HyperOS 为例）：
 

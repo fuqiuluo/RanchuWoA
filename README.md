@@ -137,12 +137,26 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
 <img src="docs/img/coloros14-settings.png" width="400" alt="ColorOS 14 设置">
 </p>
 
+- **ColorOS 16 GSI**（社区移植的 Mystic GSI，Android 16，同样移植自一加 Pad Pro）：与 ColorOS 14 相反的**向上**
+  跨版本（新 system 配旧 vendor，正是真机 OTA 的方向），Treble 原生支持，不需要降级补丁；要处理的是移植包掏空
+  OPLUS 扩展模块导致的 netd 崩溃连坐（`onrestart` 杀 zygote，框架每 5 秒无声重启）、A16 connectivity 的 BPF 调用
+  踩中旧内核 lpm_trie UBSAN 陷阱（Kernel panic）、以及 `/my_product/build.prop` 里的机型属性抢跑（画面横躺）。
+  先跑一次 `py scripts/kernel_fixes.py`（基础内核的指令补丁，对所有 GSI 生效），再在 `coloros_gsi_fixes.py` 之后跑
+  `py scripts/coloros16_fixes.py images/gsi/my-gsi.img`（可重复运行）。同为平板固件，建实例一样用横屏
+  `--width 1500 --height 1060 --density 210`。约 46 秒亮屏、1 分钟进桌面；横屏平板布局、应用库/文件管理可打开、
+  联网正常，system_server 全程稳定。
+
+<p>
+<img src="docs/img/coloros16-home.png" width="400" alt="ColorOS 16 平板桌面">
+</p>
+
 - GSI 都是 user 版，SELinux 总是 enforcing；GSI 引用了 vendor 策略里没有的类型时，用 `scripts/gsi_undef_types.py`
   找出来补到 `gfx/vendor-overlay/gsi/gsi_sepolicy.cil`。
 - 没有开机向导的 GSI（如这个 ColorOS 移植包）不会写 `device_provisioned`/`user_setup_complete`，Android 会一直不响应
   主屏幕键和最近任务；QEMU 在每次开机完成后经 adbd 把它们补成 1（无需手动处理）。
 - 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要用 `gsi_disk.py`（ColorOS 再加 `coloros_gsi_fixes.py`、
-  ColorOS 14 再加 `coloros14_fixes.py`、HyperOS 再加 `hyperos_fixes.py`）重新生成，再 `avdctl edit <名字> --system <盘>` 重新挂上（只重建写时复制层，
+  ColorOS 14 再加 `coloros14_fixes.py`、ColorOS 16 再加 `coloros16_fixes.py`、HyperOS 再加 `hyperos_fixes.py`）重新
+  生成，基础内核另跑一次 `kernel_fixes.py`，再 `avdctl edit <名字> --system <盘>` 重新挂上（只重建写时复制层，
   userdata 保留）。
 
 ## 工作原理
