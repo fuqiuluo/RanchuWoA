@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    RanchuWoA 设备特性调整（HyperOS GSI 实验盘专用，替换 vendor 里的 ranchuwoa-features.xml）：
+    - 蓝牙：与官方镜像不同，HyperOS 的 system_server（WifiHandlerThread）里 MiuiNetworkMonitor 的
+      构造函数假定 BluetoothAdapter.getDefaultAdapter() 非空，把特性标为不可用会让它返回 null，
+      getProfileProxy 调用 NPE，system_server 反复崩溃（永远到不了开机完成）。这里保留蓝牙特性：
+      蓝牙默认关闭时蓝牙栈并不会启动，framework 里只是不再拿到空 Adapter。
+    - 以太网：与通用版相同，EthernetService 接管 virtio-net 的 eth0（slirp 提供 DHCP/DNS）。
+-->
+<permissions>
+    <feature name="android.hardware.ethernet" />
+</permissions>

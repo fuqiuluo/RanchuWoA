@@ -23,3 +23,8 @@
 (type silead_fp_service)
 (roletype object_r silead_fp_service)
 (typeattributeset service_manager_type (silead_fp_service))
+
+; system_ext_file_contexts：HyperOS（Xiaomi）的 system_ext 引用的 QTI vendor 文件类型
+(type vendor_vm_qti_system_file)
+(roletype object_r vendor_vm_qti_system_file)
+(typeattributeset file_type (vendor_vm_qti_system_file))

@@ -87,7 +87,7 @@ avdctl stop pixel       :: 正常关机
 ```sh
 # 1. 生成实验盘：基础盘 + GSI（原始或 sparse 的 system.img），并给 vendor 打 GSI 兼容补丁
 py scripts/gsi_disk.py images/base/android-35/system.img <GSI 的 system.img> images/gsi/my-gsi.img
-# 2. 用它建实例（GSI 一般比较吃资源；分辨率按 GSI 的源机型配，见下面 ColorOS 的例子）
+# 2. 用它建实例（GSI 一般比较吃资源；分辨率按 GSI 的源机型配，见下面 ColorOS/HyperOS 的例子）
 py tools/avdctl/avdctl.py create mygsi --system images/gsi/my-gsi.img --ram 6144 --cores 6 --no-firstboot
 py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbose-boot 看 logs/console.log
 ```
@@ -99,6 +99,8 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
 <p>
 <img src="docs/img/coloros-home.png" width="270" alt="ColorOS 15 桌面">
 <img src="docs/img/coloros-settings.png" width="270" alt="ColorOS 15 设置">
+<img src="docs/img/hyperos-home.png" width="270" alt="HyperOS 2.0 桌面">
+<img src="docs/img/hyperos-settings.png" width="270" alt="HyperOS 2.0 设置">
 </p>
 
 - **AOSP Android 15 GSI**（developer.android.com 的 `aosp_arm64` user 版）：直接开机到锁屏。user 版 adb 需要在屏幕上授权。
@@ -107,14 +109,22 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
   这个移植包来自一加 Ace 2V（PHP110，1240x2772，DPI 560），建实例时加 `--width 620 --height 1386 --density 280`
   （原机的一半：界面布局与真机相同，在 1600 像素高的屏幕上 1:1 显示，比原机分辨率流畅约 2.5 倍）；
   要逐像素还原就用 `--width 1240 --height 2772 --density 560`（软件渲染会明显变卡）。
+- **HyperOS 2.0 GSI**（社区移植的 Mystic GSI，移植自小米 15）：再跑一次
+  `py scripts/hyperos_fixes.py images/gsi/my-gsi.img`（两处补丁：实验盘 vendor 恢复蓝牙特性声明——小米的
+  MiuiNetworkMonitor 在 system_server 里假定 BluetoothAdapter 非空，去掉特性会每 17 秒崩一次；以及 vold 的
+  f2fs 空闲维护假定 /data 在 device-mapper 上，对裸 virtio 盘会空指针 → `reboot(vold-failed)` 无限重启），
+  之后约 2 分钟开机到桌面，触摸、联网（天气小组件有实时数据）、设置都正常。建实例加
+  `--width 600 --height 1335 --density 260`（小米 15 的 1200x2670@520 的一半，同为 369x822 dp、20:9）。
+  GMS（Google Play 服务）会反复报域验证异常，无害。
   它超时灭屏很快：工具栏电源键或 `adb shell input keyevent WAKEUP` 亮屏，工具栏「更多 → 显示与电源 → 保持唤醒」
   （即 `adb shell svc power stayon true`）保持常亮。
 - GSI 都是 user 版，SELinux 总是 enforcing；GSI 引用了 vendor 策略里没有的类型时，用 `scripts/gsi_undef_types.py`
   找出来补到 `gfx/vendor-overlay/gsi/gsi_sepolicy.cil`。
 - 没有开机向导的 GSI（如这个 ColorOS 移植包）不会写 `device_provisioned`/`user_setup_complete`，Android 会一直不响应
   主屏幕键和最近任务；QEMU 在每次开机完成后经 adbd 把它们补成 1（无需手动处理）。
-- 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要用 `gsi_disk.py`（ColorOS 再加 `coloros_gsi_fixes.py`）重新生成，
-  再 `avdctl edit <名字> --system <盘>` 重新挂上（只重建写时复制层，userdata 保留）。
+- 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要用 `gsi_disk.py`（ColorOS 再加 `coloros_gsi_fixes.py`、
+  HyperOS 再加 `hyperos_fixes.py`）重新生成，再 `avdctl edit <名字> --system <盘>` 重新挂上（只重建写时复制层，
+  userdata 保留）。
 
 ## 工作原理
 
@@ -232,7 +242,7 @@ bash gfx/build_gfxstream_guest.sh      # → gfx/gs-out（guest 的 EGL/GLES 与
 | `gfx/gralloc/` | woa gralloc（allocator 服务 + IMapper v5） |
 | `gfx/swiftshader/`、`gfx/ss-build/`、`gfx/egl-out/` | SwiftShader 源码、构建目录、剥符号后的产物 |
 | `gfx/vendor-overlay/` | 装进 vendor 分区的配置（init rc、VINTF、fstab、特性开关、SELinux 补充；`gsi/` 是 GSI 实验专用） |
-| `scripts/` | vendor 改造（`vendor_install.py`、`alpine_job.py`、`superimg.py`）、GSI 实验（`gsi_disk.py`、`coloros_gsi_fixes.py`、`gsi_undef_types.py`）、调试工具（`hmp.py`、`qmp_input.py`、`vserial.py`、`vpull.py`、`vxfer.py`、`ext4tool.py`）、开发启动脚本 `boot_woa.sh`、补丁生成 `make_patches.sh`；`legacy/` 是早期实验脚本 |
+| `scripts/` | vendor 改造（`vendor_install.py`、`alpine_job.py`、`superimg.py`）、GSI 实验（`gsi_disk.py`、`coloros_gsi_fixes.py`、`hyperos_fixes.py`、`gsi_undef_types.py`）、调试工具（`hmp.py`、`qmp_input.py`、`vserial.py`、`vpull.py`、`vxfer.py`、`ext4tool.py`）、开发启动脚本 `boot_woa.sh`、补丁生成 `make_patches.sh`；`legacy/` 是早期实验脚本 |
 | `images/base/`、`images/avds/`、`images/gsi/` | 基础镜像、各实例、GSI 实验盘 |
 | `images/android-35/arm64-v8a/` | 开发用镜像（`scripts/boot_woa.sh` 引导） |
 | `docs/` | 调研记录、交接文档、AOSP/内核参考源码摘录（`docs/reference/`） |
