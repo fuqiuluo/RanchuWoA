@@ -150,12 +150,27 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
 <img src="docs/img/coloros16-home.png" width="400" alt="ColorOS 16 平板桌面">
 </p>
 
+- **ColorOS 17 GSI**（社区移植的 Mystic GSI，Android 17 开发者预览"CinnamonBun"；A17 的包不在 SF 的 ColorOS 目录，
+  在 **Generic 目录**、以甜点代号命名，移植自 OPPO PLG120 手机）：在 C16 的补丁集上又过了三关——A17 libart 的
+  ClearGrowthLimit 用**写死的 512MB** 扩堆而本机 -Xmx 被按 192m 写死（来源不明）→ `Check failed` 每 5 秒杀
+  system_server，最终在 libandroid_runtime.so 里把读的属性名换哑名、默认 16m→1g 让 -Xmx 恒为 1g；**A17 的 zygote
+  会按校验和静默剔除 SYSTEMSERVERCLASSPATH 上改过的 jar**（dex 补丁在 framework 路径上彻底失效，只能走 native
+  库）；lpm_trie 的 UBSAN 误报在**查询路径**（cgroup BPF、IPv6 发包）又有一处 → kernel_fixes.py 新增 K2。
+  先 `py scripts/kernel_fixes.py`（K1+K2），再 `coloros_gsi_fixes.py` 之后跑 `py scripts/coloros17_fixes.py
+  images/gsi/my-gsi.img`。建实例用竖屏 `--width 636 --height 1390 --density 280`（约 1272 宽@560 的一半）。
+  首次开机（含 /data 全量编译）约 7 分钟，之后解锁、桌面、设置、联网正常。
+
+<p>
+<img src="docs/img/coloros17-home.png" width="270" alt="ColorOS 17 手机桌面">
+</p>
+
 - GSI 都是 user 版，SELinux 总是 enforcing；GSI 引用了 vendor 策略里没有的类型时，用 `scripts/gsi_undef_types.py`
   找出来补到 `gfx/vendor-overlay/gsi/gsi_sepolicy.cil`。
 - 没有开机向导的 GSI（如这个 ColorOS 移植包）不会写 `device_provisioned`/`user_setup_complete`，Android 会一直不响应
   主屏幕键和最近任务；QEMU 在每次开机完成后经 adbd 把它们补成 1（无需手动处理）。
 - 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要用 `gsi_disk.py`（ColorOS 再加 `coloros_gsi_fixes.py`、
-  ColorOS 14 再加 `coloros14_fixes.py`、ColorOS 16 再加 `coloros16_fixes.py`、HyperOS 再加 `hyperos_fixes.py`）重新
+  ColorOS 14 再加 `coloros14_fixes.py`、ColorOS 16 再加 `coloros16_fixes.py`、ColorOS 17 再加 `coloros17_fixes.py`、
+  HyperOS 再加 `hyperos_fixes.py`）重新
   生成，基础内核另跑一次 `kernel_fixes.py`，再 `avdctl edit <名字> --system <盘>` 重新挂上（只重建写时复制层，
   userdata 保留）。
 

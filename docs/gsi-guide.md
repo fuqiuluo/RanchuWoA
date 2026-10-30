@@ -144,6 +144,20 @@ libvintf 认旧清单与内核等级），M8 那些降级补丁全都不需要�
 system_server）；运行时 grep 与镜像事实矛盾时先怀疑自己的 adb 引号转义（`\|` 会被吃掉输出假阴性），
 prop 来源排查直接对镜像裸数据 grep 最快。
 
+## 2.8 跨大版本（向上）：Android 17 预览的 GSI
+
+A17 预览（CinnamonBun，SDK 36.1）沿用 §2.7 的大部分补丁，新增两类坑（M10，全在
+`scripts/coloros17_fixes.py` 与 `kernel_fixes.py` K2）：
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| system_server 每 5 秒 `Check failed: new_capacity <= Size()` SIGABRT | A17 libart 的 ClearGrowthLimit 用**写死的 512MB** 调 ClampGrowthLimit；我们环境 -Xmx 被按 192m 写死（来源不明，改属性/RAM 都没用） | libandroid_runtime.so 里把读的属性名换等长哑名 + 默认 16m→1g，-Xmx 恒为 1g |
+| 给 services.jar 打 dex 补丁后 `ClassNotFoundException: SystemServer` | **A17 的 zygote 按 jar 校验和静默剔除 SYSTEMSERVERCLASSPATH 上改过的 jar**（即使 zip/dex 校验全对；日志有 ClassLoaderContext size mismatch 线索） | A17 起 framework 路径上的 jar 一律不能打 dex 补丁，改走 native 库（.so 验证可打）或 system_ext 的 jar |
+| IPv6 发包时 Kernel panic（trie_lookup_elem） | lpm_trie 的 UBSAN 误报第二处：cgroup BPF 程序查询路径（K1 只修了更新路径） | kernel_fixes.py K2：3 条越界分支改跳"返回 NULL（未命中）" |
+
+上游自己修好的：startProcess 的 perfHint 路径 A17 已砍（不用补）；Telecom 的 SocDecouplingCenter
+继续不存在。首次开机含 /data 全量编译约 7 分钟。
+
 ## 3. 实测记录
 
 | GSI | 源机型 | 实例参数 | 结果 |
@@ -153,6 +167,7 @@ prop 来源排查直接对镜像裸数据 grep 最快。
 | HyperOS 2.0（Mystic GSI 移植包） | 小米 15（dada，1200x2670@520） | `--width 600 --height 1335 --density 260 --ram 6144 --cores 6` | 跑 hyperos_fixes.py 后约 2 分钟开机到桌面；壁纸、状态栏、通知栏/控制中心、触摸、联网、设置正常 |
 | ColorOS 14（Mystic GSI 移植包，Android 14） | 一加 Pad Pro（OPD2404，平板，3000x2120@420） | `--width 1500 --height 1060 --density 210 --ram 6144 --cores 6` | 跑 coloros_gsi_fixes.py 与 coloros14_fixes.py 后首次开机约 95 秒、之后 35–60 秒；锁屏、桌面、设置（平板双栏）、触摸、联网正常；蓝牙不可用，几个 OPLUS 应用会周期性 NPE 重启 |
 | ColorOS 16（Mystic GSI 移植包，Android 16） | 一加 Pad Pro（OPD2404，平板，3000x2120@420） | `--width 1500 --height 1060 --density 210 --ram 6144 --cores 6` | 跑 kernel_fixes.py、coloros_gsi_fixes.py 与 coloros16_fixes.py 后约 46 秒亮屏、1 分钟进桌面；横屏平板布局、应用库/文件管理可打开、联网正常；向上跨版本（A16 system + A15 vendor），详见 §2.7 |
+| ColorOS 17（Mystic GSI 移植包，Android 17 预览，包在 Generic 目录、代号 CinnamonBun） | OPPO PLG120（手机，约 1272 宽@560） | `--width 636 --height 1390 --density 280 --ram 6144 --cores 6` | 跑 kernel_fixes.py（K1+K2）、coloros_gsi_fixes.py 与 coloros17_fixes.py 后开机到桌面；解锁、设置可打开、联网正常；A17 预览的 ART 与 jar 校验有两处新坑，见 §2.8 |
 
 复现（以 HyperOS 为例）：
 
