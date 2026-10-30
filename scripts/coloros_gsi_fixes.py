@@ -28,10 +28,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from alpine_job import ROOT, run_job  # noqa: E402
 
 JAR = "system/framework/oplus-services.jar"
-# (类描述符, 方法名, 参数描述符串, 返回类型) —— 只支持 void 方法（改成 return-void）
+# (类描述符, 方法名, 参数描述符串, 返回类型) —— 只支持 void 方法（改成 return-void）。
+# 同一逻辑补丁的多版本签名并列（ColorOS 15 是 (String)V，ColorOS 16 改成了 ()V），
+# 找到哪个打哪个，一个都没找到才报错。
 PATCHES = [
     ("Lcom/android/server/am/OplusOsenseCompressAction;", "calcAffinityExcludeSuperBigCore",
      "Ljava/lang/String;", "V"),
+    ("Lcom/android/server/am/OplusOsenseCompressAction;", "calcAffinityExcludeSuperBigCore",
+     "", "V"),
 ]
 STALE = ["system/framework/oat/arm64/oplus-services.ocomp.odex",
          "system/framework/oat/arm64/oplus-services.ocomp.vdex",
@@ -123,8 +127,17 @@ def patch_jar(src: Path, dst: Path):
                 for p in PATCHES:
                     at = dex.find_code(*p)
                     if at is not None:
-                        struct.pack_into("<H", dex.d, at, 0x000E)     # return-void
-                        print(f"  {info.filename}: {p[0]}->{p[1]}({p[2]}){p[3]} @ {at:#x} → return-void")
+                        # 首指令整体换成 return-void，剩余指令单元全部填 nop：方法变空。
+                        # 只换单元 0 的话，原首指令多于 1 个单元时（C16 的 ()V 变体首指令是
+                        # 3 单元的 invoke-static）后续指令边界错位 → VerifyError 杀 system_server。
+                        n = struct.unpack_from("<I", dex.d, at - 4)[0]      # code_item.insns_size
+                        if dex.d[at:at + 2] == b"\x0e\x00" and \
+                           dex.d[at + 2:at + 2 * n] == b"\x00" * (2 * n - 2):
+                            print(f"  {info.filename}: {p[0]}->{p[1]}({p[2]}){p[3]} @ {at:#x} 已打过")
+                        else:
+                            dex.d[at:at + 2 * n] = b"\x0e\x00" + b"\x00" * (2 * n - 2)
+                            print(f"  {info.filename}: {p[0]}->{p[1]}({p[2]}){p[3]} @ {at:#x}"
+                                  f" → return-void（清空 {n} 个代码单元）")
                         done.add(p)
                         changed = True
                 if changed:
@@ -134,8 +147,8 @@ def patch_jar(src: Path, dst: Path):
             zi.compress_type = info.compress_type
             zi.external_attr = info.external_attr
             zout.writestr(zi, data)
-    if len(done) != len(PATCHES):
-        sys.exit(f"有方法没找到：{[p for p in PATCHES if p not in done]}")
+    if not done:
+        sys.exit(f"有方法没找到：{PATCHES}")
     unaligned = dst.with_suffix(".unaligned")
     unaligned.write_bytes(out.getvalue())
     zipalign = Path(os.environ.get("LOCALAPPDATA", "")) / "Android/Sdk/build-tools/34.0.0/zipalign.exe"
