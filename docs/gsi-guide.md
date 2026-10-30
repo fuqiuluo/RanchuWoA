@@ -5,7 +5,8 @@
 README「运行 GSI」。
 
 > 原则：所有修改只作用于本地自持的镜像副本（实验盘），补丁以脚本形式提供（`scripts/gsi_disk.py`、
-> `scripts/coloros_gsi_fixes.py`、`scripts/hyperos_fixes.py`），对镜像版本有校验、可重复运行。
+> `scripts/coloros_gsi_fixes.py`、`scripts/hyperos_fixes.py`、`scripts/coloros14_fixes.py`），对镜像版本有校验、
+> 可重复运行。
 
 ## 1. 工具
 
@@ -14,6 +15,7 @@ README「运行 GSI」。
 | `scripts/gsi_disk.py <基础system.img> <GSI> <输出盘>` | 生成实验盘。GSI 往往比原 system 大得多（super 放不下）：复制基础盘后在末尾追加空间，重写 GPT（主/备份 GPT、CRC、保护性 MBR）与 liblp 的 4 份元数据（块设备大小、分区组上限、system 的唯一 extent 指向新区域），再写入 GSI（支持 sparse，DONT_CARE/零填充直接跳过）。最后自动跑 `vendor_install --gsi` |
 | `scripts/gsi_undef_types.py <盘>` | 找出 GSI 的 contexts 文件引用了、但最终策略里没定义的 SELinux 类型（**离线提前跑**，别等开机失败再查） |
 | `scripts/coloros_gsi_fixes.py` / `hyperos_fixes.py` | 各自的厂商框架适配补丁，见 §3 |
+| `scripts/coloros14_fixes.py` | Android 14 的 ColorOS GSI 跑在我们 Android 15 vendor 上的全部适配（§2.6），在 coloros_gsi_fixes 之后运行 |
 | `avdctl create <名字> --system <盘>` | 用实验盘建实例（写时复制层以它为后备，`prepare --force` 不会重建）；`start --verbose-boot` 把内核/init 全量日志记进 `logs/console.log` |
 
 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要用 `gsi_disk.py` 重新生成（ColorOS/HyperOS 再跑
@@ -59,7 +61,15 @@ system_server 周期性崩溃或开机完成后无限重启）。实测遇到的
   `BluetoothAdapter.getDefaultAdapter()` 非空直接 getProfileProxy → NPE → 每 17 秒崩一次，永远到不了
   开机完成。修法：实验盘 vendor 的特性声明不再 `<unavailable-feature>` 蓝牙（蓝牙默认关闭时栈根本
   不启动，前提条件消失）。注意这与官方镜像相反——官方镜像要去掉蓝牙特性声明才能阻止蓝牙栈反复 abort，
-  区别在于有没有厂商代码去拿 Adapter。
+  区别在于有没有厂商代码去拿 Adapter。（ColorOS 14 例外：它的蓝牙管理会主动开 BLE，而 A14 蓝牙栈在这里
+  打不开 wake_lock 反复 abort，所以那边维持蓝牙不可用，让几个 OPLUS 应用 NPE 后由 AMS 退避重启。）
+- **只认高通/联发科**（ColorOS）：OPLUS 代码到处按 `ro.boot.hardware` 前缀、`ro.hardware == "qcom"`、
+  `ro.board.platform` 前缀判断平台，`ranchu` 两边都不中，有的地方拿到 null 就崩（Telecom 的 SoC 解耦层、
+  日志服务）。`ro.boot.hardware` 不能改（vendor 的 init.ranchu.rc、fstab 靠它），只在会崩的地方把判断
+  改成"高通"（源机型是骁龙），dex 指令级补丁。
+- **32 位程序**：宿主的骁龙 X Elite（Oryon 核）不支持 AArch32，GSI 里的 32 位可执行文件一律跑不起来。
+  ColorOS 14 的 mediaserverwrapper 按 `ro.mediaserver.64b.enable` 决定 exec 64 位还是 32 位的 mediaserver，
+  源机型的 vendor 设了这个属性、我们的没有——没有 mediaserver 会连锁拖垮 MediaProvider 与外部存储。
 
 ### 2.4 分辨率与密度
 
@@ -69,7 +79,9 @@ system_server 周期性崩溃或开机完成后无限重启）。实测遇到的
    build.prop、面板配置找，或对照真机资料）；
 2. 按宿主屏幕高度选一个**等比缩小**的分辨率（密度同比例缩小，dp 尺寸与真机一致，布局不变；宿主
    屏幕高度有限，原分辨率本来也要缩到一半显示，直接用一半还能明显提速）；
-3. `avdctl create/edit --width W --height H --density D`；
+3. `avdctl create/edit --width W --height H --density D`；平板固件（`ro.build.characteristics` 含 tablet）
+   给横屏分辨率，并去掉 build.prop 里的 `ro.surface_flinger.primary_display_orientation`（平板面板常是物理
+   竖装、SF 固定旋转 90°/270°，我们的虚拟屏本身就是横的，再转整个界面就横躺了）；
 4. MIUI 系的应用会按屏幕物理 PPI 再算一遍自己的密度（AutoDensity：PPI × 1.1399 × deviceScale，
   deviceScale = min(1, 短边英寸/2.8)）——virtio-gpu 的 `dpi=` 属性让 EDID 按实例密度报物理尺寸后，
   应用密度与真机比例一致（如 HyperOS 实例 600 宽、系统 260dpi、应用 246dpi，与小米 15 的
@@ -85,6 +97,30 @@ system_server 周期性崩溃或开机完成后无限重启）。实测遇到的
 - GMS 域验证异常（`not the approved domain verification agent`）之类移植包常见噪音，AMS 带退避重启，
   无害。
 - 缺大量厂商 HAL 的功能不可用是正常的（相应服务反复退出，只要不占 CPU 就无害）。
+- 移植者改过的 `persist.sys.usb.config` 要是 init.usb*.rc 认识的组合（如 `mtp,adb`），写成 `adb,mtp` 时
+  adbd 永远不启动。
+- ColorOS 的"权限监控"（开发者选项"禁止权限监控"）会收回 adb shell 的 WRITE_SECURE_SETTINGS，开机命令写
+  provisioned 标志就失败；它的开关属性会被 OPLUS 应用写回持久化，coloros14_fixes 直接放开 shell 这一处。
+
+### 2.6 跨大版本：Android 14 的 GSI
+
+我们的 vendor 和内核是 Android 15 的（VINTF 8.0、SELinux 202404、android15-6.6 GKI），Treble 只保证新
+system 配旧 vendor，反过来要逐项降级。ColorOS 14 实测需要（全在 `coloros14_fixes.py`，按出现顺序）：
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| InitFatalReboot，无限重启 | A14 GSI 没有 `mapping/202404.cil` | 以基础镜像的映射为模板，裁掉 A14 没有的类型 |
+| HAL 全部 CANNOT LINK | A14 linkerconfig 没有 `ro.vndk.version` 就生成 legacy 配置 | vendor build.prop 补 `ro.vndk.version=34` |
+| 所有 HAL 注册被拒 | A14 libvintf 不认 `manifest version="8.0"` | vendor 的 VINTF 改 7.0；vendor APEX（8.0 碎片、minSdk 35）全部禁用 |
+| vendor 组件缺符号 | A15 的 NDK 符号（libui 等） | 把 A15 的 libbinder(_ndk)/libui 等装进 vendor，另加直通 mapper 的 shim |
+| zygote 反复重启 | 没有 app_process32 | 删掉 zygote_secondary 定义 |
+| system_server "duplicate authenticator" | A14 框架把 A15 指纹 HAL 的同一传感器注册两次 | 删掉指纹/人脸 HAL 的 VINTF 声明与 rc（声明文件要删除，不能改名占位） |
+| 所有应用 setgroups EINVAL | 厂商组名（`vendor_launcher` 等）解析不到，A14 把 -1 放进附加组 | 写进 `/vendor/etc/group`（bionic 只认带分区前缀的组名：`system_`/`vendor_`…） |
+| systemReady 时 SIGABRT | A14 libvintf 把内核版本串里的 android15 换算成越界等级 | 补丁 `gkiAndroidReleaseToLevel`，越界返回 UNSPECIFIED |
+| 开机弹"设备内部出现了问题" | 设备矩阵要求 System SDK 35、框架矩阵没有 6.6 内核条目 | system-sdk 改 34；框架矩阵补 6.6 条目 |
+| 桌面黑屏、launcher ANR | 高通 perfservice 读不到 `hwservicemanager.ready`，HIDL 无限等待，调它的进程全卡死 | vendor 策略补那条 allow |
+
+外加 ColorOS 自身的几处（§2.3 的平台判断、32 位 mediaserver，§2.5 的 adb 与权限监控）。
 
 ## 3. 实测记录
 
@@ -93,6 +129,7 @@ system_server 周期性崩溃或开机完成后无限重启）。实测遇到的
 | AOSP Android 15（官方 aosp_arm64 user 版） | — | 默认 720x1280 | 直接开机到锁屏；user 版 adb 需屏幕授权 |
 | ColorOS 15（Mystic GSI 移植包） | 一加 Ace 2V（PHP110，1240x2772@560） | `--width 620 --height 1386 --density 280 --ram 6144 --cores 6` | 跑 coloros_gsi_fixes.py 后 50–125 秒开机到桌面，触摸/设置/滚动正常；两种图形后端都可用 |
 | HyperOS 2.0（Mystic GSI 移植包） | 小米 15（dada，1200x2670@520） | `--width 600 --height 1335 --density 260 --ram 6144 --cores 6` | 跑 hyperos_fixes.py 后约 2 分钟开机到桌面；壁纸、状态栏、通知栏/控制中心、触摸、联网、设置正常 |
+| ColorOS 14（Mystic GSI 移植包，Android 14） | 一加 Pad Pro（OPD2404，平板，3000x2120@420） | `--width 1500 --height 1060 --density 210 --ram 6144 --cores 6` | 跑 coloros_gsi_fixes.py 与 coloros14_fixes.py 后首次开机约 95 秒、之后 35–60 秒；锁屏、桌面、设置（平板双栏）、触摸、联网正常；蓝牙不可用，几个 OPLUS 应用会周期性 NPE 重启 |
 
 复现（以 HyperOS 为例）：
 
@@ -111,4 +148,8 @@ py tools/avdctl/avdctl.py start hyperos --wait
   `guest boot completed` 就是"每轮都开机完成后立刻重启"的指纹**；
 - system_server 周期性崩溃：`logcat` 里数 FATAL EXCEPTION 的周期与线程名，对照 `debuggerd -b <pid>`
   的原生栈；
+- **user 版 GSI 上 adb 只是 shell**，读不了 /data/anr、不能 debuggerd 别的进程：`adb bugreport` 由 root 的
+  dumpstate 收集，一次拿到全部 ANR trace、tombstone 和 `BINDER TRANSACTIONS`（卡死的进程在等谁的哪个调用）；
+- 某个进程卡死时，在 bugreport 的 BINDER TRANSACTIONS 里找 `outgoing transaction ... from <pid>`，对端 pid
+  再到进程列表里查名字；
 - 更多手段（gdb 定位 init、--verbose-boot、内核符号表）见 [debugging.md](debugging.md)。

@@ -82,7 +82,8 @@ avdctl stop pixel       :: 正常关机
 
 ## 运行 GSI（实验性）
 
-可以把基础镜像里的 system 分区换成别的 Android 15 GSI（Generic System Image），沿用我们的 vendor（图形、输入、vsock 服务）：
+可以把基础镜像里的 system 分区换成别的 Android 15 GSI（Generic System Image），沿用我们的 vendor（图形、输入、vsock 服务）；
+Android 14 的 GSI 要额外适配（见下面 ColorOS 14 的例子与 [GSI 适配指南](docs/gsi-guide.md) §2.6）：
 
 ```sh
 # 1. 生成实验盘：基础盘 + GSI（原始或 sparse 的 system.img），并给 vendor 打 GSI 兼容补丁
@@ -123,12 +124,25 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
   GMS（Google Play 服务）会反复报域验证异常，无害。
   它超时灭屏很快（锁屏 10 秒、桌面 1 分钟）：工具栏电源键或 `adb shell input keyevent WAKEUP` 亮屏，
   工具栏「更多 → 显示与电源 → 保持唤醒」（即 `adb shell svc power stayon true`）保持常亮。
+- **ColorOS 14 GSI**（社区移植的 Mystic GSI，Android 14，移植自一加 Pad Pro 平板）：Android 14 的系统跑在我们
+  Android 15 的 vendor 上要逐项降级（SELinux 映射、VINTF 版本、linkerconfig、A15 符号、内核版本识别……），
+  再加 OPLUS 框架只认高通/联发科、32 位 mediaserver 等问题，全部由脚本处理：在 `coloros_gsi_fixes.py` 之后再跑
+  `py scripts/coloros14_fixes.py images/gsi/my-gsi.img`（依赖 `images/gsi/coloros15-system.img`，即 ColorOS 15
+  GSI 的原始 system.img，从中取几个 A15 系统库；可重复运行）。这是平板固件，建实例用横屏
+  `--width 1500 --height 1060 --density 210`（原机 3000x2120@420 的一半）。首次开机约 95 秒，之后 35–60 秒；
+  锁屏、桌面、设置（平板双栏）、触摸、联网正常。蓝牙不可用，几个 OPLUS 应用会周期性崩溃重启，无害。
+
+<p>
+<img src="docs/img/coloros14-home.png" width="400" alt="ColorOS 14 平板桌面">
+<img src="docs/img/coloros14-settings.png" width="400" alt="ColorOS 14 设置">
+</p>
+
 - GSI 都是 user 版，SELinux 总是 enforcing；GSI 引用了 vendor 策略里没有的类型时，用 `scripts/gsi_undef_types.py`
   找出来补到 `gfx/vendor-overlay/gsi/gsi_sepolicy.cil`。
 - 没有开机向导的 GSI（如这个 ColorOS 移植包）不会写 `device_provisioned`/`user_setup_complete`，Android 会一直不响应
   主屏幕键和最近任务；QEMU 在每次开机完成后经 adbd 把它们补成 1（无需手动处理）。
 - 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要用 `gsi_disk.py`（ColorOS 再加 `coloros_gsi_fixes.py`、
-  HyperOS 再加 `hyperos_fixes.py`）重新生成，再 `avdctl edit <名字> --system <盘>` 重新挂上（只重建写时复制层，
+  ColorOS 14 再加 `coloros14_fixes.py`、HyperOS 再加 `hyperos_fixes.py`）重新生成，再 `avdctl edit <名字> --system <盘>` 重新挂上（只重建写时复制层，
   userdata 保留）。
 
 ## 工作原理
@@ -248,7 +262,7 @@ bash gfx/build_gfxstream_guest.sh      # → gfx/gs-out（guest 的 EGL/GLES 与
 | `gfx/gralloc/` | woa gralloc（allocator 服务 + IMapper v5） |
 | `gfx/swiftshader/`、`gfx/ss-build/`、`gfx/egl-out/` | SwiftShader 源码、构建目录、剥符号后的产物 |
 | `gfx/vendor-overlay/` | 装进 vendor 分区的配置（init rc、VINTF、fstab、特性开关、SELinux 补充；`gsi/` 是 GSI 实验专用） |
-| `scripts/` | vendor 改造（`vendor_install.py`、`alpine_job.py`、`superimg.py`）、GSI 实验（`gsi_disk.py`、`coloros_gsi_fixes.py`、`hyperos_fixes.py`、`gsi_undef_types.py`）、调试工具（`hmp.py`、`qmp_input.py`、`vserial.py`、`vpull.py`、`vxfer.py`、`ext4tool.py`，抓真实窗口查闪烁的 `flicker_cap.py`、`window_cap.py`）、开发启动脚本 `boot_woa.sh`、补丁生成 `make_patches.sh`；`legacy/` 是早期实验脚本 |
+| `scripts/` | vendor 改造（`vendor_install.py`、`alpine_job.py`、`superimg.py`）、GSI 实验（`gsi_disk.py`、`coloros_gsi_fixes.py`、`coloros14_fixes.py`、`hyperos_fixes.py`、`gsi_undef_types.py`）、调试工具（`hmp.py`、`qmp_input.py`、`vserial.py`、`vpull.py`、`vxfer.py`、`ext4tool.py`，抓真实窗口查闪烁的 `flicker_cap.py`、`window_cap.py`）、开发启动脚本 `boot_woa.sh`、补丁生成 `make_patches.sh`；`legacy/` 是早期实验脚本 |
 | `images/base/`、`images/avds/`、`images/gsi/` | 基础镜像、各实例、GSI 实验盘 |
 | `images/android-35/arm64-v8a/` | 开发用镜像（`scripts/boot_woa.sh` 引导） |
 | `docs/` | 主题文档（架构、设备、图形、GSI、排查）与 AOSP/内核参考源码摘录（`docs/reference/`） |
