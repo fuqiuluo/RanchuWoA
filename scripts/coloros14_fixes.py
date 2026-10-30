@@ -136,6 +136,15 @@
   setcon 失败 abort 一次后退回 shell）。该属性是 OPLUS 全局拦截总开关、会被 OPLUS 应用写回持久化，
   改 build.prop 默认值压不住，也不该整体关掉，所以只放开 shell 这一处。
 
+  e) framework/services.jar：ProcessListSocExtImpl.startProcess 直接返回。高通 SoC 扩展在应用进程启动时
+  发 perfHint(4225, …, 101)，QPerformance 的 Performance 对 101 另起线程直接调 JNI；zygote 只在
+  ro.boot.hardware 以 qcom 开头时预加载 libqti_performance.so，于是 UnsatisfiedLinkError 无人捕获，
+  点开设置等应用就杀死 system_server（其余 perf 调用经 BoostFramework 反射，异常被吞掉）。Performance、
+  BoostFramework、ZygoteInit 都在启动类路径上，改它们启动镜像就作废，所以截断在 services.jar 的调用方
+  （该方法只发这一个提示）。也没让 zygote 加载那个库：它会在每个进程里直连高通 perf HAL，读不到
+  hwservicemanager.ready 的域会像 perfservice 一样无限等待。services 的 odex/vdex/art 删掉后 odrefresh
+  开机时在 /data 上重新编译。
+
 补丁 14（vendor 分区，etc/permissions/ranchuwoa-features.xml）：保持通用版，蓝牙不可用（不学 HyperOS）。
   com.oplus.exsystemservice、com.oplus.battery、com.heytap.accessory 等假定 BluetoothAdapter 非空，
   蓝牙不可用时它们 NPE 后被 AMS 带退避地重启（ColorOS 15 同样如此，整机仍空闲）。试过 HyperOS 的
@@ -257,6 +266,22 @@ DEX_PATCHES = {
           (0x0163, 0x2558),                      # sget-boolean v1, IS_FORUM_VERSION
           (0x000F, 0x0000))],                    # return v0（v0 已由第 0 条置 0）; nop
         []),                                     # 该 jar 没有预编译产物（coloros_gsi_fixes 已删）
+    "system/framework/services.jar": (
+        # 高通 SoC 扩展在应用进程启动时发 perfHint(4225, 进程名, pid, 101)，QPerformance 的
+        # Performance.perfHint 对 101 另起 SendGameLaunchBroadcast 线程直接调 JNI，而 zygote 只在
+        # Build.isQcomPlatform()（ro.boot.hardware 以 qcom 开头）时预加载 libqti_performance.so——
+        # UnsatisfiedLinkError 无人捕获，点开应用就杀死 system_server。Performance/BoostFramework/
+        # ZygoteInit 都在启动类路径上（改了启动镜像作废），所以在 services.jar 的调用方截断：整个方法只是
+        # 这一个性能提示
+        [("Lcom/android/server/am/ProcessListSocExtImpl;", "startProcess",
+          "Lcom/android/server/am/HostingRecord;Landroid/os/Process$ProcessStartResult;"
+          "Lcom/android/server/am/ProcessRecord;", "V", 0,
+          (0x0162, 0x523D),                      # sget-object v1, mPerfServiceStartHint
+          (0x000E, 0x0000))],                    # return-void; nop
+        # odrefresh 发现 /system 上的 system_server 产物不全，会在 /data 上重新编译
+        ["system/framework/oat/arm64/services.odex",
+         "system/framework/oat/arm64/services.vdex",
+         "system/framework/oat/arm64/services.art"]),
 }
 
 

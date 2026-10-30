@@ -66,7 +66,10 @@ system_server 周期性崩溃或开机完成后无限重启）。实测遇到的
 - **只认高通/联发科**（ColorOS）：OPLUS 代码到处按 `ro.boot.hardware` 前缀、`ro.hardware == "qcom"`、
   `ro.board.platform` 前缀判断平台，`ranchu` 两边都不中，有的地方拿到 null 就崩（Telecom 的 SoC 解耦层、
   日志服务）。`ro.boot.hardware` 不能改（vendor 的 init.ranchu.rc、fstab 靠它），只在会崩的地方把判断
-  改成"高通"（源机型是骁龙），dex 指令级补丁。
+  改成"高通"（源机型是骁龙），dex 指令级补丁。高通的 BoostFramework 也一样：zygote 只在
+  `ro.boot.hardware` 以 qcom 开头时才加载 `libqti_performance.so`，其余 perf 调用的异常被吞掉，但 ColorOS 14
+  在应用进程启动时会另起线程直接调 JNI，`UnsatisfiedLinkError` 直接杀死 system_server（表现为点开应用整机
+  重启框架）。相关类都在启动类路径上，改了启动镜像会作废，所以在 services.jar 的调用方截断。
 - **32 位程序**：宿主的骁龙 X Elite（Oryon 核）不支持 AArch32，GSI 里的 32 位可执行文件一律跑不起来。
   ColorOS 14 的 mediaserverwrapper 按 `ro.mediaserver.64b.enable` 决定 exec 64 位还是 32 位的 mediaserver，
   源机型的 vendor 设了这个属性、我们的没有——没有 mediaserver 会连锁拖垮 MediaProvider 与外部存储。
