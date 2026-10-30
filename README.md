@@ -9,6 +9,8 @@ ANGLE → Direct3D 11），也可以完全在 guest 里用 CPU 渲染（SwiftSha
 <img src="docs/img/settings.png" width="270" alt="设置">
 </p>
 
+> 这个项目因何而存在？只是好玩啦，如果你的预算充足，其实可以使用 [HyperOS-AVD](https://github.com/NEORUAA/HyperOS-AVD) / [ColorOS-AVD](https://github.com/YuKongA/ColorOS-AVD) !
+
 ## 运行环境
 
 - Windows 11 ARM64（在 Snapdragon X Elite X1E78100、Windows 11 build 26220 上验证）
