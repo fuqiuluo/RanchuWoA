@@ -161,7 +161,8 @@ bootanimation ──┤                                                         
   SDL UI 修了 Windows 上的死锁并支持高 DPI。
 - **声音**：`virtio-sound-pci` + 官方镜像的 goldfish 音频 HAL（tinyalsa）。
 
-完整的调研与实验记录见 [docs/RESEARCH.md](docs/RESEARCH.md)（§19–§20 是当前架构，§24 是 gfxstream）。
+深入文档：[系统架构与引导链](docs/architecture.md) · [自研 goldfish/virtio 设备](docs/goldfish-devices.md) ·
+[图形栈](docs/graphics.md) · [GSI 适配指南](docs/gsi-guide.md) · [排查手册](docs/debugging.md)。
 
 ## 从源码构建
 
@@ -250,7 +251,7 @@ bash gfx/build_gfxstream_guest.sh      # → gfx/gs-out（guest 的 EGL/GLES 与
 | `scripts/` | vendor 改造（`vendor_install.py`、`alpine_job.py`、`superimg.py`）、GSI 实验（`gsi_disk.py`、`coloros_gsi_fixes.py`、`hyperos_fixes.py`、`gsi_undef_types.py`）、调试工具（`hmp.py`、`qmp_input.py`、`vserial.py`、`vpull.py`、`vxfer.py`、`ext4tool.py`，抓真实窗口查闪烁的 `flicker_cap.py`、`window_cap.py`）、开发启动脚本 `boot_woa.sh`、补丁生成 `make_patches.sh`；`legacy/` 是早期实验脚本 |
 | `images/base/`、`images/avds/`、`images/gsi/` | 基础镜像、各实例、GSI 实验盘 |
 | `images/android-35/arm64-v8a/` | 开发用镜像（`scripts/boot_woa.sh` 引导） |
-| `docs/` | 调研记录、交接文档、AOSP/内核参考源码摘录（`docs/reference/`） |
+| `docs/` | 主题文档（架构、设备、图形、GSI、排查）与 AOSP/内核参考源码摘录（`docs/reference/`） |
 | `downloads/`、`dist/`、`logs/`、`debug/` | 下载缓存、打包的 QEMU、历史实验日志、内核符号等调试材料 |
 
 ## 故障排查
