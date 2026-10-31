@@ -6,10 +6,11 @@
 /dist/
 /.zcode/
 
-# 只在本地给开发会话（Claude Code）用的文档：开发约定、交接说明、内部实验日志
+# 只在本地给开发会话（Claude Code）用的文档：开发约定、交接说明、内部实验日志、研究记忆
 /CLAUDE.md
 /docs/HANDOFF.md
 /docs/RESEARCH.md
+/.local/
 
 # 可由上游源码 + patches/ 复原的源码树
 /qemu-ranchu/
