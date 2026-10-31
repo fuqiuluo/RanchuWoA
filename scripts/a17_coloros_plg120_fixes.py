@@ -1,11 +1,14 @@
-"""coloros17_fixes.py — M10 实验：ColorOS 17（Android 17 预览，CinnamonBun/SDK 36.1）GSI 在我们
-Android 15 vendor 上引导的适配补丁。在 gsi_disk.py 与 coloros_gsi_fixes.py 之后运行。
+"""a17_coloros_plg120_fixes.py — M10 实验：ColorOS 16 PLG120（Android 17 预览底座，CinnamonBun/SDK 36.1）GSI
+在我们 Android 15 vendor 上引导的适配补丁。在 gsi_disk.py 与 coloros_gsi_fixes.py 之后运行。
 
-用法: py scripts/coloros17_fixes.py <GSI 实验盘>        （盘不能正被 VM 使用）
+用法: py scripts/a17_coloros_plg120_fixes.py <GSI 实验盘>        （盘不能正被 VM 使用）
 
 背景：A17 开发者预览（fingerprint CP21.260206，2026-03 安全补丁），MysticGSI 移植包在 Generic
-目录（Coloros-OP5E11L1-CinnamonBun-20260325）。源机型 OPPO PLG120（旗舰手机，打孔屏约 1272 宽、
-560 密度 → 实例 636x1390@280）。与 M9 同为向上跨版本且更省事：mapping/202404.cil 仍在、
+目录（Coloros-OP5E11L1-CinnamonBun-20260325）。源机型 OPPO Find X9 Pro 卫星通信版（PLG120，旗舰手机，
+打孔屏约 1272 宽、560 密度 → 实例 636x1390@280）。版本口径：显示版本钉在 16.0.0
+（ro.build.display.id.show=PLG120_16.0.0.01），内部 build 号 PLG120_17.0.0.12(CN01)、my_product 自报
+ColorOS 17.0——ColorOS 17 内部版穿着 16 的外衣，镜像命名跟随显示版本（a17_coloros16.0.0_plg120.img）。
+与 M9 同为向上跨版本且更省事：mapping/202404.cil 仍在、
 gsi_undef_types 0 个未定义、8 级矩阵缺 6.6 内核条目（同 C16 的弹窗修法）。补丁基本是 C16 的
 参数更新版：
 
@@ -58,10 +61,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from alpine_job import ROOT, run_job                      # noqa: E402
-from coloros14_fixes import set_props, patch_zip_dex      # noqa: E402
+from a14_coloros_opd2404_fixes import set_props, patch_zip_dex      # noqa: E402
 from coloros_gsi_fixes import Dex                         # noqa: E402
-from coloros16_fixes import elf_dynsym_value              # noqa: E402
-from hyperos_fixes import patch_props, replace_cmds       # noqa: E402
+from a16_coloros_opd2404_fixes import elf_dynsym_value              # noqa: E402
+from a15_hyperos_dada_fixes import patch_props, replace_cmds       # noqa: E402
 from vendor_install import _write_file_cmds               # noqa: E402
 
 # 补丁 1/1b：system 分区 build.prop → 注释掉的键 / 追加设置的键（手机固件，无转向属性）。
@@ -178,7 +181,7 @@ def main():
     voff = subprocess.run([sys.executable, str(ROOT / "scripts/superimg.py"), str(disk_arg), "vendor"],
                           capture_output=True, text=True, check=True).stdout.split()[0]
 
-    stage = ROOT / "images" / ".alpine-job" / "coloros17-payload"
+    stage = ROOT / "images" / ".alpine-job" / "a17_plg120-payload"
     shutil.rmtree(stage, ignore_errors=True)
     (stage / "files").mkdir(parents=True)
     (stage / "labels").mkdir()
@@ -331,8 +334,8 @@ def main():
     job = (JOB.replace("{voff}", str(voff)).replace("{soff}", str(soff))
            .replace("{props}", " ".join(rel for rel, _ in PROP_EDITS)))
     rc = run_job(job, disks=[disk_arg], payload_dir=stage,
-                 log=ROOT / "images" / ".alpine-job" / "coloros17_fixes.log", echo=False)
-    print("完成" if rc == 0 else f"失败（rc={rc}），日志 images/.alpine-job/coloros17_fixes.log")
+                 log=ROOT / "images" / ".alpine-job" / "a17_coloros_plg120_fixes.log", echo=False)
+    print("完成" if rc == 0 else f"失败（rc={rc}），日志 images/.alpine-job/a17_coloros_plg120_fixes.log")
     sys.exit(rc)
 
 

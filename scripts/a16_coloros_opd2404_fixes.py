@@ -1,7 +1,7 @@
-"""coloros16_fixes.py — M9 实验：ColorOS 16（Android 16，SDK 36）GSI 在我们 Android 15 vendor 上
+"""a16_coloros_opd2404_fixes.py — M9 实验：ColorOS 16（Android 16，SDK 36）GSI 在我们 Android 15 vendor 上
 引导的适配补丁。在 gsi_disk.py 与 coloros_gsi_fixes.py 之后运行。
 
-用法: py scripts/coloros16_fixes.py <GSI 实验盘>        （盘不能正被 VM 使用）
+用法: py scripts/a16_coloros_opd2404_fixes.py <GSI 实验盘>        （盘不能正被 VM 使用）
 
 为什么只需要这几个补丁（与 M8/ColorOS 14 的根本区别）：
   M8 是向下跨版本（A14 system + A15 vendor），Treble 不保证，要逐项降级（mapping 自造、VINTF 8.0→7.0、
@@ -56,11 +56,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from alpine_job import ROOT, run_job                      # noqa: E402
-from coloros14_fixes import set_props                     # noqa: E402
+from a14_coloros_opd2404_fixes import set_props                     # noqa: E402
 from coloros_gsi_fixes import Dex                         # noqa: E402
-from hyperos_fixes import patch_props, replace_cmds       # noqa: E402
+from a15_hyperos_dada_fixes import patch_props, replace_cmds       # noqa: E402
 from vendor_install import _write_file_cmds               # noqa: E402
-from coloros14_fixes import patch_zip_dex                 # noqa: E402
+from a14_coloros_opd2404_fixes import patch_zip_dex                 # noqa: E402
 
 # 补丁 1/1b：system 分区 build.prop → 注释掉的键 / 追加设置的键（沿用 ColorOS 14 同源机型的表）。
 # C16 的移植包把 OPLUS 的 my_product 打进了 system 分区（C15 时代没有），/my_product/build.prop
@@ -84,7 +84,7 @@ PROP_SET = {
 # 补丁 4：要补 6.6 内核条目的框架兼容性矩阵 (路径, 内核 FCM 等级)
 FCM_KERNEL = [("system/etc/vintf/compatibility_matrix.8.xml", 8)]
 
-# 补丁 3：dex 指令级补丁（结构同 coloros14_fixes.DEX_PATCHES；索引值取自 OP5D77L1-16-1761878977752）
+# 补丁 3：dex 指令级补丁（结构同 a14_coloros_opd2404_fixes.DEX_PATCHES；索引值取自 OP5D77L1-16-1761878977752）
 DEX_PATCHES = {
     "system/framework/services.jar": (
         [("Lcom/android/server/am/ProcessListSocExtImpl;", "startProcess",
@@ -325,8 +325,8 @@ def main():
     job = (JOB.replace("{voff}", str(voff)).replace("{soff}", str(soff))
            .replace("{props}", " ".join(rel for rel, _ in PROP_EDITS)))
     rc = run_job(job, disks=[disk_arg], payload_dir=stage,
-                 log=ROOT / "images" / ".alpine-job" / "coloros16_fixes.log", echo=False)
-    print("完成" if rc == 0 else f"失败（rc={rc}），日志 images/.alpine-job/coloros16_fixes.log")
+                 log=ROOT / "images" / ".alpine-job" / "a16_coloros_opd2404_fixes.log", echo=False)
+    print("完成" if rc == 0 else f"失败（rc={rc}），日志 images/.alpine-job/a16_coloros_opd2404_fixes.log")
     sys.exit(rc)
 
 
