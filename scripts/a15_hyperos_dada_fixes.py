@@ -1,6 +1,6 @@
-"""hyperos_fixes.py — M7 实验：给 HyperOS（Xiaomi）GSI 的实验盘打补丁，让它能在 ranchu 虚拟机上跑起来。
+"""a15_hyperos_dada_fixes.py — M7 实验：给 HyperOS（Xiaomi）GSI 的实验盘打补丁，让它能在 ranchu 虚拟机上跑起来。
 
-用法: py scripts/hyperos_fixes.py <GSI 实验盘>        （scripts/gsi_disk.py 的产物，盘不能正被 VM 使用）
+用法: py scripts/a15_hyperos_dada_fixes.py <GSI 实验盘>        （scripts/gsi_disk.py 的产物，盘不能正被 VM 使用）
 可重复运行：已经打过的补丁会跳过。
 
 补丁 1（vendor 分区，ranchuwoa-features.xml）：保留蓝牙特性。
@@ -169,8 +169,8 @@ def main():
     job = (JOB.replace("{voff}", str(voff)).replace("{soff}", str(soff))
            .replace("{props}", " ".join(rel for rel, _ in PROP_EDITS)))
     rc = run_job(job, disks=[disk], payload_dir=stage,
-                 log=ROOT / "images" / ".alpine-job" / "hyperos_fixes.log", echo=False)
-    print("完成" if rc == 0 else f"失败（rc={rc}），日志 images/.alpine-job/hyperos_fixes.log")
+                 log=ROOT / "images" / ".alpine-job" / "a15_hyperos_dada_fixes.log", echo=False)
+    print("完成" if rc == 0 else f"失败（rc={rc}），日志 images/.alpine-job/a15_hyperos_dada_fixes.log")
     sys.exit(rc)
 
 

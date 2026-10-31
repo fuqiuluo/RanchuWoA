@@ -1,9 +1,9 @@
-"""coloros14_fixes.py — M8 实验：给 ColorOS 14（OPLUS，Android 14/SDK 34）GSI 的实验盘打补丁。
+"""a14_coloros_opd2404_fixes.py — M8 实验：给 ColorOS 14（OPLUS，Android 14/SDK 34）GSI 的实验盘打补丁。
 
-用法: py scripts/coloros14_fixes.py <GSI 实验盘>        （scripts/gsi_disk.py 的产物，盘不能正被 VM 使用）
+用法: py scripts/a14_coloros_opd2404_fixes.py <GSI 实验盘>        （scripts/gsi_disk.py 的产物，盘不能正被 VM 使用）
 在 coloros_gsi_fixes.py 之后运行；可重复运行（已处理的项会跳过）。
 
-补丁 1（system 分区，build.prop）：去掉源机型的显示/图形硬件属性，改由模拟器决定（同 hyperos_fixes 的第 3 条，
+补丁 1（system 分区，build.prop）：去掉源机型的显示/图形硬件属性，改由模拟器决定（同 a15_hyperos_dada_fixes 的第 3 条，
 见 RESEARCH §25；ro 属性只能设一次，init 先加载 /system/build.prop、后执行 vendor 的 init 脚本）：
   - ro.sf.lcd_density=420（源机型的密度）：抢在 vendor 按 androidboot.lcd_density 设的值之前生效，
     实例分辨率（原机一半 1500x1060）配 210 密度会被它顶成 420，界面按整屏真机排版。
@@ -174,7 +174,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from alpine_job import ROOT, run_job                      # noqa: E402
 from coloros_gsi_fixes import Dex                         # noqa: E402
-from hyperos_fixes import patch_props, replace_cmds       # noqa: E402
+from a15_hyperos_dada_fixes import patch_props, replace_cmds       # noqa: E402
 from vendor_install import _write_file_cmds               # noqa: E402
 
 # 补丁 1：system 分区里的 build.prop（ext4 内路径）→ 要注释掉的属性
@@ -377,7 +377,7 @@ def patch_ndk_dtneeded(data: bytes) -> bytes:
     struct.pack_into("<QQ", d, null_off, 1, soname + 9)   # DT_NEEDED "_ndk.so"（SONAME 子串）
     return bytes(d)
 
-# 只动 system/vendor 分区的作业（结构同 hyperos_fixes.JOB，vendor 段仅写 build.prop）
+# 只动 system/vendor 分区的作业（结构同 a15_hyperos_dada_fixes.JOB，vendor 段仅写 build.prop）
 JOB = r"""
 D="$DISK0"
 [ -n "$D" ] || { echo "找不到实验盘"; exit 1; }
@@ -717,7 +717,7 @@ def main():
     # vndservicemanager；A15 实测（ColorOS 15 正常开机）vendor HAL 的 binder 全走系统变体：
     # sphal 命名空间链到 system 的 libbinder/libbinder_ndk（fd 指向 binderfs/binder），所以把
     # 这三个系统库放进 /vendor/lib64（同名遮蔽 vendor 变体）。libapexsupport.so 只有基础镜像有。
-    GSI15_IMG = ROOT / "images" / "gsi" / "coloros15-system.img"
+    GSI15_IMG = ROOT / "images" / "gsi" / "a15_coloros15.0.0_php110-system.img"
     boff = subprocess.run([sys.executable, str(ROOT / "scripts/superimg.py"), str(BASE_IMG), "system"],
                           capture_output=True, text=True, check=True).stdout.split()[0]
     (stage / "a15").mkdir(parents=True, exist_ok=True)
@@ -852,8 +852,8 @@ def main():
     job = (JOB.replace("{voff}", str(voff)).replace("{soff}", str(soff))
            .replace("{props}", " ".join(rel for rel, _ in PROP_EDITS)))
     rc = run_job(job, disks=[disk_arg], payload_dir=stage,
-                 log=ROOT / "images" / ".alpine-job" / "coloros14_fixes.log", echo=False)
-    print("完成" if rc == 0 else f"失败（rc={rc}），日志 images/.alpine-job/coloros14_fixes.log")
+                 log=ROOT / "images" / ".alpine-job" / "a14_coloros_opd2404_fixes.log", echo=False)
+    print("完成" if rc == 0 else f"失败（rc={rc}），日志 images/.alpine-job/a14_coloros_opd2404_fixes.log")
     sys.exit(rc)
 
 

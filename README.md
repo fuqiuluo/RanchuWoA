@@ -111,7 +111,7 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
   （原机的一半：界面布局与真机相同，在 1600 像素高的屏幕上 1:1 显示，比原机分辨率流畅约 2.5 倍）；
   要逐像素还原就用 `--width 1240 --height 2772 --density 560`（软件渲染会明显变卡）。
 - **HyperOS 2.0 GSI**（社区移植的 Mystic GSI，移植自小米 15）：再跑一次
-  `py scripts/hyperos_fixes.py images/gsi/my-gsi.img`（三处补丁：实验盘 vendor 恢复蓝牙特性声明——小米的
+  `py scripts/a15_hyperos_dada_fixes.py images/gsi/my-gsi.img`（三处补丁：实验盘 vendor 恢复蓝牙特性声明——小米的
   MiuiNetworkMonitor 在 system_server 里假定 BluetoothAdapter 非空，去掉特性会每 17 秒崩一次；vold 的
   f2fs 空闲维护假定 /data 在 device-mapper 上，对裸 virtio 盘会空指针 → `reboot(vold-failed)` 无限重启；
   以及注释掉 build.prop 里小米 15 的 `ro.sf.lcd_density=520`、`ro.opengles.version`（GLES 3.2）等属性，
@@ -127,7 +127,7 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
 - **ColorOS 14 GSI**（社区移植的 Mystic GSI，Android 14，移植自一加 Pad Pro 平板）：Android 14 的系统跑在我们
   Android 15 的 vendor 上要逐项降级（SELinux 映射、VINTF 版本、linkerconfig、A15 符号、内核版本识别……），
   再加 OPLUS 框架只认高通/联发科、32 位 mediaserver 等问题，全部由脚本处理：在 `coloros_gsi_fixes.py` 之后再跑
-  `py scripts/coloros14_fixes.py images/gsi/my-gsi.img`（依赖 `images/gsi/coloros15-system.img`，即 ColorOS 15
+  `py scripts/a14_coloros_opd2404_fixes.py images/gsi/my-gsi.img`（依赖 `images/gsi/a15_coloros15.0.0_php110-system.img`，即 ColorOS 15
   GSI 的原始 system.img，从中取几个 A15 系统库；可重复运行）。这是平板固件，建实例用横屏
   `--width 1500 --height 1060 --density 210`（原机 3000x2120@420 的一半）。首次开机约 95 秒，之后 35–60 秒；
   锁屏、桌面、设置（平板双栏）、触摸、联网正常。蓝牙不可用，几个 OPLUS 应用会周期性崩溃重启，无害。
@@ -142,7 +142,7 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
   OPLUS 扩展模块导致的 netd 崩溃连坐（`onrestart` 杀 zygote，框架每 5 秒无声重启）、A16 connectivity 的 BPF 调用
   踩中旧内核 lpm_trie UBSAN 陷阱（Kernel panic）、以及 `/my_product/build.prop` 里的机型属性抢跑（画面横躺）。
   先跑一次 `py scripts/kernel_fixes.py`（基础内核的指令补丁，对所有 GSI 生效），再在 `coloros_gsi_fixes.py` 之后跑
-  `py scripts/coloros16_fixes.py images/gsi/my-gsi.img`（可重复运行）。同为平板固件，建实例一样用横屏
+  `py scripts/a16_coloros_opd2404_fixes.py images/gsi/my-gsi.img`（可重复运行）。同为平板固件，建实例一样用横屏
   `--width 1500 --height 1060 --density 210`。约 46 秒亮屏、1 分钟进桌面；横屏平板布局、应用库/文件管理可打开、
   联网正常，system_server 全程稳定。
 
@@ -150,14 +150,36 @@ py tools/avdctl/avdctl.py start mygsi --wait          # 起不来时加 --verbos
 <img src="docs/img/coloros16-home.png" width="400" alt="ColorOS 16 平板桌面">
 </p>
 
+- **ColorOS 16（PLG120，Android 17 预览）GSI**（社区移植的 Mystic GSI，底座是 Android 17 开发者预览
+  "CinnamonBun"；A17 的包不在 SF 的 ColorOS 目录，在 **Generic 目录**、以甜点代号命名，移植自 OPPO Find X9 Pro
+  卫星通信版手机。ROM 的用户可见版本钉在 16.0.0——`ro.build.display.id.show=PLG120_16.0.0.01`（设置「软件版本」
+  显示的就是它），但内部 build 号是 `PLG120_17.0.0.12(CN01)`、`my_product` 自报 ColorOS 17.0，是 ColorOS 17 内部版
+  穿着 16 的外衣）：在 C16 的补丁集上又过了三关——A17 libart 的
+  ClearGrowthLimit 用**写死的 512MB** 扩堆而本机 -Xmx 被按 192m 写死（来源不明）→ `Check failed` 每 5 秒杀
+  system_server，最终在 libandroid_runtime.so 里把读的属性名换哑名、默认 16m→1g 让 -Xmx 恒为 1g；**A17 的 zygote
+  会按校验和静默剔除 SYSTEMSERVERCLASSPATH 上改过的 jar**（dex 补丁在 framework 路径上彻底失效，只能走 native
+  库）；lpm_trie 的 UBSAN 误报在**查询路径**（cgroup BPF、IPv6 发包）又有一处 → kernel_fixes.py 新增 K2。
+  先 `py scripts/kernel_fixes.py`（K1+K2），再 `coloros_gsi_fixes.py` 之后跑 `py scripts/a17_coloros_plg120_fixes.py
+  images/gsi/my-gsi.img`。建实例用竖屏 `--width 636 --height 1390 --density 280`（约 1272 宽@560 的一半）。
+  首次开机（含 /data 全量编译）约 7 分钟，之后解锁、桌面、设置、联网正常。默认壁纸是 OPLUS 视频动态壁纸，其
+  GL 渲染路径（LUT 着色器 + external OES）gfxstream 不支持 → 桌面壁纸全黑，设静态壁纸即可（详见适配指南 §2.8）。
+
+<p>
+<img src="docs/img/a17_coloros16.0.0_plg120-home.png" width="270" alt="ColorOS 16（Android 17 预览）手机桌面">
+</p>
+
 - GSI 都是 user 版，SELinux 总是 enforcing；GSI 引用了 vendor 策略里没有的类型时，用 `scripts/gsi_undef_types.py`
   找出来补到 `gfx/vendor-overlay/gsi/gsi_sepolicy.cil`。
 - 没有开机向导的 GSI（如这个 ColorOS 移植包）不会写 `device_provisioned`/`user_setup_complete`，Android 会一直不响应
   主屏幕键和最近任务；QEMU 在每次开机完成后经 adbd 把它们补成 1（无需手动处理）。
 - 实验盘是基础盘的拷贝：`avdctl prepare --force` 之后要用 `gsi_disk.py`（ColorOS 再加 `coloros_gsi_fixes.py`、
-  ColorOS 14 再加 `coloros14_fixes.py`、ColorOS 16 再加 `coloros16_fixes.py`、HyperOS 再加 `hyperos_fixes.py`）重新
+  ColorOS 14 再加 `a14_coloros_opd2404_fixes.py`、ColorOS 16（A16）再加 `a16_coloros_opd2404_fixes.py`、
+  ColorOS 16（A17 预览）再加 `a17_coloros_plg120_fixes.py`、HyperOS 再加 `a15_hyperos_dada_fixes.py`）重新
   生成，基础内核另跑一次 `kernel_fixes.py`，再 `avdctl edit <名字> --system <盘>` 重新挂上（只重建写时复制层，
   userdata 保留）。
+- 实验盘按 `{Android 版本}_{系统+版本}_{机型}.img` 命名，版本与机型取自镜像里 `ro.build.display.id.show`
+  （前三段）与 `ro.build.product`，如 `a17_coloros16.0.0_plg120.img`、`a15_hyperos2.0.215.0_dada.img`；
+  版本专属补丁脚本同名去掉版本段（Python 模块名不能带点），如 `a17_coloros_plg120_fixes.py`。
 
 ## 工作原理
 
@@ -276,7 +298,7 @@ bash gfx/build_gfxstream_guest.sh      # → gfx/gs-out（guest 的 EGL/GLES 与
 | `gfx/gralloc/` | woa gralloc（allocator 服务 + IMapper v5） |
 | `gfx/swiftshader/`、`gfx/ss-build/`、`gfx/egl-out/` | SwiftShader 源码、构建目录、剥符号后的产物 |
 | `gfx/vendor-overlay/` | 装进 vendor 分区的配置（init rc、VINTF、fstab、特性开关、SELinux 补充；`gsi/` 是 GSI 实验专用） |
-| `scripts/` | vendor 改造（`vendor_install.py`、`alpine_job.py`、`superimg.py`）、GSI 实验（`gsi_disk.py`、`coloros_gsi_fixes.py`、`coloros14_fixes.py`、`hyperos_fixes.py`、`gsi_undef_types.py`）、调试工具（`hmp.py`、`qmp_input.py`、`vserial.py`、`vpull.py`、`vxfer.py`、`ext4tool.py`，抓真实窗口查闪烁的 `flicker_cap.py`、`window_cap.py`）、开发启动脚本 `boot_woa.sh`、补丁生成 `make_patches.sh`；`legacy/` 是早期实验脚本 |
+| `scripts/` | vendor 改造（`vendor_install.py`、`alpine_job.py`、`superimg.py`）、GSI 实验（`gsi_disk.py`、`coloros_gsi_fixes.py`、`a14_coloros_opd2404_fixes.py`、`a16_coloros_opd2404_fixes.py`、`a17_coloros_plg120_fixes.py`、`a15_hyperos_dada_fixes.py`、`gsi_undef_types.py`）、调试工具（`hmp.py`、`qmp_input.py`、`vserial.py`、`vpull.py`、`vxfer.py`、`ext4tool.py`，抓真实窗口查闪烁的 `flicker_cap.py`、`window_cap.py`）、开发启动脚本 `boot_woa.sh`、补丁生成 `make_patches.sh`；`legacy/` 是早期实验脚本 |
 | `images/base/`、`images/avds/`、`images/gsi/` | 基础镜像、各实例、GSI 实验盘 |
 | `images/android-35/arm64-v8a/` | 开发用镜像（`scripts/boot_woa.sh` 引导） |
 | `docs/` | 主题文档（架构、设备、图形、GSI、排查）与 AOSP/内核参考源码摘录（`docs/reference/`） |
